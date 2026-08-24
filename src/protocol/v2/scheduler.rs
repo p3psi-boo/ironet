@@ -15,8 +15,8 @@ use super::{
     train::{PacketTrain, SegmentBufferPool, TrainBuildStats},
 };
 
-pub const MAX_QUANTUM_BYTES: usize = 8 * 1024;
-pub const MAX_QUANTUM_CELLS: usize = 4;
+pub const MAX_QUANTUM_BYTES: usize = 16 * 1024;
+pub const MAX_QUANTUM_CELLS: usize = 8;
 const DEFAULT_LATENCY_DEADLINE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +42,7 @@ impl Default for SchedulerLimits {
             probe_bytes: 256 * 1024,
             application_bytes: 8 * 1024 * 1024,
             bulk_reserve_bytes: 1024 * 1024,
-            bulk_drr_quantum_bytes: 4 * 1400,
+            bulk_drr_quantum_bytes: 8 * 1400,
             latency_burst_bytes: 64 * 1024,
             maximum_quantum_cells: MAX_QUANTUM_CELLS,
             maximum_quantum_bytes: MAX_QUANTUM_BYTES,
@@ -836,6 +836,8 @@ mod tests {
     #[test]
     fn bulk_train_pauses_at_a_hard_quantum_boundary() {
         let mut scheduler = V2Scheduler::new(SchedulerLimits::default()).unwrap();
+        assert!(scheduler.set_bulk_quantum_cells(8).is_ok());
+        assert!(scheduler.set_bulk_quantum_cells(9).is_err());
         scheduler
             .enqueue_train(1, train(TrafficClass::Bulk, 1, 44, 1500), 1382)
             .unwrap();
@@ -843,7 +845,8 @@ mod tests {
             ScheduledWork::Cells(quantum) => quantum,
             _ => panic!("expected cells"),
         };
-        assert!(first.cells.len() <= 4);
+        assert!((6..=8).contains(&first.cells.len()));
+        assert!(first.cells.iter().all(|cell| cell.len() >= 1_300));
         assert!(first.bytes() <= MAX_QUANTUM_BYTES);
         assert!(!first.train_finished);
 
@@ -921,14 +924,21 @@ mod tests {
                 .unwrap();
         }
         let mut first_round = Vec::new();
+        let mut first_round_quantum_cells = Vec::new();
         for _ in 0..8 {
             let ScheduledWork::Cells(quantum) = scheduler.pop().unwrap() else {
                 panic!("expected bulk cells");
             };
             first_round.push(quantum.flow_id);
+            first_round_quantum_cells.push(quantum.cells.len());
         }
         first_round.sort_unstable();
         assert_eq!(first_round, (1..=8).collect::<Vec<_>>());
+        assert!(
+            first_round_quantum_cells
+                .into_iter()
+                .all(|cells| (6..=8).contains(&cells))
+        );
     }
 
     #[test]

@@ -1083,7 +1083,7 @@ fn base_config(
         identity_file,
         bind_addresses: bind_address.into_iter().collect(),
         excluded_underlay_prefixes: Vec::new(),
-        tun_mtu: u16::MAX,
+        tun_mtu: crate::config::DEFAULT_TUN_MTU,
         node_interface: "ironet0".into(),
         node_addresses: addresses,
         advertised_prefixes: Vec::new(),
@@ -1466,6 +1466,20 @@ pub fn parse_duration(value: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_product_config_uses_the_tun_mtu_default() {
+        let config = base_config(
+            "network-secret".into(),
+            "/tmp/ironet-v2.key".into(),
+            "edge".into(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(config.tun_mtu, crate::config::DEFAULT_TUN_MTU);
+    }
 
     #[test]
     fn local_product_state_is_upgraded_independently_of_the_wire_protocol() {

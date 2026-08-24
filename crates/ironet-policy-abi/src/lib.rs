@@ -69,8 +69,10 @@ pub const POLICY_EXTENSION_MAX_COUNT: u16 = 32;
 pub const POLICY_LABEL_BYTES: usize = 16;
 /// Highest egress priority a candidate may request (0 = background).
 pub const EGRESS_PRIORITY_MAX: u8 = 7;
-/// Parity overhead guard: parity cells may not exceed 50% of data cells.
-pub const FEC_PARITY_PER_MILLE_CAP: u16 = 500;
+/// Parity overhead guard: parity cells may not exceed the data-cell count.
+/// The native policy reserves 100% overhead for severe correlated loss; the
+/// ordinary geometries remain substantially below this host ceiling.
+pub const FEC_PARITY_PER_MILLE_CAP: u16 = 1_000;
 /// Largest FEC data cell count the V2 stripe encoder supports.
 pub const FEC_DATA_CELLS_MAX: u8 = 16;
 /// Largest FEC parity cell count the V2 stripe encoder supports.

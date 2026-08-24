@@ -15,9 +15,17 @@ use tracing::warn;
 #[derive(Debug)]
 pub(super) struct Pacer {
     capacity: u64,
+    /// Last live congestion-controller burst quantum. Changes settle elapsed
+    /// credit into the new bucket exactly once, so a live quantum adjustment
+    /// neither loses earned rate nor reuses stale idle time after depletion.
+    last_controller_capacity: Option<u64>,
     last_window: u64,
     last_mtu: u16,
     tokens: u64,
+    /// At most one datagram of controller-rate refill overflow retained for
+    /// the current wake epoch. This compensates timer lateness without
+    /// allowing idle elapsed time to refill a second full quantum.
+    late_refill_credit: u64,
     max_bytes_per_second: Option<u64>,
     prev: Instant,
 }
@@ -35,9 +43,11 @@ impl Pacer {
         let capacity = optimal_capacity(smoothed_rtt, window, mtu);
         Self {
             capacity,
+            last_controller_capacity: None,
             last_window: window,
             last_mtu: mtu,
             tokens: capacity,
+            late_refill_credit: 0,
             max_bytes_per_second,
             prev: now,
         }
@@ -51,11 +61,30 @@ impl Pacer {
     /// Refill the burst budget when a warm backup becomes the active path.
     pub(super) fn on_path_activated(&mut self) {
         self.tokens = self.capacity;
+        self.late_refill_credit = 0;
+    }
+
+    /// Forget elapsed refill time while a transmit was waiting for the shared
+    /// UDP socket to become writable.
+    ///
+    /// Packet construction has already charged the bucket. Anchoring it at
+    /// the actual socket flush prevents that blocked interval from refilling
+    /// a second adjacent quantum immediately after the buffered batch.
+    pub(super) fn on_socket_transmit_flush(&mut self, now: Instant) {
+        if now.checked_duration_since(self.prev).is_some() {
+            self.prev = now;
+            self.late_refill_credit = 0;
+        }
     }
 
     /// Record that a packet has been transmitted.
     pub(super) fn on_transmit(&mut self, packet_length: u16) {
-        self.tokens = self.tokens.saturating_sub(packet_length.into())
+        let packet_length = u64::from(packet_length);
+        let from_tokens = self.tokens.min(packet_length);
+        self.tokens -= from_tokens;
+        self.late_refill_credit = self
+            .late_refill_credit
+            .saturating_sub(packet_length - from_tokens);
     }
 
     /// Return how long we need to wait before sending `bytes_to_send`.
@@ -92,19 +121,34 @@ impl Pacer {
 
             // Clamp the tokens
             self.tokens = self.capacity.min(self.tokens);
+            self.late_refill_credit = 0;
             self.last_window = window;
             self.last_mtu = mtu;
         }
 
+        let previous_capacity = self.capacity;
+        let mut controller_capacity_changed = false;
         if let Some(capacity) = capacity {
             // A controller quantum is a burst budget, but it must never be smaller than
             // one packet or the token bucket could permanently reject that packet.
-            self.capacity = capacity.max(bytes_to_send).max(u64::from(mtu));
+            let capacity = capacity.max(bytes_to_send).max(u64::from(mtu));
+            controller_capacity_changed = self.last_controller_capacity != Some(capacity);
+            self.last_controller_capacity = Some(capacity);
+            self.capacity = capacity;
             self.tokens = self.capacity.min(self.tokens);
+            if controller_capacity_changed {
+                self.late_refill_credit = 0;
+            }
+        } else {
+            self.last_controller_capacity = None;
+            self.late_refill_credit = 0;
         }
 
-        // if we can already send a packet, there is no need for delay
-        if self.tokens >= bytes_to_send {
+        // Preserve the legacy window-derived pacer's fast path. A
+        // controller-rate bucket must always settle elapsed time, even while
+        // full: otherwise it can spend the old bucket after an idle interval
+        // and then refill from that same interval for a second adjacent burst.
+        if pacing_rate.is_none() && self.tokens >= bytes_to_send && !controller_capacity_changed {
             return None;
         }
 
@@ -127,27 +171,49 @@ impl Pacer {
             None => return None,
         };
         if refill_rate <= 0.0 {
-            return Some(Duration::MAX);
+            return (self.tokens < bytes_to_send).then_some(Duration::MAX);
         }
 
         let new_tokens = (refill_rate * time_elapsed.as_secs_f64()).round() as u64;
-        self.tokens = self.tokens.saturating_add(new_tokens).min(self.capacity);
+        let available = self.tokens.saturating_add(new_tokens);
+        if controller_capacity_changed {
+            // First settle elapsed time under the old bucket's bound, then
+            // resize. Idle time while the old bucket was already full must not
+            // populate newly added capacity or survive a shrink as a second
+            // burst.
+            self.tokens = available.min(previous_capacity).min(self.capacity);
+        } else {
+            self.tokens = available.min(self.capacity);
+        }
 
-        // In the unlikely event that we're getting polled faster than tokens are generated, ensure
-        // that `elapsed_rtts` can grow until we make progress.
-        if new_tokens > 0 {
+        // A controller timer can wake slightly after the nominal quantum
+        // interval. Retain at most one datagram of the resulting overflow for
+        // this wake epoch. Because elapsed time is settled and `prev` advances
+        // even while the main bucket is full, idle time can never be reused
+        // to create a second quantum.
+        if pacing_rate.is_some() && new_tokens > 0 && !controller_capacity_changed {
+            self.late_refill_credit = available.saturating_sub(self.capacity).min(u64::from(mtu));
+        }
+
+        // Controller pacing consumes the elapsed interval even if the bucket
+        // was already full, so that idle time cannot be reused after the
+        // bucket is depleted. Preserve the legacy sub-token accumulation for
+        // the window-derived pacer.
+        if pacing_rate.is_some() || new_tokens > 0 {
             self.prev = now;
         }
 
         // if we can already send a packet, there is no need for delay
-        if self.tokens >= bytes_to_send {
+        if self.tokens.saturating_add(self.late_refill_credit) >= bytes_to_send {
             return None;
         }
 
         // Wait until a full burst quantum is available. This amortizes wakeups without
         // changing the long-term byte rate; unrelated endpoint activity may wake us
         // earlier and consume a partially refilled packet's worth of tokens.
-        let deficit = bytes_to_send.max(self.capacity) - self.tokens;
+        let deficit = bytes_to_send
+            .max(self.capacity)
+            .saturating_sub(self.tokens.saturating_add(self.late_refill_credit));
         Some(Duration::from_secs_f64(deficit as f64 / refill_rate))
     }
 }
@@ -160,9 +226,9 @@ impl Pacer {
 /// - constantly waking up the connection to produce additional datagrams
 ///
 /// Too short burst intervals means we will never meet them since the timer
-/// accuracy in user-space is not high enough. If we miss the interval by more
-/// than 25%, we will lose that part of the congestion window since no additional
-/// tokens for the extra-elapsed time can be stored.
+/// accuracy in user-space is not high enough. The controller-rate path retains
+/// at most one MTU of late-wakeup refill credit; larger excess is deliberately
+/// discarded so timer lateness cannot create an unbounded adjacent burst.
 ///
 /// Too long burst intervals make pacing less effective.
 fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
@@ -476,6 +542,442 @@ mod tests {
             "an unrelated wakeup may spend one packet of partial token credit"
         );
         assert_eq!(pacer.tokens, 1_000);
+    }
+
+    #[test]
+    fn late_controller_wakeup_retains_at_most_one_datagram_of_credit() {
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+
+        for _ in 0..2 {
+            assert_eq!(
+                pacer.delay(rtt, 1_000, mtu, window, start, Some(2_000), Some(100_000)),
+                None
+            );
+            pacer.on_transmit(mtu);
+        }
+
+        // The 20 ms quantum timer wakes at least one packet late. The bucket
+        // retains exactly one MTU beyond its ordinary quantum.
+        let late = start + Duration::from_millis(40);
+        assert_eq!(
+            pacer.delay(rtt, 1_000, mtu, window, late, Some(2_000), Some(100_000)),
+            None
+        );
+        assert_eq!(pacer.tokens, 2_000);
+        assert_eq!(pacer.late_refill_credit, 1_000);
+        for _ in 0..3 {
+            pacer.on_transmit(mtu);
+        }
+
+        // The elapsed interval was consumed even though it overflowed, so a
+        // fourth packet cannot reuse it at the same timestamp.
+        assert_eq!(
+            pacer.delay(rtt, 1_000, mtu, window, late, Some(2_000), Some(100_000)),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(pacer.tokens, 0);
+    }
+
+    #[test]
+    fn very_late_wakeup_sends_at_most_q12_plus_one_mtu_at_the_same_instant() {
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+        let capacity = 12_000;
+        let pacing_rate = 12_000_000;
+
+        for _ in 0..12 {
+            assert_eq!(
+                pacer.delay(
+                    rtt,
+                    1_000,
+                    mtu,
+                    window,
+                    start,
+                    Some(capacity),
+                    Some(pacing_rate),
+                ),
+                None
+            );
+            pacer.on_transmit(mtu);
+        }
+
+        // Even a wake one hundred quantum intervals late may make only the
+        // twelve-packet controller quantum plus one MTU available.
+        let very_late = start + Duration::from_millis(100);
+        let mut sent = 0;
+        while pacer
+            .delay(
+                rtt,
+                1_000,
+                mtu,
+                window,
+                very_late,
+                Some(capacity),
+                Some(pacing_rate),
+            )
+            .is_none()
+        {
+            pacer.on_transmit(mtu);
+            sent += u64::from(mtu);
+            assert!(
+                sent <= capacity + u64::from(mtu),
+                "one Instant exceeded q12 plus one MTU"
+            );
+        }
+        assert_eq!(sent, capacity + u64::from(mtu));
+        assert_eq!(pacer.tokens, 0);
+        assert_eq!(pacer.late_refill_credit, 0);
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                1_000,
+                mtu,
+                window,
+                very_late,
+                Some(capacity),
+                Some(pacing_rate),
+            ),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn full_controller_bucket_across_ten_intervals_is_bounded_by_quantum_plus_mtu() {
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+        let capacity = 2_000;
+        let pacing_rate = 100_000;
+        let after_ten_intervals = start + Duration::from_millis(200);
+
+        // Publish the controller quantum before the idle interval; the
+        // bucket itself remains full.
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                1_000,
+                mtu,
+                window,
+                start,
+                Some(capacity),
+                Some(pacing_rate),
+            ),
+            None
+        );
+
+        let mut sent = 0;
+        while pacer
+            .delay(
+                rtt,
+                1_000,
+                mtu,
+                window,
+                after_ten_intervals,
+                Some(capacity),
+                Some(pacing_rate),
+            )
+            .is_none()
+        {
+            pacer.on_transmit(mtu);
+            sent += u64::from(mtu);
+            assert!(sent <= capacity + u64::from(mtu));
+        }
+        assert_eq!(sent, capacity + u64::from(mtu));
+    }
+
+    #[test]
+    fn partial_controller_bucket_plus_one_interval_is_bounded_by_quantum_plus_mtu() {
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+        let capacity = 4_000;
+        let pacing_rate = 100_000;
+
+        // Leave two MTUs in the old bucket.
+        for _ in 0..2 {
+            assert_eq!(
+                pacer.delay(
+                    rtt,
+                    1_000,
+                    mtu,
+                    window,
+                    start,
+                    Some(capacity),
+                    Some(pacing_rate),
+                ),
+                None
+            );
+            pacer.on_transmit(mtu);
+        }
+
+        let after_one_interval = start + Duration::from_millis(40);
+        let mut sent = 0;
+        while pacer
+            .delay(
+                rtt,
+                1_000,
+                mtu,
+                window,
+                after_one_interval,
+                Some(capacity),
+                Some(pacing_rate),
+            )
+            .is_none()
+        {
+            pacer.on_transmit(mtu);
+            sent += u64::from(mtu);
+            assert!(sent <= capacity + u64::from(mtu));
+        }
+        assert_eq!(sent, capacity + u64::from(mtu));
+    }
+
+    #[test]
+    fn smaller_live_controller_quantum_clamps_old_burst_tokens_on_next_delay() {
+        let window = 2_000_000;
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                mtu.into(),
+                mtu,
+                window,
+                start,
+                Some(64_000),
+                Some(20_000_000),
+            ),
+            None
+        );
+        assert_eq!(pacer.capacity, 64_000);
+
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                mtu.into(),
+                mtu,
+                window,
+                start,
+                Some(13_000),
+                Some(13_000_000),
+            ),
+            None
+        );
+        assert_eq!(pacer.capacity, 13_000);
+        assert_eq!(pacer.tokens, 13_000);
+    }
+
+    #[test]
+    fn live_controller_quantum_change_settles_old_idle_time_once() {
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+
+        for new_capacity in [1_000, 3_000] {
+            let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+            assert_eq!(
+                pacer.delay(rtt, 1_000, mtu, window, start, Some(2_000), Some(100_000)),
+                None
+            );
+
+            // Leave the old bucket full across a long idle interval. Changing
+            // either down or up settles under the old bound and then resizes,
+            // but must not retain that interval for a second refill after the
+            // converted tokens are spent.
+            let changed_at = start + Duration::from_secs(1);
+            assert_eq!(
+                pacer.delay(
+                    rtt,
+                    1_000,
+                    mtu,
+                    window,
+                    changed_at,
+                    Some(new_capacity),
+                    Some(100_000),
+                ),
+                None
+            );
+            assert_eq!(pacer.tokens, new_capacity.min(2_000));
+
+            while pacer.tokens >= u64::from(mtu) {
+                pacer.on_transmit(mtu);
+            }
+            assert_eq!(pacer.tokens, 0);
+            assert_eq!(
+                pacer.delay(
+                    rtt,
+                    1_000,
+                    mtu,
+                    window,
+                    changed_at,
+                    Some(new_capacity),
+                    Some(100_000),
+                ),
+                Some(Duration::from_millis(new_capacity / 100)),
+                "the new quantum must wait for its own refill interval"
+            );
+        }
+    }
+
+    #[test]
+    fn live_controller_quantum_micro_adjustments_preserve_elapsed_credit() {
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+
+        for _ in 0..2 {
+            assert_eq!(
+                pacer.delay(rtt, 1_000, mtu, window, start, Some(2_000), Some(100_000)),
+                None
+            );
+            pacer.on_transmit(mtu);
+        }
+        assert_eq!(pacer.tokens, 0);
+
+        // A live rate estimate can move the computed send quantum by one byte
+        // on every poll. Each adjustment must settle, rather than erase, the
+        // 500 bytes earned since the previous poll.
+        for (elapsed_millis, capacity, expected_tokens) in
+            [(10, 2_001, 1_000), (15, 2_002, 1_500), (20, 2_003, 2_000)]
+        {
+            let now = start + Duration::from_millis(elapsed_millis);
+            let delay = pacer.delay(rtt, 1_000, mtu, window, now, Some(capacity), Some(100_000));
+            assert_eq!(pacer.tokens, expected_tokens);
+            assert_eq!(delay, None);
+        }
+    }
+
+    #[test]
+    fn unchanged_live_controller_quantum_bounds_overflow_credit_to_one_mtu() {
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+
+        for _ in 0..2 {
+            assert_eq!(
+                pacer.delay(rtt, 1_000, mtu, window, start, Some(2_000), Some(100_000)),
+                None
+            );
+            pacer.on_transmit(mtu);
+        }
+
+        let late = start + Duration::from_millis(40);
+        assert_eq!(
+            pacer.delay(rtt, 1_000, mtu, window, late, Some(2_000), Some(100_000)),
+            None
+        );
+        assert_eq!(pacer.tokens, 2_000);
+        assert_eq!(pacer.late_refill_credit, 1_000);
+        for _ in 0..3 {
+            pacer.on_transmit(mtu);
+        }
+        assert_eq!(
+            pacer.delay(rtt, 1_000, mtu, window, late, Some(2_000), Some(100_000)),
+            Some(Duration::from_millis(20)),
+            "an unchanged quantum must retain no more than one MTU"
+        );
+    }
+
+    #[test]
+    fn pending_socket_send_reanchors_flush_and_requires_a_new_quantum_delay() {
+        #[derive(Debug)]
+        struct PendingOnceSender {
+            pending: bool,
+            now: Instant,
+        }
+
+        impl PendingOnceSender {
+            fn poll_send(&mut self) -> std::task::Poll<()> {
+                if self.pending {
+                    self.pending = false;
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            }
+        }
+
+        let window = 2_000_000;
+        let mtu = 1_000;
+        let rtt = Duration::from_millis(50);
+        let start = Instant::now();
+        let capacity = 12_000;
+        let pacing_rate = 12_000_000;
+        let mut pacer = Pacer::new(rtt, window, mtu, None, start);
+
+        // Protocol packet construction charges the complete old q12 GSO batch
+        // before the runtime discovers socket backpressure.
+        for _ in 0..12 {
+            assert_eq!(
+                pacer.delay(
+                    rtt,
+                    u64::from(mtu),
+                    mtu,
+                    window,
+                    start,
+                    Some(capacity),
+                    Some(pacing_rate),
+                ),
+                None
+            );
+            pacer.on_transmit(mtu);
+        }
+        assert_eq!(pacer.tokens, 0);
+
+        let mut sender = PendingOnceSender {
+            pending: true,
+            now: start,
+        };
+        assert_eq!(sender.poll_send(), std::task::Poll::Pending);
+        sender.now += Duration::from_millis(100);
+        assert_eq!(sender.poll_send(), std::task::Poll::Ready(()));
+
+        // A successful retry re-anchors the pacer at the actual flush. The old
+        // q12 is the only batch eligible at this timestamp; a new batch needs
+        // one positive quantum interval.
+        pacer.on_socket_transmit_flush(sender.now);
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                sender.now,
+                Some(capacity),
+                Some(pacing_rate),
+            ),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                sender.now + Duration::from_millis(1),
+                Some(capacity),
+                Some(pacing_rate),
+            ),
+            None
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ pub const ACTIVE_TRAIN_BUDGET_CAP: u16 = 1_024;
 
 /// Host geometry table for a FEC preset family the candidate requested
 /// without explicit cell counts. Every entry is valid under the default
-/// limits (data <= 16, parity <= 8, ratio <= 500 per mille).
+/// limits (data <= 16, parity <= 8, ratio <= 1,000 per mille).
 fn fec_family_geometry(family: FecPresetFamilyV1) -> Option<(u8, u8)> {
     match family {
         FecPresetFamilyV1::Unspecified => None,
@@ -64,7 +64,7 @@ fn fec_family_geometry(family: FecPresetFamilyV1) -> Option<(u8, u8)> {
         FecPresetFamilyV1::Sparse => Some((16, 1)),
         // 25% overhead for random-loss WANs.
         FecPresetFamilyV1::Balanced => Some((8, 2)),
-        // 50% overhead, the wire-overhead cap, for bursty radio paths.
+        // 50% overhead for bursty radio paths.
         FecPresetFamilyV1::Dense => Some((8, 4)),
     }
 }
@@ -1216,11 +1216,29 @@ mod tests {
     #[test]
     fn invalid_geometry_is_rejected_not_repaired() {
         let guardrails = GuardrailsV1::new(limits());
+        let maximum_ratio = CandidateActionV1 {
+            fec: Some(FecCandidateV1 {
+                enabled: Some(true),
+                data_cells: Some(4),
+                parity_cells: Some(4),
+                preset_family: None,
+            }),
+            ..CandidateActionV1::default()
+        };
+        let (effective, report) = guardrails.apply(&maximum_ratio, &base(), &context());
+        assert!(effective.fec.enabled);
+        assert_eq!(effective.fec.data_cells, 4);
+        assert_eq!(effective.fec.parity_cells, 4);
+        assert!(report.entries.iter().all(|entry| {
+            entry.field != ClampFieldV1::FecParityCells
+                || entry.reason != ClampReasonV1::CrossFieldConstraint
+        }));
+
         let candidate = CandidateActionV1 {
             fec: Some(FecCandidateV1 {
                 enabled: Some(true),
                 data_cells: Some(4),
-                parity_cells: Some(3),
+                parity_cells: Some(5),
                 preset_family: None,
             }),
             ..CandidateActionV1::default()

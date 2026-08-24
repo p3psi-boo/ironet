@@ -798,11 +798,22 @@ mod tests {
         assert_eq!(repair.requested, i64::MAX);
         assert_eq!(repair.effective, 32 * 1024 * 1024);
 
-        // Parity ratio guard: 8 data cells allow at most 4 parity cells.
+        // Parity ratio guard: parity may equal, but not exceed, data cells.
+        let maximum_ratio = CandidateActionV1 {
+            fec: Some(FecCandidateV1 {
+                enabled: Some(true),
+                data_cells: Some(4),
+                parity_cells: Some(4),
+                preset_family: None,
+            }),
+            ..CandidateActionV1::default()
+        };
+        assert!(maximum_ratio.validate(&limits).is_ok());
+
         let ratio = CandidateActionV1 {
             fec: Some(FecCandidateV1 {
                 enabled: Some(true),
-                data_cells: Some(8),
+                data_cells: Some(4),
                 parity_cells: Some(5),
                 preset_family: None,
             }),
@@ -840,6 +851,29 @@ mod tests {
                 .iter()
                 .any(|entry| entry.reason == ClampReasonV1::TooManyExtensions)
         );
+    }
+
+    #[test]
+    fn default_limits_accept_eight_cell_bulk_quantum_and_reject_nine() {
+        let limits = HostLimitsV1::default();
+        assert_eq!(limits.bulk_quantum_cap_cells, 8);
+
+        let mut candidate = CandidateActionV1 {
+            scheduler: Some(SchedulerCandidateV1 {
+                bulk_quantum_cells: Some(8),
+                ..SchedulerCandidateV1::default()
+            }),
+            ..CandidateActionV1::default()
+        };
+        assert!(candidate.validate(&limits).is_ok());
+
+        candidate.scheduler.as_mut().unwrap().bulk_quantum_cells = Some(9);
+        let entries = candidate.validate(&limits).unwrap_err();
+        assert!(entries.iter().any(|entry| {
+            entry.field == ClampFieldV1::SchedulerBulkQuantumCells
+                && entry.reason == ClampReasonV1::AboveCap
+                && entry.effective == 8
+        }));
     }
 
     /// The guardrails fuzz target (`fuzz/fuzz_targets/v2_policy_guardrails.rs`)

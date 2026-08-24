@@ -30,12 +30,13 @@ use super::{
     connection::{PeerSessionV2, establish_mesh_adjacencies},
     cpu_sampler_loop,
     dataplane::{
-        CLASSIFIER_IDLE, CoverShaperV2, MAX_CLASSIFIERS, PrioritySendArbiterV2, PrioritySendTurnV2,
-        TUN_INPUT_SLOTS, TUN_PRIORITY_INPUT_SLOTS, TX_ADMISSION_BATCH_BYTES,
+        CLASSIFIER_IDLE, CoverShaperV2, IngressReadyOrderV2, MAX_CLASSIFIERS,
+        PrioritySendArbiterV2, TUN_INPUT_SLOTS, TUN_PRIORITY_INPUT_SLOTS, TX_ADMISSION_BATCH_BYTES,
         TX_LATENCY_ADMISSION_HIGH_WATER_BYTES, TunIngressRecordV2, TxControl,
         adaptive_repair_minimum_age, admission_saturated, apply_receive_buffer_target,
-        drain_tun_ingress_batch, effective_tx_tuning, flow_id, minimum_receive_buffer_bytes,
-        prioritized_tun_reader, route_loop, tx_admission_high_water, unix_secs, write_reassembled,
+        drain_tun_ingress_batch, effective_tx_tuning, flow_id, ingress_ready_order,
+        minimum_receive_buffer_bytes, prioritized_tun_reader, route_loop, tx_admission_high_water,
+        unix_secs, write_reassembled,
     },
     host_network::{configure_mesh_tunnel, local_overlay_addresses, reconcile_v2_nat},
     telemetry::{RuntimeMetrics, TunIngressBatchV2, increment_sampled_counter},
@@ -344,6 +345,9 @@ pub(super) async fn run_mesh(
     );
 
     let tun_metrics = runtime_state.tun_ingress_metrics.clone();
+    // This shared budget only merges one bounded GSO burst from the RSS
+    // readers. Route dispatch still feeds each adjacency through the 512-KiB
+    // scheduler high-water mark in `mesh_tx_loop`.
     let tun_regular_budget = Arc::new(Semaphore::new(TUN_REGULAR_INPUT_BYTES));
     for (queue, device) in tunnel.devices.iter().enumerate() {
         spawn_named_mesh_task(
@@ -356,6 +360,7 @@ pub(super) async fn run_mesh(
                 tun_priority_sender.clone(),
                 tun_regular_budget.clone(),
                 tun_metrics.clone(),
+                tunnel.mtu,
             ),
         );
     }
@@ -624,7 +629,9 @@ async fn mesh_tx_loop(
         let event = if tx.has_pending()
             && admission_saturated(tx.depth(), tx_admission_high_water(&tx))
         {
-            if priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
+            if ingress_ready_order(true, priority_send.next())
+                == IngressReadyOrderV2::PriorityThenSend
+            {
                 tokio::select! {
                     biased;
                     changed = tuning.changed() => {
@@ -646,15 +653,17 @@ async fn mesh_tx_loop(
                 }
             }
         } else if tx.has_pending() {
-            if priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
+            if ingress_ready_order(false, priority_send.next())
+                == IngressReadyOrderV2::SendThenPriorityThenRegular
+            {
                 tokio::select! {
                     biased;
                     changed = tuning.changed() => {
                         changed.context("V2 mesh tuner stopped")?;
                         Event::Tuned
                     }
-                    command = priority_commands.recv() => Event::Command { command, priority_admission: true },
                     sent = tx.send_next() => Event::Sent(sent),
+                    command = priority_commands.recv() => Event::Command { command, priority_admission: true },
                     command = commands.recv() => Event::Command { command, priority_admission: false },
                 }
             } else {
@@ -664,8 +673,8 @@ async fn mesh_tx_loop(
                         changed.context("V2 mesh tuner stopped")?;
                         Event::Tuned
                     }
-                    sent = tx.send_next() => Event::Sent(sent),
                     command = priority_commands.recv() => Event::Command { command, priority_admission: true },
+                    sent = tx.send_next() => Event::Sent(sent),
                     command = commands.recv() => Event::Command { command, priority_admission: false },
                 }
             }
@@ -978,6 +987,7 @@ async fn enqueue_mesh_tun_batch(
         let TunIngressRecordV2 {
             bytes: raw,
             info,
+            gso: reader_gso,
             _permit: permit,
         } = record;
         let packet = &raw[VIRTIO_NET_HDR_LEN..];
@@ -1037,13 +1047,20 @@ async fn enqueue_mesh_tun_batch(
             .classifier
             .observe(now, packet_len, 0, info.latency_protected);
         let route = state.effective_route;
-        let (metadata, data, gso) = match encode_train_record_observed(raw) {
+        let (metadata, data, mut gso) = match encode_train_record_observed(raw) {
             Ok(record) => record,
             Err(error) => {
                 warn!(%error, "dropped invalid V2 mesh GSO metadata");
                 continue;
             }
         };
+        gso.input_bytes = gso.input_bytes.saturating_add(reader_gso.input_bytes);
+        gso.preserved_bytes = gso
+            .preserved_bytes
+            .saturating_add(reader_gso.preserved_bytes);
+        gso.fallback_splits = gso
+            .fallback_splits
+            .saturating_add(reader_gso.fallback_splits);
         if !commands.contains_key(&route.adjacency) {
             warn!(
                 adjacency = route.adjacency.0,
@@ -1796,13 +1813,34 @@ async fn apply_mesh_presence(
 #[cfg(test)]
 mod tests {
     use iroh::SecretKey;
+    use tokio::sync::mpsc;
 
-    use crate::protocol::v2::routing::LabelRouteV2;
+    use crate::{protocol::v2::routing::LabelRouteV2, v2_runtime::dataplane::PrioritySendTurnV2};
 
     use super::*;
 
     fn product_config() -> crate::config::Config {
         toml::from_str(include_str!("../../config/example.toml")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn priority_turn_polls_a_ready_send_before_regular_command() {
+        let (_priority_sender, mut priority_commands) = mpsc::channel::<()>(1);
+        let (commands_sender, mut commands) = mpsc::channel(1);
+        commands_sender.send(()).await.unwrap();
+
+        assert_eq!(
+            ingress_ready_order(false, PrioritySendTurnV2::PriorityAdmission),
+            IngressReadyOrderV2::PriorityThenSendThenRegular
+        );
+        let selected = tokio::select! {
+            biased;
+            _ = priority_commands.recv() => "priority",
+            _ = std::future::ready(()) => "send",
+            _ = commands.recv() => "regular",
+        };
+        assert_eq!(selected, "send");
+        assert_eq!(commands.try_recv(), Ok(()));
     }
 
     #[tokio::test]

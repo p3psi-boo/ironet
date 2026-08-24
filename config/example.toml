@@ -12,7 +12,7 @@ identity_file = "/var/lib/ironet/identity.key"
 # this excludes Yggdrasil while retaining public carrier IPv6.
 excluded_underlay_prefixes = ["200::/7"]
 
-tun_mtu = 65535
+tun_mtu = 32768
 node_interface = "ironet0"
 node_addresses = ["21.0.0.1/32", "21::1/128"]
 advertised_prefixes = ["192.168.10.0/24"]

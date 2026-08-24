@@ -67,7 +67,10 @@ use crate::{
 const ALPN: &[u8] = b"h3";
 const COVER_PROFILE_NAME: &str = "LiveMedia";
 const QUIC_WIRE_VERSION: u32 = 1;
-/// Shared ingress budget used by TUN setup and host fq_codel sizing.
+/// Shared ordinary-ingress merge budget used by TUN setup and host fq_codel
+/// sizing. It is a global byte bound before route dispatch; each adjacency
+/// still admits at most 512 KiB into its latency-sensitive scheduler, so this
+/// merge boundary does not deepen the paced path queue.
 pub(super) const TUN_REGULAR_INPUT_BYTES: usize = 512 * 1024;
 const LIVE_MEDIA_QUIC_MINIMUM_MTU: u16 = 1_200;
 const LIVE_MEDIA_QUIC_INITIAL_MTU: u16 = 1_200;
@@ -461,6 +464,8 @@ async fn run_with_shutdown_future(
     )?);
     let (tun_sender, tun_receiver) = mpsc::channel(TUN_INPUT_SLOTS);
     let (tun_priority_sender, tun_priority_receiver) = mpsc::channel(TUN_PRIORITY_INPUT_SLOTS);
+    // Absorb one bounded multi-queue GSO merge burst before dispatch; the TX
+    // scheduler retains its independent 512-KiB per-adjacency high-water.
     let tun_regular_budget = Arc::new(Semaphore::new(TUN_REGULAR_INPUT_BYTES));
     let (tune_sender, tune_receiver) = watch::channel(None::<TuneDecisionV2>);
     let (control_sender, control_receiver) = mpsc::channel(256);
@@ -476,6 +481,7 @@ async fn run_with_shutdown_future(
             tun_priority_sender.clone(),
             tun_regular_budget.clone(),
             metrics.clone(),
+            tunnel.mtu,
         ));
     }
     drop(tun_sender);
@@ -642,6 +648,11 @@ fn process_cpu_ticks() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_tun_merge_budget_is_globally_byte_bounded() {
+        assert_eq!(TUN_REGULAR_INPUT_BYTES, 512 * 1024);
+    }
 
     #[test]
     fn cpu_stat_parser_is_available_on_linux() {

@@ -54,6 +54,37 @@ const PACING_RATE_24MBPS: f64 = 24_000_000.0 / 8.0;
 /// inspired by a previous version of BBR2 used in cloudflare's quiche
 const HIGH_PACE_MAX_QUANTUM: u64 = 64 * 1000;
 
+/// High-rate pacer wakeups per second. A 5 ms quantum amortizes userspace
+/// timer/send-call overhead while the 64 KB ceiling bounds each burst.
+const HIGH_PACE_QUANTUMS_PER_SECOND: f64 = 200.0;
+
+/// A host-managed steady-state cap uses a one-millisecond aggregate budget
+/// capped at twelve SMSS. This avoids the persistent throughput loss of the
+/// stricter publication-edge drain budget below.
+const EXTERNAL_CAP_QUANTUMS_PER_SECOND: f64 = 1_000.0;
+const EXTERNAL_CAP_MAX_QUANTUM_PACKETS: u64 = 12;
+/// When a cap is first published, briefly shrink the aggregate burst to drain
+/// packets queued by the previously uncapped quantum before settling at the
+/// sustainable external-cap budget.
+const EXTERNAL_CAP_DRAIN_QUANTUMS_PER_SECOND: f64 = 1_500.0;
+const EXTERNAL_CAP_DRAIN_MAX_QUANTUM_PACKETS: u64 = 6;
+const EXTERNAL_CAP_DRAIN_ROUNDS: u8 = 4;
+/// A bounded host-requested capacity probe uses the same one-millisecond,
+/// twelve-SMSS budget as a shallow policer. This also protects the first
+/// paced quantum while the request is still waiting for a round refresh.
+const CAPACITY_PROBE_QUANTUMS_PER_SECOND: f64 = 1_000.0;
+const CAPACITY_PROBE_MAX_QUANTUM_PACKETS: u64 = 12;
+/// A bounded host-requested reprobe on a short path protects its first
+/// ordinary quantum only while the prior model is below 32 MiB/s. Above that
+/// rate, the smaller timer interval is more likely to cost throughput than to
+/// protect a shallow queue.
+const CAPACITY_PROBE_QUANTUM_MAX_BW: f64 = 32.0 * 1024.0 * 1024.0;
+/// Before outcome classification, a correlated loss declaration needs a
+/// sustainable one-millisecond bound so another oversized quantum is not
+/// emitted during the active Bulk episode.
+const SHALLOW_LOSS_QUANTUMS_PER_SECOND: f64 = 1_000.0;
+const SHALLOW_LOSS_MAX_QUANTUM_PACKETS: u64 = 12;
+
 /// equivalent to BBR.StartupPacingGain: A constant specifying the minimum gain value for calculating the pacing rate that will allow
 /// the sending rate to double each round (4 * ln(2) ~= 2.77)
 /// BBRStartupPacingGain; used in Startup mode for BBR.pacing_gain. <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.1>
@@ -77,17 +108,35 @@ const DRAIN_PACING_GAIN: f64 = 1.0 / DEFAULT_CWND_GAIN;
 // A short-RTT shallow policer drops instead of retaining a measurable queue,
 // so the RTT guard cannot distinguish it from random radio loss. Aggregate
 // outcomes over 500 ms so QUIC's delayed/batched loss declarations remain in
-// the same sample as their ACKs. Sustained >=2% loss below 20 ms RTT backs
-// pacing off multiplicatively, while a clean window probes upward. Long-haul and
-// radio paths stay on the FEC/Repair path instead of being rate-capped.
+// the same sample as their ACKs. A <=10 ms path with sustained >=2% loss may
+// trial a frozen model below the high-rate Wi-Fi boundary; confirmed episodes
+// retain that fixed model unless sustained loss disproves it. Other paths stay
+// on the FEC/Repair path.
 const POLICER_RTT_CEILING: Duration = Duration::from_millis(20);
 const POLICER_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
 const POLICER_MIN_SAMPLE_BYTES: u64 = 64 * 1024;
 const POLICER_LOSS_THRESHOLD: f64 = 0.02;
 const POLICER_CLEAN_THRESHOLD: f64 = 0.005;
-const POLICER_MIN_PACING_SCALE: f64 = 0.80;
-const POLICER_MAX_SINGLE_DECREASE: f64 = 0.90;
-const POLICER_ADDITIVE_RECOVERY: f64 = 0.02;
+/// A confirmed shallow-policer episode retains modest headroom below BBR's
+/// windowed maximum delivery-rate model. Episode activity is represented by
+/// the transition counter rather than a multiplicative live-bandwidth scale.
+const POLICER_EPISODE_PACING_SCALE: f64 = 1.0;
+/// Discount BBR's windowed maximum during the bounded drain trial. A clean
+/// confirmation restores most of that estimator margin while retaining a
+/// small fixed headroom below the frozen model.
+const POLICER_TRIAL_MAX_BW_SCALE: f64 = 0.92;
+const POLICER_CONFIRMED_MAX_BW_SCALE: f64 = 0.98;
+const POLICER_FALLBACK_TRIAL_SCALE: f64 = 1.10;
+/// After one drain/warmup outcome, allow four complete confirmation outcomes
+/// so pre-cap delayed loss cannot decide classification.
+const POLICER_TRIAL_CONFIRMATION_WINDOWS: u8 = 4;
+const POLICER_FALLBACK_MIN_RTT_CEILING: Duration = Duration::from_millis(10);
+/// Persistent loss disproves the fixed-policer hypothesis. Requiring ten
+/// consecutive complete outcomes tolerates isolated delayed-loss phases on a
+/// real shallow policer while retiring an interference false positive in
+/// about five seconds.
+const POLICER_CONFIRMED_LOSS_REVOKE_WINDOWS: u8 = 10;
+const SHALLOW_LOSS_BURST_PACKETS: u64 = 16;
 
 /// equivalent to BBR.MinRTTFilterLen: A constant specifying the length of the BBR.min_rtt min filter window, BBR.MinRTTFilterLen is 10 secs.
 const MIN_RTT_FILTER_LEN: u64 = 10;
@@ -98,6 +147,16 @@ const FULL_BW_GROWTH: f64 = 1.25;
 
 /// maximum number of rounds needed before we consider that the pipe is full <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.1.2-6>
 const MAX_FULL_BW_COUNT: u64 = 3;
+
+/// Number of valid, non-application-limited packet-timed rounds for which a
+/// host-requested capacity reprobe ignores a flat delivery-rate sample.
+///
+/// A semantic bulk/backlog edge can arrive while BBR's retained model still
+/// describes sparse control traffic. Three flat samples at that tiny rate can
+/// otherwise end Startup before the higher-gain flight is acknowledged. Eight
+/// rounds cover the bounded exponential discovery needed by the high-RTT
+/// matrix while the independent RTT queue guard can still end Startup early.
+const CAPACITY_PROBE_GRACE_ROUNDS: u8 = 8;
 
 /// when setting `bw_probe_up_rounds` when raising our inflight long term slope we don't go above this
 /// <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-8>
@@ -386,6 +445,9 @@ pub struct Bbr3 {
     full_bw: f64,
     /// equivalent to BBR.full_bw_count: The number of non-app-limited round trips without large increases in BBR.full_bw.
     full_bw_count: u64,
+    /// Valid packet-timed rounds left in a host-requested capacity-discovery
+    /// grace period. Ordinary path activation and Startup leave this at zero.
+    capacity_probe_grace_rounds_remaining: u8,
     /// equivalent to BBR.min_rtt_stamp: The wall clock time at which the current BBR.min_rtt sample was obtained.
     min_rtt_stamp: Option<Instant>,
     /// equivalent to BBR.ProbeRTTDuration: A constant specifying the minimum duration for which ProbeRTT state holds C.inflight to BBR.MinPipeCwnd or fewer packets: 200 ms.
@@ -471,7 +533,42 @@ pub struct Bbr3 {
     policer_window_lost_bytes: u64,
     policer_pacing_scale: f64,
     policer_pacing_transitions: u64,
+    /// The first trusted lossy outcome arms confirmation from BBR's existing
+    /// windowed max-bandwidth model.
+    policer_pacing_candidate_armed: bool,
+    /// A burst-edge safety trial discards its first complete outcome so
+    /// delayed losses from the pre-cap flight cannot decide confirmation.
+    policer_pacing_candidate_warmup_windows_remaining: u8,
+    /// Complete post-warmup outcomes still available to confirm a bounded
+    /// safety trial before it is rejected for this semantic Bulk episode.
+    policer_pacing_candidate_confirmation_windows_remaining: u8,
+    /// Sticky evidence that at least one complete confirmation outcome had
+    /// the bounded-horizon short-path latency signature.
+    policer_pacing_candidate_saw_low_latency_window: bool,
+    /// Consecutive fixed-ceiling outcomes with at least two-percent loss. A
+    /// sufficiently long streak disproves the fixed-policer hypothesis.
+    policer_pacing_consecutive_loss_windows: u8,
+    /// Prevents repeated bounded trials after one exhausts its confirmation
+    /// horizon. Only a semantic capacity/path/external reset clears it.
+    policer_pacing_trial_rejected: bool,
+    /// Absolute wire-rate ceiling confirmed from the windowed max-bandwidth
+    /// model. Keeping the snapshot avoids following later model changes.
+    policer_pacing_ceiling_bytes_per_second: f64,
     pacing_bypass_armed: bool,
+    /// Keeps a short-path host capacity probe on its safe paced quantum until
+    /// a complete policer window classifies the probe as clean or lossy.
+    capacity_probe_quantum_guard_armed: bool,
+    /// Packet-timed rounds remaining in the strict drain phase after a host
+    /// pacing cap is first published. Positive-to-positive cap updates do not
+    /// restart this phase.
+    external_cap_drain_rounds_remaining: u8,
+    /// Packet loss declared at one transport timestamp is a protection burst,
+    /// not classification evidence. Sixteen SMSS immediately disables pacing
+    /// bypass; only an already-lossy aggregate opens the temporary quantum
+    /// guard/trial. Later complete outcomes independently classify the path.
+    shallow_loss_declaration_stamp: Option<Instant>,
+    shallow_loss_declaration_bytes: u64,
+    shallow_loss_quantum_guard: bool,
 }
 
 impl Bbr3 {
@@ -623,6 +720,7 @@ impl Bbr3 {
             full_bw_now: false,
             full_bw: 0.0,
             full_bw_count: 0,
+            capacity_probe_grace_rounds_remaining: 0,
             min_rtt_stamp: None,
             probe_rtt_cwnd_gain,
             probe_rtt_duration: params.probe_rtt_duration,
@@ -667,14 +765,29 @@ impl Bbr3 {
             policer_window_lost_bytes: 0,
             policer_pacing_scale: 1.0,
             policer_pacing_transitions: 0,
+            policer_pacing_candidate_armed: false,
+            policer_pacing_candidate_warmup_windows_remaining: 0,
+            policer_pacing_candidate_confirmation_windows_remaining: 0,
+            policer_pacing_candidate_saw_low_latency_window: false,
+            policer_pacing_consecutive_loss_windows: 0,
+            policer_pacing_trial_rejected: false,
+            policer_pacing_ceiling_bytes_per_second: 0.0,
             pacing_bypass_armed: false,
+            capacity_probe_quantum_guard_armed: false,
+            external_cap_drain_rounds_remaining: 0,
+            shallow_loss_declaration_stamp: None,
+            shallow_loss_declaration_bytes: 0,
+            shallow_loss_quantum_guard: false,
         }
     }
 
     /// Refresh the controller-local parameter snapshot. This is called only
     /// after `update_round` has identified a packet-timed round boundary.
     fn refresh_params(&mut self) {
-        let generation = self.tunables.generation.load(Ordering::Relaxed);
+        // Pair with the writer's Release publication so every preceding
+        // relaxed tunable write, including capacity_probe_generation, is
+        // visible before this snapshot is accepted.
+        let generation = self.tunables.generation.load(Ordering::Acquire);
         if generation == self.params_generation {
             return;
         }
@@ -688,11 +801,33 @@ impl Bbr3 {
             params.cwnd_floor_bytes = params.cwnd_cap_bytes;
             clamped += 1;
         }
+        let capacity_probe_requested =
+            params.capacity_probe_generation != self.params.capacity_probe_generation;
+        let external_cap_published = self.params.pacing_rate_cap_bytes_per_second == 0
+            && params.pacing_rate_cap_bytes_per_second > 0;
+        let external_cap_removed = self.params.pacing_rate_cap_bytes_per_second > 0
+            && params.pacing_rate_cap_bytes_per_second == 0;
+        let arm_capacity_probe_quantum_guard = capacity_probe_requested
+            && params.pacing_rate_cap_bytes_per_second == 0
+            && self.capacity_probe_quantum_guard_candidate();
         self.tunables
             .clamped_writes
             .fetch_add(clamped, Ordering::Relaxed);
         self.params = params;
         self.params_generation = generation;
+        if external_cap_published {
+            self.external_cap_drain_rounds_remaining = EXTERNAL_CAP_DRAIN_ROUNDS;
+        } else if external_cap_removed {
+            self.external_cap_drain_rounds_remaining = 0;
+        }
+        if params.pacing_rate_cap_bytes_per_second > 0 {
+            // Host policy now owns shallow-policer pacing. Avoid retaining a
+            // stale controller-local guard after that cap is later removed.
+            self.reset_policer_pacing_episode();
+            self.policer_pacing_trial_rejected = false;
+            self.clear_shallow_loss_quantum_guard();
+            self.capacity_probe_quantum_guard_armed = false;
+        }
 
         self.default_pacing_gain = params.cruise_pacing_gain;
         self.probe_bw_down_pacing_gain = params.probe_bw_down_pacing_gain;
@@ -729,6 +864,41 @@ impl Bbr3 {
                 self.cwnd_gain = self.probe_rtt_cwnd_gain;
             }
         }
+        if capacity_probe_requested {
+            // Transport-level idle restart can be observed during short
+            // sender gaps inside one application Bulk epoch. A new host
+            // capacity-probe generation is the explicit semantic boundary
+            // that retires both confirmed/candidate policer state and the
+            // protective loss-burst guard before fresh discovery.
+            self.reset_policer_pacing_episode();
+            self.clear_shallow_loss_quantum_guard();
+            self.restart_capacity_discovery();
+            self.capacity_probe_grace_rounds_remaining = CAPACITY_PROBE_GRACE_ROUNDS;
+            self.capacity_probe_quantum_guard_armed = arm_capacity_probe_quantum_guard;
+            if self.capacity_probe_quantum_guard_armed {
+                // Classify the probe from a complete outcome window. Reusing
+                // a nearly finished pre-probe window could release the latch
+                // before the newly paced traffic has been observed.
+                self.policer_window_started = None;
+                self.policer_window_acked_bytes = 0;
+                self.policer_window_lost_bytes = 0;
+            }
+            // A host-requested capacity probe must be packet paced. Keeping a
+            // previously armed low-RTT bypass would make the restart retain
+            // the very burst behavior it is intended to re-evaluate.
+            self.pacing_bypass_armed = false;
+        }
+        // Unlike an ordinary BBR model update, an explicit host pacing cap is
+        // authoritative in Startup too. `set_pacing_rate_with_gain` normally
+        // refuses a downward rate change until full bandwidth is reached, so
+        // enforce a newly published cap at this parameter boundary and keep
+        // the pacer's aggregate budget coherent with the clamped rate.
+        if self.params.pacing_rate_cap_bytes_per_second > 0 {
+            self.pacing_rate = self
+                .pacing_rate
+                .min(self.params.pacing_rate_cap_bytes_per_second as f64);
+        }
+        self.set_send_quantum();
     }
 
     /// equivalent to BBREnterStartup <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.1.1-3>
@@ -871,14 +1041,16 @@ impl Bbr3 {
         // a path whose policy says random loss is not congestion, applying
         // the steady-state 0.5*min_rtt guard here repeatedly aborts bandwidth
         // discovery at a fraction of capacity (especially behind a shaped
-        // home uplink). Relax only these upward probes; Drain/Cruise and
+        // home uplink). Startup retains enough room to discover the pipe, but
+        // later ProbeBW-Up cycles use a tighter allowance so they cannot keep
+        // recreating a large steady-state queue. Drain/Cruise and
         // loss-as-congestion presets retain the strict latency guard.
-        let upward_loss_tolerant_probe = !self.params.loss_is_congestion
-            && matches!(
-                self.state,
-                BbrState::Startup | BbrState::ProbeBw(ProbeBwSubstate::Up)
-            );
-        let guard_multiplier = if upward_loss_tolerant_probe { 4.0 } else { 1.0 };
+        let guard_multiplier = match (self.params.loss_is_congestion, self.state) {
+            (false, BbrState::Startup) => 4.0,
+            (false, BbrState::ProbeBw(ProbeBwSubstate::Up)) => 2.0,
+            _ => 1.0,
+        };
+        let upward_loss_tolerant_probe = guard_multiplier > 1.0;
         let relative_slack = self
             .min_rtt
             .mul_f64(self.params.queue_delay_guard_inflation * guard_multiplier);
@@ -922,12 +1094,209 @@ impl Bbr3 {
         }
     }
 
+    fn record_shallow_loss_declaration(&mut self, now: Instant, lost_bytes: u64) {
+        // A same-timestamp loss burst is a protection signal, not policer
+        // classification evidence by itself. Even an inflated or long-RTT
+        // path must stop bypassing the pacer before another oversized burst.
+        let trial_eligible = self.policer_trial_model_is_trustworthy();
+        let high_rate_trial_rejected = self.policer_trial_model_is_too_fast();
+        let burst_threshold = self.smss.saturating_mul(SHALLOW_LOSS_BURST_PACKETS);
+        let previous_burst_bytes = if self.shallow_loss_declaration_stamp == Some(now) {
+            self.shallow_loss_declaration_bytes
+        } else {
+            0
+        };
+        if self.shallow_loss_declaration_stamp == Some(now) {
+            self.shallow_loss_declaration_bytes = self
+                .shallow_loss_declaration_bytes
+                .saturating_add(lost_bytes);
+        } else {
+            self.shallow_loss_declaration_stamp = Some(now);
+            self.shallow_loss_declaration_bytes = lost_bytes;
+        }
+
+        if !self.shallow_loss_quantum_guard
+            && previous_burst_bytes < burst_threshold
+            && self.shallow_loss_declaration_bytes >= burst_threshold
+        {
+            // `on_packet_lost` records each packet in the outcome counters
+            // after calling this function. Thus these counters include the
+            // first fifteen declared losses but not the threshold-crossing
+            // packet. Snapshot them before resetting the post-burst window.
+            // A burst may accelerate an already trustworthy aggregate, but
+            // its packet count alone never classifies a policer.
+            let aggregate_total = self
+                .policer_window_acked_bytes
+                .saturating_add(self.policer_window_lost_bytes);
+            let aggregate_is_lossy = aggregate_total >= POLICER_MIN_SAMPLE_BYTES
+                && self.policer_window_lost_bytes as f64 / aggregate_total as f64
+                    >= POLICER_LOSS_THRESHOLD;
+            let aggregate_elapsed = self
+                .policer_window_started
+                .map_or(Duration::ZERO, |started| {
+                    now.saturating_duration_since(started)
+                });
+            let aggregate_ceiling =
+                self.policer_trial_ceiling(self.policer_window_acked_bytes, aggregate_elapsed);
+            self.pacing_bypass_armed = false;
+            if aggregate_is_lossy
+                && aggregate_ceiling.is_some()
+                && high_rate_trial_rejected
+                && self.policer_pacing_transitions == 0
+            {
+                // A short, high-rate Wi-Fi path is not a shallow policer.
+                // Latch the rejection before a later degraded model falls
+                // below the admission boundary and becomes ambiguous.
+                self.policer_pacing_trial_rejected = true;
+            }
+            if trial_eligible
+                && aggregate_is_lossy
+                && self.policer_pacing_transitions == 0
+                && !self.policer_pacing_trial_rejected
+                && let Some(ceiling) = aggregate_ceiling
+            {
+                // The complete pre-reset aggregate plus a trusted short
+                // minimum RTT warrants one bounded safety trial, not
+                // confirmation. An incomplete burst leaves the running
+                // outcome intact so the normal 500 ms path can classify it.
+                self.policer_window_started = Some(now);
+                self.policer_window_acked_bytes = 0;
+                self.policer_window_lost_bytes = 0;
+                self.policer_pacing_candidate_armed = true;
+                self.policer_pacing_candidate_warmup_windows_remaining = 1;
+                self.policer_pacing_candidate_confirmation_windows_remaining =
+                    POLICER_TRIAL_CONFIRMATION_WINDOWS;
+                self.policer_pacing_candidate_saw_low_latency_window = false;
+                self.policer_pacing_ceiling_bytes_per_second = ceiling;
+                self.shallow_loss_quantum_guard = true;
+                self.clamp_pacing_rate_to_policer_wire_rate();
+            }
+        }
+    }
+
+    fn policer_trial_ceiling(&self, acked: u64, sample_elapsed: Duration) -> Option<f64> {
+        if sample_elapsed < POLICER_SAMPLE_WINDOW
+            || acked == 0
+            || self.max_bw <= 0.0
+            || !self.max_bw.is_finite()
+        {
+            return None;
+        }
+        let trial_ceiling = self.max_bw * POLICER_TRIAL_MAX_BW_SCALE;
+        if trial_ceiling <= 0.0 || !trial_ceiling.is_finite() {
+            return None;
+        }
+        Some(trial_ceiling)
+    }
+
+    fn short_policer_min_rtt_is_trustworthy(&self) -> bool {
+        self.min_rtt != Duration::from_secs(u64::MAX)
+            && !self.min_rtt.is_zero()
+            && self.min_rtt <= POLICER_RTT_CEILING
+    }
+
+    fn policer_trial_model_is_trustworthy(&self) -> bool {
+        self.short_policer_min_rtt_is_trustworthy()
+            && self.min_rtt <= POLICER_FALLBACK_MIN_RTT_CEILING
+            && self.max_bw > 0.0
+            && self.max_bw.is_finite()
+            && self.max_bw < CAPACITY_PROBE_QUANTUM_MAX_BW
+    }
+
+    fn policer_trial_model_is_too_fast(&self) -> bool {
+        self.short_policer_min_rtt_is_trustworthy()
+            && self.min_rtt <= POLICER_FALLBACK_MIN_RTT_CEILING
+            && self.max_bw.is_finite()
+            && self.max_bw >= CAPACITY_PROBE_QUANTUM_MAX_BW
+    }
+
+    fn shallow_queue_rtt_is_trustworthy(&self) -> bool {
+        let shallow_queue_rtt_ceiling = self
+            .min_rtt
+            .saturating_add((self.min_rtt / 2).max(Duration::from_millis(5)));
+        self.short_policer_min_rtt_is_trustworthy() && self.srtt <= shallow_queue_rtt_ceiling
+    }
+
+    fn bounded_horizon_policer_fallback_is_trustworthy(&self) -> bool {
+        let queue_allowance = (self.min_rtt / 2).max(Duration::from_millis(5));
+        self.min_rtt <= POLICER_FALLBACK_MIN_RTT_CEILING
+            && self.srtt
+                <= self
+                    .min_rtt
+                    .saturating_add(queue_allowance.saturating_mul(3))
+    }
+
+    fn clamp_pacing_rate_to_policer_wire_rate(&mut self) {
+        if let Some(wire_rate) = self.policer_learned_wire_rate_ceiling() {
+            self.pacing_rate = self.pacing_rate.min(wire_rate);
+        }
+    }
+
+    fn apply_fixed_policer_pacing_ceiling(&mut self) {
+        if self.policer_pacing_transitions > 0 && self.state != BbrState::ProbeRtt {
+            self.pacing_rate = self.policer_pacing_ceiling_bytes_per_second;
+        }
+        self.clamp_pacing_rate_to_policer_wire_rate();
+        self.set_send_quantum();
+    }
+
+    fn policer_learned_wire_rate_ceiling(&self) -> Option<f64> {
+        if self.policer_pacing_transitions == 0 && !self.policer_pacing_candidate_armed {
+            return None;
+        }
+        let mut wire_rate = self.policer_pacing_ceiling_bytes_per_second;
+        if wire_rate <= 0.0 || !wire_rate.is_finite() {
+            return None;
+        }
+        if self.params.pacing_rate_cap_bytes_per_second > 0 {
+            wire_rate = wire_rate.min(self.params.pacing_rate_cap_bytes_per_second as f64);
+        }
+        Some(wire_rate)
+    }
+
+    fn reset_policer_pacing_episode(&mut self) {
+        self.policer_pacing_scale = 1.0;
+        self.policer_pacing_transitions = 0;
+        self.policer_pacing_candidate_armed = false;
+        self.policer_pacing_candidate_warmup_windows_remaining = 0;
+        self.policer_pacing_candidate_confirmation_windows_remaining = 0;
+        self.policer_pacing_candidate_saw_low_latency_window = false;
+        self.policer_pacing_consecutive_loss_windows = 0;
+        self.policer_pacing_ceiling_bytes_per_second = 0.0;
+    }
+
+    fn clear_shallow_loss_quantum_guard(&mut self) {
+        self.shallow_loss_quantum_guard = false;
+        self.shallow_loss_declaration_stamp = None;
+        self.shallow_loss_declaration_bytes = 0;
+    }
+
     /// Learn the usable wire rate of a shallow policer from transport-level
     /// outcomes. This caps pacing only; it never installs a lasting cwnd or
-    /// max-bandwidth bound, so capacity recovers automatically.
+    /// max-bandwidth bound, and the existing path/episode reset removes it.
     fn update_policer_pacing(&mut self, now: Instant) {
+        if self.params.pacing_rate_cap_bytes_per_second > 0 {
+            // The host policy's explicit cap is already the authoritative
+            // shallow-policer response. Applying the controller-local loss
+            // scale as well makes the two feedback loops multiply and can
+            // ratchet the delivery-rate model below the usable wire rate.
+            // Discard this window too, so removing the external cap starts a
+            // fresh observation interval rather than immediately applying
+            // loss accumulated while the cap was active.
+            self.policer_window_acked_bytes = 0;
+            self.policer_window_lost_bytes = 0;
+            self.policer_window_started = Some(now);
+            self.reset_policer_pacing_episode();
+            self.policer_pacing_trial_rejected = false;
+            self.pacing_bypass_armed = false;
+            self.capacity_probe_quantum_guard_armed = false;
+            self.clear_shallow_loss_quantum_guard();
+            return;
+        }
+
         let started = self.policer_window_started.get_or_insert(now);
-        if now.saturating_duration_since(*started) < POLICER_SAMPLE_WINDOW {
+        let sample_elapsed = now.saturating_duration_since(*started);
+        if sample_elapsed < POLICER_SAMPLE_WINDOW {
             return;
         }
 
@@ -939,8 +1308,9 @@ impl Bbr3 {
             || self.min_rtt.is_zero()
             || self.min_rtt > POLICER_RTT_CEILING
         {
-            self.policer_pacing_scale = 1.0;
+            self.reset_policer_pacing_episode();
             self.pacing_bypass_armed = false;
+            self.clear_shallow_loss_quantum_guard();
             return;
         }
 
@@ -949,14 +1319,158 @@ impl Bbr3 {
             return;
         }
         let loss_ratio = lost as f64 / total as f64;
+        if self.policer_pacing_transitions == 0 && self.policer_pacing_candidate_armed {
+            if self.policer_pacing_candidate_warmup_windows_remaining > 0 {
+                // The first full post-burst outcome can still contain losses
+                // declared for the pre-cap flight. Drain it without changing
+                // the trial ceiling or guard; the next complete window is the
+                // first causal confirmation sample.
+                self.policer_pacing_candidate_warmup_windows_remaining -= 1;
+                self.clamp_pacing_rate_to_policer_wire_rate();
+                return;
+            }
+            // Confirmation is causal rather than merely temporal. A shallow
+            // trial becomes fixed only when a full outcome within the bounded
+            // horizon remains at shallow RTT and is clean. Delayed loss or a
+            // transient queue may consume a window without releasing the
+            // protective trial cap.
+            self.policer_pacing_candidate_saw_low_latency_window |=
+                self.bounded_horizon_policer_fallback_is_trustworthy();
+            if self.shallow_queue_rtt_is_trustworthy() && loss_ratio <= POLICER_CLEAN_THRESHOLD {
+                let confirmed_ceiling = self.policer_pacing_ceiling_bytes_per_second
+                    / POLICER_TRIAL_MAX_BW_SCALE
+                    * POLICER_CONFIRMED_MAX_BW_SCALE;
+                if confirmed_ceiling <= 0.0 || !confirmed_ceiling.is_finite() {
+                    self.reset_policer_pacing_episode();
+                    self.policer_pacing_trial_rejected = true;
+                    self.capacity_probe_quantum_guard_armed = false;
+                    self.clear_shallow_loss_quantum_guard();
+                    return;
+                }
+                self.policer_pacing_candidate_armed = false;
+                self.policer_pacing_candidate_warmup_windows_remaining = 0;
+                self.policer_pacing_candidate_confirmation_windows_remaining = 0;
+                self.policer_pacing_candidate_saw_low_latency_window = false;
+                // Promote from the model frozen at trial entry rather than a
+                // later live max_bw sample.
+                self.policer_pacing_ceiling_bytes_per_second = confirmed_ceiling;
+                self.policer_pacing_scale = POLICER_EPISODE_PACING_SCALE;
+                self.policer_pacing_transitions = 1;
+                self.capacity_probe_quantum_guard_armed = false;
+                self.shallow_loss_quantum_guard = true;
+                self.pacing_bypass_armed = false;
+                self.apply_fixed_policer_pacing_ceiling();
+            } else {
+                if self.policer_pacing_candidate_confirmation_windows_remaining > 1 {
+                    self.policer_pacing_candidate_confirmation_windows_remaining -= 1;
+                    self.clamp_pacing_rate_to_policer_wire_rate();
+                } else if self.policer_pacing_candidate_saw_low_latency_window {
+                    // A very short path can retain a small residual queue for
+                    // every bounded confirmation window even after the trial
+                    // has removed the shallow-shaper overshoot. At the horizon
+                    // only, accept that narrow causal signature. Long-minimum
+                    // and deeply queued paths are excluded by the RTT bounds;
+                    // high-rate Wi-Fi was excluded before trial admission.
+                    // At the bounded horizon, restore a modest amount of the
+                    // conservative trial margin without consulting a later
+                    // live max_bw sample.
+                    let fallback_ceiling =
+                        self.policer_pacing_ceiling_bytes_per_second * POLICER_FALLBACK_TRIAL_SCALE;
+                    if fallback_ceiling > 0.0 && fallback_ceiling.is_finite() {
+                        self.policer_pacing_candidate_armed = false;
+                        self.policer_pacing_candidate_warmup_windows_remaining = 0;
+                        self.policer_pacing_candidate_confirmation_windows_remaining = 0;
+                        self.policer_pacing_candidate_saw_low_latency_window = false;
+                        self.policer_pacing_ceiling_bytes_per_second = fallback_ceiling;
+                        self.policer_pacing_scale = POLICER_EPISODE_PACING_SCALE;
+                        self.policer_pacing_transitions = 1;
+                        self.capacity_probe_quantum_guard_armed = false;
+                        self.shallow_loss_quantum_guard = true;
+                        self.pacing_bypass_armed = false;
+                        self.apply_fixed_policer_pacing_ceiling();
+                    } else {
+                        self.reset_policer_pacing_episode();
+                        self.policer_pacing_trial_rejected = true;
+                        self.capacity_probe_quantum_guard_armed = false;
+                        self.clear_shallow_loss_quantum_guard();
+                    }
+                } else {
+                    // One semantic Bulk episode gets one bounded safety
+                    // trial. Later bursts may protect one window, but cannot
+                    // repeatedly re-enter a Wi-Fi/interference trial.
+                    self.reset_policer_pacing_episode();
+                    self.policer_pacing_trial_rejected = true;
+                    self.capacity_probe_quantum_guard_armed = false;
+                    self.clear_shallow_loss_quantum_guard();
+                }
+            }
+            return;
+        }
+        if self.policer_pacing_transitions > 0 {
+            if loss_ratio >= POLICER_LOSS_THRESHOLD {
+                self.policer_pacing_consecutive_loss_windows = self
+                    .policer_pacing_consecutive_loss_windows
+                    .saturating_add(1);
+                if self.policer_pacing_consecutive_loss_windows
+                    >= POLICER_CONFIRMED_LOSS_REVOKE_WINDOWS
+                {
+                    // Persistent loss disproves a shallow policer. Retire the
+                    // fixed ceiling and guard for this semantic Bulk episode.
+                    self.reset_policer_pacing_episode();
+                    self.policer_pacing_trial_rejected = true;
+                    self.capacity_probe_quantum_guard_armed = false;
+                    self.clear_shallow_loss_quantum_guard();
+                    return;
+                }
+            } else {
+                self.policer_pacing_consecutive_loss_windows = 0;
+            }
+            self.apply_fixed_policer_pacing_ceiling();
+            return;
+        }
         if loss_ratio >= POLICER_LOSS_THRESHOLD {
+            // Only a short path whose frozen BBR model is below the known
+            // high-rate Wi-Fi regime may enter a bounded safety trial.
+            if !self.policer_trial_model_is_trustworthy() {
+                if self.policer_pacing_transitions == 0 && self.policer_trial_model_is_too_fast() {
+                    self.policer_pacing_trial_rejected = true;
+                    self.pacing_bypass_armed = false;
+                }
+                self.clear_shallow_loss_quantum_guard();
+                return;
+            }
+            self.capacity_probe_quantum_guard_armed = false;
+            self.shallow_loss_quantum_guard = true;
             self.pacing_bypass_armed = false;
-            let decrease = (1.0 - loss_ratio).clamp(POLICER_MAX_SINGLE_DECREASE, 0.98);
-            self.policer_pacing_scale =
-                (self.policer_pacing_scale * decrease).max(POLICER_MIN_PACING_SCALE);
-            self.policer_pacing_transitions = self.policer_pacing_transitions.saturating_add(1);
+            if self.policer_pacing_transitions == 0 {
+                if self.policer_pacing_trial_rejected {
+                    self.clear_shallow_loss_quantum_guard();
+                    return;
+                }
+                // A complete trustworthy lossy window starts one bounded
+                // trial from the conservative frozen max_bw estimate. The
+                // strict quantum remains armed throughout its confirmation
+                // horizon.
+                let Some(ceiling) = self.policer_trial_ceiling(acked, sample_elapsed) else {
+                    self.clear_shallow_loss_quantum_guard();
+                    return;
+                };
+                self.policer_pacing_candidate_armed = true;
+                // Discard the first post-cap outcome so delayed loss from the
+                // uncapped flight cannot contaminate confirmation.
+                self.policer_pacing_candidate_warmup_windows_remaining = 1;
+                self.policer_pacing_candidate_confirmation_windows_remaining =
+                    POLICER_TRIAL_CONFIRMATION_WINDOWS;
+                self.policer_pacing_candidate_saw_low_latency_window = false;
+                self.policer_pacing_ceiling_bytes_per_second = ceiling;
+            }
+            // Clamp immediately for the trial; a clean complete outcome
+            // within the bounded horizon promotes the same frozen model.
+            self.clamp_pacing_rate_to_policer_wire_rate();
         } else if loss_ratio <= POLICER_CLEAN_THRESHOLD {
+            self.capacity_probe_quantum_guard_armed = false;
             if self.policer_pacing_transitions == 0
+                && !self.shallow_loss_quantum_guard
                 && self.policer_pacing_scale >= 1.0
                 && self
                     .pacing_bypass_below_rtt
@@ -967,23 +1481,21 @@ impl Bbr3 {
                 // Wi-Fi path from a shallow policer before allowing bursts.
                 self.pacing_bypass_armed = true;
             }
-            // Once this controller has proven a shallow policer, retain a 1%
-            // pacing cap. Besides preserving headroom, this keeps the
-            // low-latency timer bypass disabled until path migration creates
-            // a fresh controller; otherwise recovery to exactly 1.0 would
-            // re-enable bursts and repeat the loss cycle.
-            let recovery_ceiling = if self.policer_pacing_transitions == 0 {
-                1.0
-            } else {
-                0.99
-            };
-            self.policer_pacing_scale =
-                (self.policer_pacing_scale + POLICER_ADDITIVE_RECOVERY).min(recovery_ceiling);
+            // An active episode retains its fixed wire ceiling. Clean
+            // windows neither ratchet it down nor recover it upward; only an
+            // episode/path reset returns to unscaled discovery.
+        }
+        if self.policer_pacing_transitions == 0 && !self.policer_pacing_candidate_armed {
+            // A burst without enough prior short-path evidence is protection
+            // for one complete outcome only. Do not leave Wi-Fi/interference
+            // traffic permanently constrained by the shallow quantum.
+            self.clear_shallow_loss_quantum_guard();
         }
     }
 
     fn pacing_bypass_active(&self) -> bool {
-        self.pacing_bypass_armed
+        self.state != BbrState::ProbeRtt
+            && self.pacing_bypass_armed
             && self.policer_pacing_scale >= 1.0
             && self
                 .pacing_bypass_below_rtt
@@ -1193,8 +1705,16 @@ impl Bbr3 {
 
     /// equivalent to BBRSetPacingRateWithGain <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.2-7>
     fn set_pacing_rate_with_gain(&mut self, gain: f64) {
-        let mut rate = gain * self.bw * (100.0 - self.pacing_margin_percent) / 100.0
-            * self.policer_pacing_scale;
+        let learned_policer_ceiling = self.policer_learned_wire_rate_ceiling();
+        // The episode scale is represented by the absolute learned ceiling.
+        // Applying it to the live bandwidth model too would compound loss-
+        // driven max_bw reductions and ratchet pacing below that ceiling.
+        let model_scale = if learned_policer_ceiling.is_some() {
+            1.0
+        } else {
+            self.policer_pacing_scale
+        };
+        let mut rate = gain * self.bw * (100.0 - self.pacing_margin_percent) / 100.0 * model_scale;
         // A runtime cwnd floor represents host-authoritative evidence that
         // the delivery-rate model is trapped below a queued flow's usable
         // BDP.  Raising only cwnd cannot escape that trap because the pacer
@@ -1208,13 +1728,25 @@ impl Bbr3 {
             let floor_rate = self.params.cwnd_floor_bytes as f64
                 / self.cwnd_gain.max(1.0)
                 / self.min_rtt.as_secs_f64()
-                * self.policer_pacing_scale;
+                * model_scale;
             rate = rate.max(floor_rate);
         }
         if self.params.pacing_rate_cap_bytes_per_second > 0 {
             rate = rate.min(self.params.pacing_rate_cap_bytes_per_second as f64);
         }
-        if self.full_bw_reached || rate > self.pacing_rate {
+        if let Some(ceiling) = learned_policer_ceiling {
+            // The bounded pacer now owns this shallow-policer episode. A
+            // loss-depressed short-term bandwidth model must not underfeed
+            // the known sustainable rate in ProbeBW Down/Cruise. ProbeRTT
+            // retains its intentional drain behavior. `ceiling` already
+            // incorporates any lower explicit host cap.
+            rate = if self.state == BbrState::ProbeRtt {
+                rate.min(ceiling)
+            } else {
+                ceiling
+            };
+        }
+        if learned_policer_ceiling.is_some() || self.full_bw_reached || rate > self.pacing_rate {
             self.pacing_rate = rate;
         }
     }
@@ -1376,20 +1908,70 @@ impl Bbr3 {
         self.cwnd_gain = self.probe_rtt_cwnd_gain;
     }
 
+    fn restart_capacity_discovery(&mut self) {
+        // Path activation uses ordinary Startup semantics. Only a new host
+        // capacity-probe generation arms the bounded grace after this reset.
+        self.capacity_probe_grace_rounds_remaining = 0;
+        self.capacity_probe_quantum_guard_armed = false;
+        self.enter_startup();
+        self.reset_full_bw();
+        self.full_bw_reached = false;
+        self.reset_congestion_signals();
+        self.inflight_longterm = u64::MAX;
+        self.inflight_shortterm = u64::MAX;
+        self.bw_shortterm = f64::INFINITY;
+        self.reset_policer_pacing_episode();
+        self.policer_pacing_trial_rejected = false;
+        self.cwnd = self.cwnd.max(self.initial_cwnd);
+
+        let nominal_bandwidth = if self.params.startup_bw_hint_bytes_per_second > 0 {
+            self.params.startup_bw_hint_bytes_per_second as f64
+        } else {
+            let initial_window_rate =
+                if !self.min_rtt.is_zero() && self.min_rtt != Duration::from_secs(u64::MAX) {
+                    self.initial_cwnd as f64 / self.min_rtt.as_secs_f64()
+                } else {
+                    0.0
+                };
+            self.max_bw.max(initial_window_rate)
+        };
+        // A brand-new path activation has neither a delivery model nor an RTT
+        // sample yet. Preserve its constructor pacing in that case; a later
+        // host-requested reprobe has a measured RTT and enters through the
+        // bounded model/IW-per-minRTT baseline above.
+        if nominal_bandwidth > 0.0 {
+            self.pacing_rate = self.startup_pacing_gain * nominal_bandwidth;
+        }
+        if self.params.pacing_rate_cap_bytes_per_second > 0 {
+            self.pacing_rate = self
+                .pacing_rate
+                .min(self.params.pacing_rate_cap_bytes_per_second as f64);
+        }
+        self.set_send_quantum();
+    }
+
     /// equivalent to BBRHandleRestartFromIdle <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.4.1>
     fn handle_restart_from_idle(&mut self, now: Instant) {
-        if self.inflight == 0 && self.app_limited != 0 {
-            self.idle_restart = true;
-            self.extra_acked_interval_start = Some(now);
-            match self.state {
-                BbrState::ProbeBw(_) => {
-                    self.set_pacing_rate_with_gain(1.0);
-                }
-                BbrState::ProbeRtt => {
-                    self.check_probe_rtt_done(now);
-                }
-                _ => {}
+        if self.inflight != 0 {
+            return;
+        }
+        if self.app_limited == 0 {
+            return;
+        }
+        // Transport inflight can briefly drain inside one application Bulk
+        // epoch. Preserve candidate/fixed policer state and its protective
+        // quantum guard; an explicit capacity-probe generation, path
+        // activation, or external pacing authority defines the real reset.
+        self.idle_restart = true;
+        self.extra_acked_interval_start = Some(now);
+        match self.state {
+            BbrState::ProbeBw(_) => {
+                self.set_pacing_rate_with_gain(1.0);
             }
+            BbrState::ProbeRtt => {
+                self.check_probe_rtt_done(now);
+            }
+            _ => {}
         }
     }
 
@@ -1513,13 +2095,26 @@ impl Bbr3 {
         if self.full_bw_now || !self.round_start {
             return;
         }
+        let mut capacity_probe_grace_round = false;
         if let Some(rate_sample) = self.rs {
             if rate_sample.is_app_limited {
                 return;
             }
+            if self.state == BbrState::Startup
+                && self.capacity_probe_grace_rounds_remaining > 0
+                && rate_sample.delivery_rate.is_finite()
+                && rate_sample.delivery_rate > 0.0
+            {
+                self.capacity_probe_grace_rounds_remaining -= 1;
+                capacity_probe_grace_round = true;
+            }
             if rate_sample.delivery_rate >= self.full_bw * FULL_BW_GROWTH {
                 self.reset_full_bw();
                 self.full_bw = rate_sample.delivery_rate;
+                return;
+            }
+
+            if capacity_probe_grace_round {
                 return;
             }
 
@@ -1540,6 +2135,11 @@ impl Bbr3 {
                 return;
             }
         }
+        if self.state == BbrState::Startup && self.capacity_probe_grace_rounds_remaining > 0 {
+            // A round without a usable rate sample is not one of the eight
+            // valid rounds and is not evidence of a delivery-rate plateau.
+            return;
+        }
         self.full_bw_count += 1;
         self.full_bw_now = self.full_bw_count >= MAX_FULL_BW_COUNT;
         if self.full_bw_now {
@@ -1549,6 +2149,7 @@ impl Bbr3 {
 
     /// equivalent to BBREnterDrain <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.2>
     fn enter_drain(&mut self) {
+        self.capacity_probe_grace_rounds_remaining = 0;
         self.state = BbrState::Drain;
         self.pacing_gain = self.drain_pacing_gain;
         self.cwnd_gain = self.default_cwnd_gain;
@@ -1630,7 +2231,15 @@ impl Bbr3 {
                 self.handle_probe_rtt(now);
             }
             _ => {
-                if self.probe_rtt_expired && !self.idle_restart {
+                // A confirmed shallow-policer ceiling is learned from full
+                // outcome windows. Entering ProbeRTT mid-episode drains below
+                // that ceiling and can invalidate the confirmation signal.
+                // Keep the expiry latched so the first update after the
+                // episode ends enters ProbeRTT immediately.
+                if self.probe_rtt_expired
+                    && !self.idle_restart
+                    && self.policer_pacing_transitions == 0
+                {
                     self.enter_probe_rtt();
                     self.save_cwnd();
                     self.probe_rtt_done_stamp = None;
@@ -1662,6 +2271,7 @@ impl Bbr3 {
         self.reset_congestion_signals();
         self.update_congestion_signals(p);
         if self.round_start {
+            self.advance_external_cap_drain_transition();
             self.refresh_params();
         }
         self.update_ack_aggregation(now);
@@ -1676,6 +2286,11 @@ impl Bbr3 {
         self.bound_bw_for_model();
     }
 
+    fn advance_external_cap_drain_transition(&mut self) {
+        self.external_cap_drain_rounds_remaining =
+            self.external_cap_drain_rounds_remaining.saturating_sub(1);
+    }
+
     /// equivalent to BBRSetPacingRate <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.2-7>
     fn set_pacing_rate(&mut self) {
         self.set_pacing_rate_with_gain(self.pacing_gain);
@@ -1684,11 +2299,98 @@ impl Bbr3 {
     /// equivalent to BBRSetSendQuantum <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.3>
     /// this version is based on a version of bbr2 from quiche
     fn set_send_quantum(&mut self) {
-        self.send_quantum = match self.pacing_rate {
+        let external_cap = self.params.pacing_rate_cap_bytes_per_second;
+        let shaping_rate = if external_cap > 0 {
+            self.pacing_rate.min(external_cap as f64)
+        } else {
+            self.pacing_rate
+        };
+        self.send_quantum = self.send_quantum_for(
+            shaping_rate,
+            external_cap > 0,
+            external_cap > 0 && self.external_cap_drain_rounds_remaining > 0,
+            self.shallow_loss_quantum_guard,
+            self.capacity_probe_quantum_guard_armed,
+        );
+    }
+
+    fn capacity_probe_quantum_guard_candidate(&self) -> bool {
+        self.max_bw < CAPACITY_PROBE_QUANTUM_MAX_BW
+            && (self.pacing_bypass_armed
+                || self
+                    .pacing_bypass_below_rtt
+                    .is_some_and(|threshold| self.min_rtt < threshold))
+    }
+
+    fn capacity_probe_quantum_guard(&self, capacity_probe_pending: bool) -> bool {
+        self.capacity_probe_quantum_guard_armed
+            || (capacity_probe_pending && self.capacity_probe_quantum_guard_candidate())
+    }
+
+    fn send_quantum_for(
+        &self,
+        pacing_rate: f64,
+        external_cap_safe: bool,
+        external_cap_drain_safe: bool,
+        shallow_loss_safe: bool,
+        capacity_probe_safe: bool,
+    ) -> u64 {
+        match pacing_rate {
             rate if rate < PACING_RATE_1_2MBPS => self.smss,
             rate if rate < PACING_RATE_24MBPS => 2 * self.smss,
-            _ => min((self.pacing_rate / 1000.0) as u64, HIGH_PACE_MAX_QUANTUM),
-        };
+            rate => {
+                let normal_quantum = min(
+                    (rate / HIGH_PACE_QUANTUMS_PER_SECOND) as u64,
+                    HIGH_PACE_MAX_QUANTUM,
+                );
+                if external_cap_drain_safe {
+                    // A newly published cap first drains any queue left by
+                    // the uncapped quantum with a stricter bounded burst.
+                    min(
+                        normal_quantum,
+                        min(
+                            (rate / EXTERNAL_CAP_DRAIN_QUANTUMS_PER_SECOND) as u64,
+                            self.smss
+                                .saturating_mul(EXTERNAL_CAP_DRAIN_MAX_QUANTUM_PACKETS),
+                        ),
+                    )
+                } else if shallow_loss_safe {
+                    // A correlated loss declaration acts before outcome
+                    // classification. Keep its active-episode safety mode at
+                    // one millisecond and at most twelve packets.
+                    min(
+                        normal_quantum,
+                        min(
+                            (rate / SHALLOW_LOSS_QUANTUMS_PER_SECOND) as u64,
+                            self.smss.saturating_mul(SHALLOW_LOSS_MAX_QUANTUM_PACKETS),
+                        ),
+                    )
+                } else if external_cap_safe {
+                    // Once the publication edge has drained, a host-managed
+                    // cap uses its sustainable one-millisecond budget.
+                    min(
+                        normal_quantum,
+                        min(
+                            (rate / EXTERNAL_CAP_QUANTUMS_PER_SECOND) as u64,
+                            self.smss.saturating_mul(EXTERNAL_CAP_MAX_QUANTUM_PACKETS),
+                        ),
+                    )
+                } else if capacity_probe_safe {
+                    // A bounded short-path reprobe protects both its pending
+                    // first quantum and its grace period with the same strict
+                    // one-millisecond, twelve-packet shallow-queue budget.
+                    min(
+                        normal_quantum,
+                        min(
+                            (rate / CAPACITY_PROBE_QUANTUMS_PER_SECOND) as u64,
+                            self.smss.saturating_mul(CAPACITY_PROBE_MAX_QUANTUM_PACKETS),
+                        ),
+                    )
+                } else {
+                    normal_quantum
+                }
+            }
+        }
     }
 
     /// equivalent to BBRBoundCwndForModel <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.6.4.7>
@@ -1728,7 +2430,11 @@ impl Bbr3 {
         self.cwnd = max(self.cwnd, self.min_pipe_cwnd);
         self.bound_cwnd_for_probe_rtt();
         self.bound_cwnd_for_model();
-        if self.params.cwnd_floor_bytes > 0 {
+        // ProbeRTT must be allowed to drain to probe_rtt_cwnd before its
+        // measurement timer can start. A runtime throughput floor is useful
+        // in every other state, but applying it here can hold the effective
+        // window permanently above the completion predicate.
+        if self.state != BbrState::ProbeRtt && self.params.cwnd_floor_bytes > 0 {
             self.cwnd = self.cwnd.max(self.params.cwnd_floor_bytes);
         }
         if self.params.cwnd_cap_bytes > 0 {
@@ -1785,31 +2491,9 @@ impl Bbr3 {
 }
 impl Controller for Bbr3 {
     fn on_path_activated(&mut self) {
-        // Keep validated RTT history, but discard the low-rate/app-limited standby
-        // operating point. Per-path keepalives are deliberately sparse and must not
-        // leave a newly selected path cruising at their delivery rate.
-        self.enter_startup();
-        self.reset_full_bw();
-        self.full_bw_reached = false;
-        self.reset_congestion_signals();
-        self.inflight_longterm = u64::MAX;
-        self.inflight_shortterm = u64::MAX;
-        self.bw_shortterm = f64::INFINITY;
-        self.policer_pacing_scale = 1.0;
-        self.cwnd = self.cwnd.max(self.initial_cwnd);
-
-        let nominal_bandwidth = if self.params.startup_bw_hint_bytes_per_second > 0 {
-            self.params.startup_bw_hint_bytes_per_second as f64
-        } else {
-            self.initial_cwnd as f64 / 0.001
-        };
-        self.pacing_rate = self.startup_pacing_gain * nominal_bandwidth;
-        if self.params.pacing_rate_cap_bytes_per_second > 0 {
-            self.pacing_rate = self
-                .pacing_rate
-                .min(self.params.pacing_rate_cap_bytes_per_second as f64);
-        }
-        self.send_quantum = 2 * self.smss;
+        self.clear_shallow_loss_quantum_guard();
+        self.external_cap_drain_rounds_remaining = 0;
+        self.restart_capacity_discovery();
     }
 
     fn on_packet_sent(&mut self, now: Instant, bytes: u16, pn: u64) {
@@ -1991,6 +2675,7 @@ impl Controller for Bbr3 {
 
     fn on_packet_lost(&mut self, lost_bytes: u16, pn: u64, now: Instant) {
         let lost_bytes_64 = lost_bytes as u64;
+        self.record_shallow_loss_declaration(now, lost_bytes_64);
         self.policer_window_lost_bytes =
             self.policer_window_lost_bytes.saturating_add(lost_bytes_64);
         self.lost += lost_bytes_64;
@@ -2046,12 +2731,65 @@ impl Controller for Bbr3 {
     }
 
     fn metrics(&self) -> ControllerMetrics {
-        let pacing_enabled = !self.pacing_bypass_active();
+        // The host publishes tunables with a Release generation store, while
+        // BBR normally adopts them only on a packet-timed round boundary. A
+        // newly detected shallow policer cannot safely wait for that boundary:
+        // the old token bucket may still contain a 64 KB burst. Observe the
+        // published cap here so the very next pacing check clamps both rate
+        // and capacity. Other controller parameters retain round semantics.
+        let live_generation = self.tunables.generation.load(Ordering::Acquire);
+        let generation_pending = live_generation != self.params_generation;
+        let capacity_probe_pending = generation_pending
+            && self
+                .tunables
+                .capacity_probe_generation
+                .load(Ordering::Relaxed)
+                != self.params.capacity_probe_generation;
+        let raw_live_cap = self
+            .tunables
+            .pacing_rate_cap_bytes_per_second
+            .load(Ordering::Relaxed);
+        let live_cap = if raw_live_cap == 0 || raw_live_cap >= 64 * 1024 {
+            raw_live_cap
+        } else {
+            64 * 1024
+        };
+        let external_cap = if generation_pending {
+            live_cap
+        } else {
+            self.params.pacing_rate_cap_bytes_per_second
+        };
+        let pacing_rate = if external_cap > 0 {
+            self.pacing_rate.min(external_cap as f64)
+        } else {
+            self.pacing_rate
+        };
+        let capacity_probe_safe = self.capacity_probe_quantum_guard(capacity_probe_pending);
+        let external_cap_drain_safe = external_cap > 0
+            && (self.external_cap_drain_rounds_remaining > 0
+                || (generation_pending
+                    && self.params.pacing_rate_cap_bytes_per_second == 0
+                    && live_cap > 0));
+        let send_quantum = self.send_quantum_for(
+            pacing_rate,
+            external_cap > 0,
+            external_cap_drain_safe,
+            self.shallow_loss_quantum_guard,
+            capacity_probe_safe,
+        );
+        // A live positive cap is authoritative even if the controller-local
+        // low-RTT pacing bypass has not yet reached its next ACK update. The
+        // host capacity-probe edge likewise resumes pacing before the next
+        // packet-timed round adopts and restarts the controller model.
+        let pacing_enabled = external_cap > 0
+            || capacity_probe_safe
+            || self.shallow_loss_quantum_guard
+            || !self.pacing_bypass_active();
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
-            pacing_rate: pacing_enabled.then_some(self.pacing_rate.round() as u64),
-            send_quantum: pacing_enabled.then_some(self.send_quantum),
+            pacing_rate: pacing_enabled.then_some(pacing_rate.round() as u64),
+            send_quantum: pacing_enabled.then_some(send_quantum),
             queue_delay_guard_transitions: self.queue_delay_guard_transitions,
             policer_pacing_scale_per_mille: (self.policer_pacing_scale * 1_000.0)
                 .round()
@@ -2290,23 +3028,877 @@ mod test {
     }
 
     #[test]
+    fn pending_host_capacity_probe_resumes_low_rtt_pacing_before_round_refresh() {
+        let mut config = Bbr3Config::default();
+        config.pacing_bypass_below_rtt(Some(Duration::from_millis(5)));
+        let mut bbr3 = Bbr3::new(Arc::new(config), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.min_rtt = Duration::from_millis(4);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 13_000_000.0;
+        bbr3.pacing_bypass_armed = true;
+        assert!(bbr3.metrics().pacing_rate.is_none());
+        assert!(bbr3.metrics().send_quantum.is_none());
+
+        handle.capacity_probe_generation.store(1, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+
+        let pending = bbr3.metrics();
+        assert_eq!(bbr3.params_generation, 0);
+        assert_eq!(pending.pacing_rate, Some(13_000_000));
+        assert_eq!(pending.send_quantum, Some(13_000));
+
+        bbr3.refresh_params();
+        assert!(!bbr3.pacing_bypass_armed);
+        assert!(bbr3.capacity_probe_quantum_guard_armed);
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS
+        );
+        assert!(bbr3.metrics().pacing_rate.is_some());
+        assert_eq!(bbr3.metrics().send_quantum, Some(12 * 1_200));
+    }
+
+    #[test]
+    fn pending_capacity_probe_quantum_guard_respects_short_low_bw_boundaries() {
+        let mut config = Bbr3Config::default();
+        config.pacing_bypass_below_rtt(Some(Duration::from_millis(5)));
+        let mut bbr3 = Bbr3::new(Arc::new(config), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.pacing_rate = 100_000_000.0;
+        bbr3.min_rtt = Duration::from_millis(4);
+        bbr3.max_bw = CAPACITY_PROBE_QUANTUM_MAX_BW - 1.0;
+        handle.capacity_probe_generation.store(1, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+
+        assert_eq!(bbr3.metrics().send_quantum, Some(12 * 1_200));
+
+        // An already high-bandwidth model does not need pending-probe burst
+        // protection, even before the generation reaches a round refresh.
+        bbr3.max_bw = CAPACITY_PROBE_QUANTUM_MAX_BW;
+        assert_eq!(bbr3.metrics().send_quantum, Some(HIGH_PACE_MAX_QUANTUM));
+
+        // The existing bypass boundary is exclusive: paths at the threshold
+        // are not part of the short-RTT capacity-probe special case.
+        bbr3.max_bw = CAPACITY_PROBE_QUANTUM_MAX_BW - 1.0;
+        bbr3.min_rtt = Duration::from_millis(5);
+        assert_eq!(bbr3.metrics().send_quantum, Some(HIGH_PACE_MAX_QUANTUM));
+    }
+
+    #[test]
     fn short_rtt_sustained_loss_automatically_caps_wire_pacing() {
         let start = Instant::now();
         let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        assert_eq!(bbr3.params.pacing_rate_cap_bytes_per_second, 0);
         bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.bw = 10_000_000.0;
+        bbr3.max_bw = 2_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        assert!(!bbr3.full_bw_reached);
         bbr3.policer_window_started = Some(start);
         bbr3.policer_window_acked_bytes = 800_000;
         bbr3.policer_window_lost_bytes = 200_000;
 
         bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
-        assert_eq!(bbr3.policer_pacing_scale, 0.9);
+        assert_eq!(bbr3.policer_pacing_scale, 1.0);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 1_840_000.0);
+        assert_eq!(bbr3.pacing_rate, 1_840_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+        assert_eq!(bbr3.policer_pacing_candidate_warmup_windows_remaining, 1);
+
+        // An unguarded lossy outcome begins the cap, so its first full
+        // post-cap outcome is a drain/warmup sample rather than confirmation.
+        bbr3.policer_window_acked_bytes = 900_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_candidate_warmup_windows_remaining, 0);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+
+        bbr3.policer_window_acked_bytes = 900_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 3);
+        assert_eq!(bbr3.policer_pacing_scale, POLICER_EPISODE_PACING_SCALE);
         assert_eq!(bbr3.policer_pacing_transitions, 1);
-        assert_eq!(bbr3.metrics().policer_pacing_scale_per_mille, 900);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 1_960_000.0);
+        assert_eq!(bbr3.metrics().policer_pacing_scale_per_mille, 1_000);
+        // The confirming outcome lowers Startup's retained monotonic rate
+        // directly; no later set_pacing_rate_with_gain call is needed.
+        assert_eq!(bbr3.pacing_rate, 1_960_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 2 * 1_200);
+    }
+
+    #[test]
+    fn trial_ceiling_bounds_ack_compression_with_discounted_windowed_max_bw() {
+        let start = Instant::now();
+        for (first_acked, second_acked) in [(800_000, 4_200_000), (1_000_000, 5_000_000)] {
+            let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+            bbr3.min_rtt = Duration::from_millis(5);
+            bbr3.srtt = Duration::from_millis(8);
+            bbr3.pacing_rate = 20_000_000.0;
+            bbr3.max_bw = 10_000_000.0;
+            bbr3.policer_window_started = Some(start);
+            bbr3.policer_window_acked_bytes = first_acked;
+            bbr3.policer_window_lost_bytes = 200_000;
+
+            bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+            assert_eq!(bbr3.policer_pacing_transitions, 0);
+            assert!(bbr3.policer_pacing_candidate_armed);
+            assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 9_200_000.0);
+            assert_eq!(bbr3.pacing_rate, 9_200_000.0);
+            assert!(bbr3.shallow_loss_quantum_guard);
+
+            // Warmup and confirmation may carry different ACK phases, while
+            // the promoted ceiling still uses the model frozen at entry.
+            bbr3.max_bw = 30_000_000.0;
+            bbr3.policer_window_acked_bytes = second_acked;
+            bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
+            assert_eq!(bbr3.policer_pacing_transitions, 0);
+            assert!(bbr3.policer_pacing_candidate_armed);
+
+            bbr3.policer_window_acked_bytes = first_acked;
+            bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 3);
+            assert_eq!(bbr3.policer_pacing_transitions, 1);
+            assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 9_800_000.0);
+            assert_eq!(bbr3.pacing_rate, 9_800_000.0);
+            assert!(bbr3.shallow_loss_quantum_guard);
+        }
+    }
+
+    #[test]
+    fn trial_ceiling_uses_only_the_frozen_windowed_model() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.max_bw = 2_000_000.0;
+
+        assert_eq!(
+            bbr3.policer_trial_ceiling(4_000_000, POLICER_SAMPLE_WINDOW),
+            Some(1_840_000.0)
+        );
+    }
+
+    #[test]
+    fn trial_ceiling_rejects_incomplete_or_invalid_outcomes() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.max_bw = 10_000_000.0;
+
+        assert_eq!(
+            bbr3.policer_trial_ceiling(4_000_000, POLICER_SAMPLE_WINDOW - Duration::from_nanos(1)),
+            None
+        );
+        assert_eq!(bbr3.policer_trial_ceiling(0, POLICER_SAMPLE_WINDOW), None);
+        bbr3.max_bw = f64::NAN;
+        assert_eq!(
+            bbr3.policer_trial_ceiling(4_000_000, POLICER_SAMPLE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn no_burst_short_min_rtt_high_loss_arms_trial_despite_inflated_srtt() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(7);
+        bbr3.srtt = Duration::from_millis(30);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_candidate_warmup_windows_remaining, 1);
+        assert_eq!(
+            bbr3.policer_pacing_candidate_confirmation_windows_remaining,
+            POLICER_TRIAL_CONFIRMATION_WINDOWS
+        );
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 9_200_000.0);
+        assert_eq!(bbr3.pacing_rate, 9_200_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+    }
+
+    #[test]
+    fn no_burst_loss_above_ten_ms_min_rtt_does_not_arm_trial() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(13);
+        bbr3.srtt = Duration::from_millis(18);
+        bbr3.bw = 10_000_000.0;
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_candidate_saw_low_latency_window);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+        assert_eq!(bbr3.metrics().send_quantum, Some(HIGH_PACE_MAX_QUANTUM));
+    }
+
+    #[test]
+    fn no_burst_short_min_rtt_loss_below_two_percent_does_not_arm_trial() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(7);
+        bbr3.srtt = Duration::from_millis(30);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 990_000;
+        bbr3.policer_window_lost_bytes = 10_000;
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+    }
+
+    #[test]
+    fn high_rate_short_path_latches_trial_rejection_before_model_declines() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(7);
+        bbr3.srtt = Duration::from_millis(10);
+        bbr3.max_bw = CAPACITY_PROBE_QUANTUM_MAX_BW;
+        bbr3.pacing_rate = 50_000_000.0;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+
+        assert!(bbr3.policer_pacing_trial_rejected);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+
+        // A later degraded delivery model cannot reinterpret the same Bulk
+        // episode as a shallow policer and enter a delayed trial.
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
+
+        assert!(bbr3.policer_pacing_trial_rejected);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+    }
+
+    #[test]
+    fn queue_inflation_on_confirmation_rejects_trial() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(7);
+        bbr3.srtt = Duration::from_millis(10);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert!(bbr3.policer_pacing_candidate_armed);
+
+        bbr3.srtt = Duration::from_micros(22_001);
+        for window in 2..=6 {
+            bbr3.policer_window_acked_bytes = 1_000_000;
+            bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * window);
+            if window < 6 {
+                assert!(bbr3.policer_pacing_candidate_armed);
+                assert_eq!(
+                    bbr3.policer_pacing_candidate_confirmation_windows_remaining,
+                    (6 - window) as u8
+                );
+                assert!(bbr3.shallow_loss_quantum_guard);
+            }
+        }
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_candidate_saw_low_latency_window);
+        assert!(bbr3.policer_pacing_trial_rejected);
+    }
+
+    #[test]
+    fn bounded_horizon_short_path_with_receded_queue_confirms_fallback_ceiling() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(7);
+        bbr3.srtt = Duration::from_millis(22);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_pacing_candidate_armed = true;
+        bbr3.policer_pacing_candidate_confirmation_windows_remaining = 1;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 10_400_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 4_200_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 1);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 11_440_000.0);
+        assert_eq!(bbr3.pacing_rate, 11_440_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_candidate_saw_low_latency_window);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+
+        // Later live model and loss samples do not recalibrate the frozen
+        // confirmed ceiling.
+        bbr3.max_bw = 30_000_000.0;
+        bbr3.policer_window_acked_bytes = 4_200_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 11_440_000.0);
+        assert_eq!(bbr3.policer_pacing_consecutive_loss_windows, 1);
+    }
+
+    #[test]
+    fn bounded_horizon_remembers_middle_low_latency_window_across_final_spike() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(7);
+        bbr3.srtt = Duration::from_millis(22);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_pacing_candidate_armed = true;
+        bbr3.policer_pacing_candidate_confirmation_windows_remaining = 2;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 10_400_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 4_200_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert!(bbr3.policer_pacing_candidate_saw_low_latency_window);
+        assert_eq!(
+            bbr3.policer_pacing_candidate_confirmation_windows_remaining,
+            1
+        );
+
+        bbr3.srtt = Duration::from_millis(30);
+        bbr3.policer_window_acked_bytes = 4_200_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
+
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 1);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 11_440_000.0);
+        assert!(!bbr3.policer_pacing_candidate_saw_low_latency_window);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+    }
+
+    #[test]
+    fn policer_episode_reset_clears_candidate_and_loss_streak() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.max_bw = 2_000_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 1_840_000.0);
+        bbr3.policer_pacing_candidate_saw_low_latency_window = true;
+        bbr3.policer_pacing_consecutive_loss_windows = 2;
+
+        bbr3.restart_capacity_discovery();
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.policer_pacing_candidate_saw_low_latency_window);
+        assert_eq!(bbr3.policer_pacing_consecutive_loss_windows, 0);
+    }
+
+    #[test]
+    fn transport_idle_restart_preserves_policer_state_and_protective_guard() {
+        let now = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.policer_pacing_candidate_armed = true;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 1_960_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_pacing_trial_rejected = true;
+        bbr3.shallow_loss_declaration_stamp = Some(now);
+        bbr3.shallow_loss_declaration_bytes = 16 * 1_200;
+        bbr3.app_limited = 1;
+        assert_eq!(bbr3.inflight, 0);
+
+        bbr3.handle_restart_from_idle(now);
+        assert!(bbr3.idle_restart);
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert!(bbr3.policer_pacing_trial_rejected);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 1_960_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+        assert_eq!(bbr3.shallow_loss_declaration_stamp, Some(now));
+        assert_eq!(bbr3.shallow_loss_declaration_bytes, 16 * 1_200);
+
+        bbr3.policer_pacing_candidate_armed = false;
+        bbr3.policer_pacing_transitions = 1;
+        bbr3.handle_restart_from_idle(now + Duration::from_millis(1));
+        assert_eq!(bbr3.policer_pacing_transitions, 1);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 1_960_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+    }
+
+    #[test]
+    fn path_activation_clears_protective_guard() {
+        let now = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_pacing_trial_rejected = true;
+        bbr3.shallow_loss_declaration_stamp = Some(now);
+        bbr3.shallow_loss_declaration_bytes = 16 * 1_200;
+        bbr3.on_path_activated();
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+        assert_eq!(bbr3.shallow_loss_declaration_stamp, None);
+        assert_eq!(bbr3.shallow_loss_declaration_bytes, 0);
+    }
+
+    #[test]
+    fn learned_policer_wire_rate_is_a_persistent_pacing_target() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.bw = 10_000_000.0;
+        bbr3.policer_pacing_scale = POLICER_EPISODE_PACING_SCALE;
+        bbr3.policer_pacing_transitions = 1;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 8_910_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.pacing_rate = 20_000_000.0;
+        assert!(!bbr3.full_bw_reached);
+
+        // Startup and ProbeBW-Up gains cannot multiply a learned wire rate
+        // back above the shallow policer.
+        bbr3.set_pacing_rate_with_gain(STARTUP_PACING_GAIN);
+        assert_eq!(bbr3.pacing_rate, 8_910_000.0);
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.set_pacing_rate_with_gain(bbr3.probe_bw_up_pacing_gain);
+        assert_eq!(bbr3.pacing_rate, 8_910_000.0);
+
+        // Later loss can depress the live bandwidth model, but it must not
+        // recompute and ratchet the episode's absolute ceiling downward.
+        bbr3.bw = 6_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.set_pacing_rate_with_gain(STARTUP_PACING_GAIN);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 8_910_000.0);
+        assert_eq!(bbr3.pacing_rate, 8_910_000.0);
+
+        // ProbeBW Down/Cruise must not follow a loss-depressed live model
+        // below the sustainable fixed episode rate.
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.full_bw_reached = true;
+        bbr3.set_pacing_rate_with_gain(1.0);
+        assert_eq!(bbr3.pacing_rate, 8_910_000.0);
+
+        // ProbeRTT remains the one intentional underfill state.
+        bbr3.state = BbrState::ProbeRtt;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.set_pacing_rate_with_gain(0.5);
+        assert_eq!(bbr3.pacing_rate, 2_970_000.0);
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+
+        // A clean outcome does not recover the episode-fixed ceiling.
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 1_000_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert_eq!(bbr3.policer_pacing_scale, POLICER_EPISODE_PACING_SCALE);
+        assert_eq!(bbr3.policer_pacing_transitions, 1);
+        bbr3.set_pacing_rate_with_gain(STARTUP_PACING_GAIN);
+        assert_eq!(bbr3.pacing_rate, 8_910_000.0);
+
+        // An explicit host cap remains authoritative when it is lower than
+        // the fixed internal ceiling.
+        bbr3.params.pacing_rate_cap_bytes_per_second = 7_000_000;
+        bbr3.set_pacing_rate_with_gain(STARTUP_PACING_GAIN);
+        assert_eq!(bbr3.pacing_rate, 7_000_000.0);
+    }
+
+    #[test]
+    fn same_timestamp_low_evidence_burst_preserves_outcome_without_quantum_guard() {
+        let now = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.pacing_rate = 13_000_000.0;
+        bbr3.policer_window_started = Some(now - POLICER_SAMPLE_WINDOW);
+        bbr3.policer_window_acked_bytes = 900_000;
+        bbr3.policer_window_lost_bytes = 0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+
+        for pn in 0..15 {
+            bbr3.on_packet_lost(1_200, pn, now);
+            assert!(!bbr3.shallow_loss_quantum_guard);
+            assert_eq!(bbr3.metrics().send_quantum, Some(HIGH_PACE_MAX_QUANTUM));
+        }
+        bbr3.on_packet_lost(1_200, 15, now);
+
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert_eq!(
+            bbr3.policer_window_started,
+            Some(now - POLICER_SAMPLE_WINDOW)
+        );
+        assert_eq!(bbr3.policer_window_acked_bytes, 900_000);
+        assert_eq!(bbr3.policer_window_lost_bytes, 16 * 1_200);
+        bbr3.on_packet_lost(1_200, 16, now);
+        assert_eq!(bbr3.policer_window_lost_bytes, 17 * 1_200);
+        assert_eq!(bbr3.metrics().pacing_rate, Some(13_000_000));
+        assert_eq!(bbr3.metrics().send_quantum, Some(HIGH_PACE_MAX_QUANTUM));
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+    }
+
+    #[test]
+    fn multiple_low_evidence_bursts_preserve_horizon_until_aggregate_arms_trial() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(30);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 900_000;
+
+        let first_burst = start + Duration::from_millis(100);
+        for pn in 0..16 {
+            bbr3.on_packet_lost(1_200, pn, first_burst);
+        }
+        assert_eq!(bbr3.policer_window_started, Some(start));
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+
+        // Additional ACKs keep the second burst's pre-threshold aggregate
+        // below 2%, while its threshold-crossing packet makes the completed
+        // 500 ms aggregate exceed 2%.
+        bbr3.policer_window_acked_bytes += 950_000;
+        let second_burst = start + Duration::from_millis(200);
+        for pn in 16..32 {
+            bbr3.on_packet_lost(1_200, pn, second_burst);
+        }
+        assert_eq!(bbr3.policer_window_started, Some(start));
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_candidate_warmup_windows_remaining, 1);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 9_200_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+    }
+
+    #[test]
+    fn lossy_aggregate_before_burst_enters_trial_before_counters_are_reset() {
+        let now = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(30);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(now - POLICER_SAMPLE_WINDOW);
+        bbr3.policer_window_acked_bytes = 900_000;
+        bbr3.policer_window_lost_bytes = 20_000;
+
+        for pn in 0..16 {
+            bbr3.on_packet_lost(1_200, pn, now);
+        }
+
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_candidate_warmup_windows_remaining, 1);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 9_200_000.0);
+        assert_eq!(bbr3.pacing_rate, 9_200_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+        assert_eq!(bbr3.policer_window_acked_bytes, 0);
+        assert_eq!(bbr3.policer_window_lost_bytes, 1_200);
+    }
+
+    #[test]
+    fn incomplete_lossy_aggregate_burst_waits_for_normal_window() {
+        let now = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(30);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(now - POLICER_SAMPLE_WINDOW / 2);
+        bbr3.policer_window_acked_bytes = 900_000;
+        bbr3.policer_window_lost_bytes = 20_000;
+
+        for pn in 0..16 {
+            bbr3.on_packet_lost(1_200, pn, now);
+        }
+
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert_eq!(
+            bbr3.policer_window_started,
+            Some(now - POLICER_SAMPLE_WINDOW / 2)
+        );
+        assert_eq!(bbr3.policer_window_acked_bytes, 900_000);
+        assert_eq!(bbr3.policer_window_lost_bytes, 20_000 + 16 * 1_200);
+    }
+
+    #[test]
+    fn deep_queued_short_path_gets_bounded_trial_then_rejects() {
+        let now = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.bw = 10_000_000.0;
+        bbr3.max_bw = 2_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.policer_window_started = Some(now);
+        for pn in 0..15 {
+            bbr3.on_packet_lost(1_200, pn, now);
+        }
+        assert_eq!(bbr3.shallow_loss_declaration_bytes, 15 * 1_200);
+
+        // A burst without a complete preceding aggregate closes bypass and
+        // resets the outcome window, but does not impose the q12 timer bound.
+        bbr3.srtt = Duration::from_millis(30);
+        bbr3.on_packet_lost(1_200, 15, now);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert_eq!(bbr3.pacing_rate, 20_000_000.0);
+        assert_eq!(bbr3.shallow_loss_declaration_stamp, Some(now));
+        assert_eq!(bbr3.shallow_loss_declaration_bytes, 16 * 1_200);
+
+        // The next complete lossy outcome enters a temporary trial from the
+        // short minimum RTT despite the currently inflated RTT.
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+        bbr3.update_policer_pacing(now + POLICER_SAMPLE_WINDOW);
+        assert!(bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_candidate_warmup_windows_remaining, 1);
+        assert_eq!(
+            bbr3.policer_pacing_candidate_confirmation_windows_remaining,
+            POLICER_TRIAL_CONFIRMATION_WINDOWS
+        );
+        assert_eq!(bbr3.pacing_rate, 1_840_000.0);
+        assert!(bbr3.shallow_loss_quantum_guard);
+
+        // One drain outcome plus four complete inflated/lossy confirmation
+        // outcomes exhaust the bounded trial without oscillating quantum.
+        for attempt in 1..=POLICER_TRIAL_CONFIRMATION_WINDOWS + 1 {
+            bbr3.policer_window_acked_bytes = 800_000;
+            bbr3.policer_window_lost_bytes = 200_000;
+            bbr3.update_policer_pacing(now + POLICER_SAMPLE_WINDOW * u32::from(attempt + 1));
+            if attempt <= POLICER_TRIAL_CONFIRMATION_WINDOWS {
+                assert!(bbr3.policer_pacing_candidate_armed);
+                assert_eq!(
+                    bbr3.policer_pacing_candidate_confirmation_windows_remaining,
+                    POLICER_TRIAL_CONFIRMATION_WINDOWS + 1 - attempt
+                );
+                assert_eq!(bbr3.pacing_rate, 1_840_000.0);
+                assert!(bbr3.shallow_loss_quantum_guard);
+            }
+        }
+        assert_eq!(bbr3.policer_pacing_scale, 1.0);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(bbr3.policer_pacing_trial_rejected);
+    }
+
+    #[test]
+    fn low_random_loss_burst_protects_one_window_without_starting_trial() {
+        let start = Instant::now();
+        let mut config = Bbr3Config::default();
+        config.pacing_bypass_below_rtt(Some(Duration::from_millis(5)));
+        let mut bbr3 = Bbr3::new(Arc::new(config), 1_200);
+        bbr3.min_rtt = Duration::from_millis(4);
+        bbr3.srtt = Duration::from_millis(6);
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 1_000_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert!(bbr3.pacing_bypass_armed);
+
+        bbr3.bw = 10_000_000.0;
+        bbr3.max_bw = 2_000_000.0;
+        bbr3.pacing_rate = 20_000_000.0;
+        // The current RTT may already be inflated, but neither it nor an old
+        // bypass arm turns a burst into classification evidence.
+        bbr3.srtt = Duration::from_millis(10);
+        let burst = start + POLICER_SAMPLE_WINDOW + Duration::from_millis(1);
+        for pn in 0..15 {
+            bbr3.on_packet_lost(1_200, pn, burst);
+            assert!(!bbr3.shallow_loss_quantum_guard);
+            assert!(bbr3.pacing_bypass_armed);
+        }
+        bbr3.on_packet_lost(1_200, 15, burst);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.pacing_bypass_armed);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert_eq!(bbr3.pacing_rate, 20_000_000.0);
+
+        // A complete low-random-loss outcome remains on ordinary BBR and can
+        // never transition into a fixed policer episode.
+        bbr3.policer_window_acked_bytes = 1_000_000;
+        bbr3.policer_window_lost_bytes = 2_000;
+        bbr3.update_policer_pacing(burst + POLICER_SAMPLE_WINDOW);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+    }
+
+    #[test]
+    fn split_or_long_rtt_burst_without_aggregate_does_not_arm_quantum_guard() {
+        let now = Instant::now();
+        let mut split = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        split.min_rtt = Duration::from_millis(5);
+        split.srtt = Duration::from_millis(8);
+        for pn in 0..15 {
+            split.on_packet_lost(1_200, pn, now);
+        }
+        split.on_packet_lost(1_200, 15, now + Duration::from_nanos(1));
+        assert!(!split.shallow_loss_quantum_guard);
+        assert_eq!(split.shallow_loss_declaration_bytes, 1_200);
+
+        let mut long_rtt = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        long_rtt.min_rtt = Duration::from_millis(21);
+        for pn in 0..16 {
+            long_rtt.on_packet_lost(1_200, pn, now);
+        }
+        assert!(!long_rtt.shallow_loss_quantum_guard);
+        assert_eq!(long_rtt.shallow_loss_declaration_bytes, 16 * 1_200);
+    }
+
+    #[test]
+    fn low_evidence_burst_stays_unguarded_but_lossy_aggregate_fixes_ceiling() {
+        let start = Instant::now();
+        let mut clean = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        clean.min_rtt = Duration::from_millis(5);
+        clean.srtt = Duration::from_millis(8);
+        for pn in 0..16 {
+            clean.on_packet_lost(1_200, pn, start);
+        }
+        clean.policer_window_acked_bytes = 4_000_000;
+        clean.update_policer_pacing(start + POLICER_SAMPLE_WINDOW - Duration::from_nanos(1));
+        assert!(!clean.shallow_loss_quantum_guard);
+        clean.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert!(!clean.shallow_loss_quantum_guard);
+        assert_eq!(clean.policer_pacing_transitions, 0);
+
+        let mut policer = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        policer.min_rtt = Duration::from_millis(5);
+        policer.srtt = Duration::from_millis(8);
+        policer.bw = 10_000_000.0;
+        policer.max_bw = 2_000_000.0;
+        policer.policer_window_started = Some(start - POLICER_SAMPLE_WINDOW);
+        policer.policer_window_acked_bytes = 800_000;
+        policer.policer_window_lost_bytes = 200_000;
+        for pn in 0..16 {
+            policer.on_packet_lost(1_200, pn, start);
+        }
+        assert!(policer.shallow_loss_quantum_guard);
+        assert!(policer.policer_pacing_candidate_armed);
+        assert_eq!(policer.policer_pacing_candidate_warmup_windows_remaining, 1);
+        assert_eq!(policer.policer_pacing_ceiling_bytes_per_second, 1_840_000.0);
+
+        // The first clean window is still warmup and cannot confirm.
+        policer.policer_window_acked_bytes = 1_000_000;
+        policer.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert!(policer.shallow_loss_quantum_guard);
+        assert!(policer.policer_pacing_candidate_armed);
+        assert_eq!(policer.policer_pacing_candidate_warmup_windows_remaining, 0);
+        assert_eq!(policer.policer_pacing_transitions, 0);
+
+        // One non-causal outcome may follow warmup without dropping the cap.
+        policer.srtt = Duration::from_millis(11);
+        policer.policer_window_acked_bytes = 800_000;
+        policer.policer_window_lost_bytes = 200_000;
+        policer.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
+        assert!(policer.shallow_loss_quantum_guard);
+        assert!(policer.policer_pacing_candidate_armed);
+        assert_eq!(
+            policer.policer_pacing_candidate_confirmation_windows_remaining,
+            3
+        );
+        assert_eq!(policer.policer_pacing_transitions, 0);
+
+        // The second confirmation outcome is clean/currently shallow and fixes.
+        policer.srtt = Duration::from_millis(8);
+        policer.policer_window_acked_bytes = 1_000_000;
+        policer.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 3);
+        assert!(policer.shallow_loss_quantum_guard);
+        assert!(!policer.policer_pacing_candidate_armed);
+        assert_eq!(
+            policer.policer_pacing_candidate_confirmation_windows_remaining,
+            0
+        );
+        assert_eq!(policer.policer_pacing_transitions, 1);
+        assert_eq!(policer.policer_pacing_ceiling_bytes_per_second, 1_960_000.0);
+    }
+
+    #[test]
+    fn external_pacing_cap_disables_internal_policer_scale() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.params.pacing_rate_cap_bytes_per_second = 9_700_000;
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.policer_pacing_scale = 0.8;
+        bbr3.policer_pacing_transitions = 1;
+        bbr3.policer_pacing_candidate_armed = true;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 8_000_000.0;
+        bbr3.policer_pacing_trial_rejected = true;
+        bbr3.pacing_bypass_armed = true;
+        bbr3.capacity_probe_quantum_guard_armed = true;
+        bbr3.policer_window_started = Some(start);
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+
+        let now = start + POLICER_SAMPLE_WINDOW;
+        bbr3.update_policer_pacing(now);
+
+        assert_eq!(bbr3.policer_pacing_scale, 1.0);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.pacing_bypass_armed);
+        assert!(!bbr3.capacity_probe_quantum_guard_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_window_acked_bytes, 0);
+        assert_eq!(bbr3.policer_window_lost_bytes, 0);
+        assert_eq!(bbr3.policer_window_started, Some(now));
 
         bbr3.full_bw_reached = true;
         bbr3.bw = 10_000_000.0;
         bbr3.set_pacing_rate_with_gain(1.0);
-        assert_eq!(bbr3.pacing_rate, 8_910_000.0);
+        assert_eq!(bbr3.pacing_rate, 9_700_000.0);
     }
 
     #[test]
@@ -2317,6 +3909,8 @@ mod test {
         config.low_rtt_cwnd_floor(512 * 1024);
         let mut bbr3 = Bbr3::new(Arc::new(config), 1_200);
         bbr3.min_rtt = Duration::from_millis(4);
+        bbr3.bw = 10_000_000.0;
+        bbr3.max_bw = 2_000_000.0;
         bbr3.policer_window_started = Some(start);
         bbr3.policer_window_acked_bytes = 1_000_000;
 
@@ -2329,35 +3923,93 @@ mod test {
         bbr3.policer_window_lost_bytes = 200_000;
         bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
         assert!(!bbr3.pacing_bypass_armed);
-        assert_eq!(bbr3.policer_pacing_scale, 0.9);
-        assert_eq!(bbr3.policer_pacing_transitions, 1);
+        assert_eq!(bbr3.policer_pacing_scale, POLICER_EPISODE_PACING_SCALE);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert!(bbr3.policer_pacing_candidate_armed);
         assert!(bbr3.metrics().pacing_rate.is_some());
+
+        bbr3.policer_window_acked_bytes = 900_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 3);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert!(bbr3.policer_pacing_candidate_armed);
+
+        bbr3.policer_window_acked_bytes = 900_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 4);
+        assert_eq!(bbr3.policer_pacing_transitions, 1);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 1_960_000.0);
     }
 
     #[test]
-    fn clean_short_path_recovers_additively_and_long_rtt_loss_is_ignored() {
+    fn confirmed_policer_ambiguous_loss_holds_ceiling() {
         let start = Instant::now();
         let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
         bbr3.min_rtt = Duration::from_millis(5);
-        bbr3.policer_pacing_scale = 0.8;
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.max_bw = 3_000_000.0;
+        bbr3.policer_pacing_transitions = 1;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 2_000_000.0;
         bbr3.policer_window_started = Some(start);
-        bbr3.policer_window_acked_bytes = 1_000_000;
+        bbr3.policer_window_acked_bytes = 990_000;
+        bbr3.policer_window_lost_bytes = 10_000;
         bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
-        assert!((bbr3.policer_pacing_scale - 0.82).abs() < f64::EPSILON);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 2_000_000.0);
+        assert_eq!(bbr3.policer_pacing_consecutive_loss_windows, 0);
+    }
 
-        bbr3.min_rtt = Duration::from_millis(85);
+    #[test]
+    fn confirmed_policer_tenth_consecutive_loss_revokes_and_latches() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(5);
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.policer_pacing_transitions = 1;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 2_000_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_window_started = Some(start);
+
+        for window in 1..POLICER_CONFIRMED_LOSS_REVOKE_WINDOWS {
+            bbr3.policer_window_acked_bytes = 800_000;
+            bbr3.policer_window_lost_bytes = 200_000;
+            bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * u32::from(window));
+            assert_eq!(bbr3.policer_pacing_transitions, 1);
+            assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 2_000_000.0);
+            assert_eq!(bbr3.policer_pacing_consecutive_loss_windows, window);
+            assert!(bbr3.shallow_loss_quantum_guard);
+        }
+
         bbr3.policer_window_acked_bytes = 800_000;
         bbr3.policer_window_lost_bytes = 200_000;
-        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
-        assert_eq!(bbr3.policer_pacing_scale, 1.0);
+        bbr3.update_policer_pacing(
+            start + POLICER_SAMPLE_WINDOW * u32::from(POLICER_CONFIRMED_LOSS_REVOKE_WINDOWS),
+        );
         assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert_eq!(bbr3.policer_pacing_consecutive_loss_windows, 0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(bbr3.policer_pacing_trial_rejected);
+    }
 
+    #[test]
+    fn confirmed_policer_any_subthreshold_window_clears_loss_streak() {
+        let start = Instant::now();
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
         bbr3.min_rtt = Duration::from_millis(5);
-        bbr3.policer_pacing_scale = 0.98;
+        bbr3.srtt = Duration::from_millis(8);
         bbr3.policer_pacing_transitions = 1;
-        bbr3.policer_window_acked_bytes = 1_000_000;
-        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 3);
-        assert_eq!(bbr3.policer_pacing_scale, 0.99);
+        bbr3.policer_pacing_ceiling_bytes_per_second = 2_000_000.0;
+        bbr3.policer_window_started = Some(start);
+
+        bbr3.policer_window_acked_bytes = 800_000;
+        bbr3.policer_window_lost_bytes = 200_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert_eq!(bbr3.policer_pacing_consecutive_loss_windows, 1);
+
+        bbr3.policer_window_acked_bytes = 990_000;
+        bbr3.policer_window_lost_bytes = 10_000;
+        bbr3.update_policer_pacing(start + POLICER_SAMPLE_WINDOW * 2);
+        assert_eq!(bbr3.policer_pacing_consecutive_loss_windows, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 2_000_000.0);
+        assert_eq!(bbr3.policer_pacing_transitions, 1);
     }
 
     #[test]
@@ -2372,9 +4024,25 @@ mod test {
         bbr3.set_send_quantum();
         assert_eq!(bbr3.send_quantum, 2_400);
 
+        bbr3.pacing_rate = PACING_RATE_24MBPS - 1.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 2_400);
+
         bbr3.pacing_rate = PACING_RATE_24MBPS;
         bbr3.set_send_quantum();
-        assert_eq!(bbr3.send_quantum, 3_000);
+        assert_eq!(bbr3.send_quantum, 15_000);
+
+        bbr3.pacing_rate = 6_120_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 30_600);
+
+        bbr3.pacing_rate = 13_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+
+        bbr3.pacing_rate = 32_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
 
         bbr3.pacing_rate = 100_000_000.0;
         bbr3.set_send_quantum();
@@ -2383,6 +4051,298 @@ mod test {
         bbr3.pacing_rate = PACING_RATE_1_2MBPS;
         bbr3.on_mtu_update(1_452);
         assert_eq!(bbr3.send_quantum, 2_904);
+    }
+
+    #[test]
+    fn shallow_loss_guard_uses_one_millisecond_twelve_smss_quantum() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.shallow_loss_quantum_guard = true;
+
+        bbr3.pacing_rate = 13_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 13_000);
+
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 12 * 1_200);
+        bbr3.on_mtu_update(1_452);
+        assert_eq!(bbr3.send_quantum, 12 * 1_452);
+
+        // The stricter budget is scoped to the shallow-loss episode. An
+        // ordinary uncapped path returns to the normal high-rate quantum.
+        bbr3.shallow_loss_quantum_guard = false;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+    }
+
+    #[test]
+    fn external_pacing_cap_always_uses_safe_quantum_and_removal_restores_normal() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.params.pacing_rate_cap_bytes_per_second = 14_251_004;
+
+        bbr3.pacing_rate = PACING_RATE_1_2MBPS - 1.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 1_200);
+
+        bbr3.pacing_rate = PACING_RATE_1_2MBPS;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 2_400);
+
+        bbr3.pacing_rate = PACING_RATE_24MBPS - 1.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 2_400);
+
+        bbr3.pacing_rate = PACING_RATE_24MBPS;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 3_000);
+
+        // A latched cap above the current controller model still defines the
+        // active shaper and therefore retains the shallow-queue-safe quantum.
+        bbr3.pacing_rate = 6_120_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 6_120);
+
+        bbr3.pacing_rate = 14_251_004.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 14_251);
+
+        // At a higher binding rate the twelve-packet guard follows the live
+        // SMSS once the one-millisecond byte budget would exceed it.
+        bbr3.params.pacing_rate_cap_bytes_per_second = 20_000_000;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 12 * 1_200);
+        bbr3.on_mtu_update(1_452);
+        assert_eq!(bbr3.send_quantum, 12 * 1_452);
+
+        bbr3.params.pacing_rate_cap_bytes_per_second = 0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+    }
+
+    #[test]
+    fn capacity_probe_quantum_guard_waits_for_clean_or_loss_outcome() {
+        let start = Instant::now();
+        let mut config = Bbr3Config::default();
+        config.pacing_bypass_below_rtt(Some(Duration::from_millis(5)));
+        let config = Arc::new(config);
+
+        let mut clean = Bbr3::new(config.clone(), 1_200);
+        let clean_handle = clean.tunables.clone();
+        clean.pacing_rate = 100_000_000.0;
+        clean.min_rtt = Duration::from_millis(4);
+        clean.max_bw = 10_000_000.0;
+        clean.pacing_bypass_armed = true;
+        clean_handle
+            .capacity_probe_generation
+            .store(1, Ordering::Relaxed);
+        clean_handle.generation.store(1, Ordering::Release);
+        clean.refresh_params();
+        assert!(clean.capacity_probe_quantum_guard_armed);
+
+        // Exhausting discovery grace, or a later inflated RTT/model sample,
+        // cannot create an unprotected normal-quantum window.
+        clean.capacity_probe_grace_rounds_remaining = 0;
+        clean.min_rtt = Duration::from_millis(8);
+        clean.max_bw = CAPACITY_PROBE_QUANTUM_MAX_BW * 2.0;
+        clean.pacing_rate = 100_000_000.0;
+        clean.set_send_quantum();
+        assert_eq!(clean.send_quantum, 12 * 1_200);
+
+        clean.min_rtt = Duration::from_millis(4);
+        clean.policer_window_started = Some(start);
+        clean.policer_window_acked_bytes = 1_000_000;
+        clean.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert!(!clean.capacity_probe_quantum_guard_armed);
+        assert!(!clean.shallow_loss_quantum_guard);
+        assert!(clean.pacing_bypass_armed);
+        assert!(clean.metrics().pacing_rate.is_none());
+
+        let mut loss = Bbr3::new(config, 1_200);
+        loss.capacity_probe_quantum_guard_armed = true;
+        loss.min_rtt = Duration::from_millis(4);
+        loss.srtt = Duration::from_millis(7);
+        loss.max_bw = 2_000_000.0;
+        loss.pacing_rate = 100_000_000.0;
+        loss.policer_window_started = Some(start);
+        loss.policer_window_acked_bytes = 800_000;
+        loss.policer_window_lost_bytes = 200_000;
+        loss.update_policer_pacing(start + POLICER_SAMPLE_WINDOW);
+        assert!(!loss.capacity_probe_quantum_guard_armed);
+        assert!(loss.shallow_loss_quantum_guard);
+        assert!(!loss.pacing_bypass_armed);
+        assert_eq!(loss.policer_pacing_transitions, 0);
+        assert!(loss.policer_pacing_candidate_armed);
+        assert_eq!(loss.metrics().send_quantum, Some(2 * 1_200));
+    }
+
+    #[test]
+    fn high_bandwidth_capacity_probe_does_not_arm_quantum_guard() {
+        let mut config = Bbr3Config::default();
+        config.pacing_bypass_below_rtt(Some(Duration::from_millis(5)));
+        let mut bbr3 = Bbr3::new(Arc::new(config), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.pacing_rate = 100_000_000.0;
+        bbr3.min_rtt = Duration::from_millis(4);
+        bbr3.max_bw = CAPACITY_PROBE_QUANTUM_MAX_BW;
+        bbr3.pacing_bypass_armed = true;
+        handle.capacity_probe_generation.store(1, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+
+        assert!(bbr3.metrics().send_quantum.is_none());
+        bbr3.refresh_params();
+        assert!(!bbr3.capacity_probe_quantum_guard_armed);
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+    }
+
+    #[test]
+    fn startup_applies_a_new_external_pacing_cap_immediately_and_resizes_quantum() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.state = BbrState::Startup;
+        bbr3.full_bw_reached = false;
+        bbr3.capacity_probe_grace_rounds_remaining = CAPACITY_PROBE_GRACE_ROUNDS;
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+        bbr3.capacity_probe_quantum_guard_armed = true;
+
+        handle
+            .pacing_rate_cap_bytes_per_second
+            .store(5_000_000, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+        bbr3.refresh_params();
+
+        assert_eq!(bbr3.state, BbrState::Startup);
+        assert!(!bbr3.full_bw_reached);
+        assert!(!bbr3.capacity_probe_quantum_guard_armed);
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS
+        );
+        assert_eq!(bbr3.pacing_rate, 5_000_000.0);
+        assert_eq!(bbr3.send_quantum, 3_333);
+
+        // Removing the cap does not invent a new bandwidth estimate, but it
+        // immediately restores the uncapped quantum for the current rate.
+        handle
+            .pacing_rate_cap_bytes_per_second
+            .store(0, Ordering::Relaxed);
+        handle.generation.store(2, Ordering::Release);
+        bbr3.refresh_params();
+        assert_eq!(bbr3.pacing_rate, 5_000_000.0);
+        assert_eq!(bbr3.send_quantum, 25_000);
+    }
+
+    #[test]
+    fn metrics_observes_a_published_cap_before_round_refresh() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.pacing_rate = 20_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+
+        handle
+            .pacing_rate_cap_bytes_per_second
+            .store(5_000_000, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+
+        let metrics = bbr3.metrics();
+        assert_eq!(bbr3.params_generation, 0);
+        assert_eq!(bbr3.params.pacing_rate_cap_bytes_per_second, 0);
+        assert_eq!(metrics.pacing_rate, Some(5_000_000));
+        assert_eq!(metrics.send_quantum, Some(3_333));
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+
+        // Cap publication also uses the safe quantum while the retained rate
+        // is just below the new cap, matching the Drain-to-Policer edge that
+        // otherwise exposed one more normal 5 ms burst.
+        bbr3.pacing_rate = 13_000_000.0;
+        handle
+            .pacing_rate_cap_bytes_per_second
+            .store(13_800_000, Ordering::Relaxed);
+        handle.generation.store(2, Ordering::Release);
+        let metrics = bbr3.metrics();
+        assert_eq!(metrics.pacing_rate, Some(13_000_000));
+        assert_eq!(metrics.send_quantum, Some(6 * 1_200));
+    }
+
+    #[test]
+    fn nonbinding_cap_stays_safe_until_it_is_removed() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.pacing_rate = 13_000_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, HIGH_PACE_MAX_QUANTUM);
+
+        handle
+            .pacing_rate_cap_bytes_per_second
+            .store(13_800_000, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+
+        // The live, not-yet-adopted 0 -> positive edge immediately uses the
+        // strict drain quantum.
+        assert_eq!(bbr3.metrics().send_quantum, Some(6 * 1_200));
+        bbr3.refresh_params();
+        assert_eq!(bbr3.send_quantum, 6 * 1_200);
+        assert_eq!(
+            bbr3.external_cap_drain_rounds_remaining,
+            EXTERNAL_CAP_DRAIN_ROUNDS
+        );
+
+        // Updating a positive cap does not restart the four-round drain.
+        handle
+            .pacing_rate_cap_bytes_per_second
+            .store(14_000_000, Ordering::Relaxed);
+        handle.generation.store(2, Ordering::Release);
+        bbr3.refresh_params();
+        assert_eq!(
+            bbr3.external_cap_drain_rounds_remaining,
+            EXTERNAL_CAP_DRAIN_ROUNDS
+        );
+
+        // Updates outside a packet-timed round do not consume the drain.
+        let packet = test_rate_sample(0, 1_200).last_packet;
+        bbr3.next_round_delivered = 1;
+        bbr3.update_model_and_state(packet, Instant::now());
+        assert_eq!(
+            bbr3.external_cap_drain_rounds_remaining,
+            EXTERNAL_CAP_DRAIN_ROUNDS
+        );
+
+        // Each packet-timed round consumes exactly one drain round. The
+        // fourth boundary restores the steady one-millisecond/twelve-SMSS
+        // external-cap quantum.
+        bbr3.next_round_delivered = 0;
+        for remaining in [3, 2, 1] {
+            bbr3.update_model_and_state(packet, Instant::now());
+            bbr3.set_send_quantum();
+            assert_eq!(bbr3.external_cap_drain_rounds_remaining, remaining);
+            assert_eq!(bbr3.send_quantum, 6 * 1_200);
+        }
+        bbr3.update_model_and_state(packet, Instant::now());
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.external_cap_drain_rounds_remaining, 0);
+        assert_eq!(bbr3.send_quantum, 13_000);
+
+        // Moving farther below the cap still computes the safe quantum from
+        // the actual shaping rate rather than returning to the 5 ms budget.
+        bbr3.pacing_rate = 6_120_000.0;
+        bbr3.set_send_quantum();
+        assert_eq!(bbr3.send_quantum, 6_120);
+
+        // Removal keeps the current controller rate while immediately
+        // restoring uncapped quantum semantics.
+        handle
+            .pacing_rate_cap_bytes_per_second
+            .store(0, Ordering::Relaxed);
+        handle.generation.store(3, Ordering::Release);
+        let metrics = bbr3.metrics();
+        assert_eq!(metrics.pacing_rate, Some(6_120_000));
+        assert_eq!(metrics.send_quantum, Some(30_600));
+        bbr3.refresh_params();
+        assert_eq!(bbr3.send_quantum, 30_600);
+        assert_eq!(bbr3.external_cap_drain_rounds_remaining, 0);
     }
 
     #[test]
@@ -2546,20 +4506,56 @@ mod test {
     }
 
     #[test]
-    fn loss_tolerant_upward_probe_gets_room_to_discover_a_shaped_link() {
+    fn loss_tolerant_startup_keeps_four_x_queue_guard_allowance() {
         let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
         bbr3.min_rtt = Duration::from_millis(20);
         bbr3.srtt = Duration::from_millis(40);
         bbr3.bw = 1_000_000.0;
 
         assert!(!bbr3.params.loss_is_congestion);
+        assert_eq!(bbr3.state, BbrState::Startup);
+        assert!(!bbr3.queue_delay_guard_triggered());
+        bbr3.srtt = Duration::from_millis(60);
         assert!(!bbr3.queue_delay_guard_triggered());
         bbr3.srtt = Duration::from_micros(60_001);
         assert!(bbr3.queue_delay_guard_triggered());
+    }
 
-        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
-        bbr3.srtt = Duration::from_micros(30_001);
+    #[test]
+    fn loss_tolerant_probe_bw_up_uses_two_x_queue_guard_and_enters_down() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let now = Instant::now();
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr3.full_bw_reached = true;
+        bbr3.min_rtt = Duration::from_millis(20);
+        bbr3.srtt = Duration::from_millis(40);
+        bbr3.bw = 1_000_000.0;
+
+        assert!(!bbr3.params.loss_is_congestion);
+        assert!(!bbr3.queue_delay_guard_triggered());
+        bbr3.srtt = Duration::from_micros(40_001);
         assert!(bbr3.queue_delay_guard_triggered());
+        bbr3.check_queue_delay_guard(now);
+        assert_eq!(bbr3.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert!(bbr3.full_bw_reached);
+        assert_eq!(bbr3.queue_delay_guard_transitions, 1);
+    }
+
+    #[test]
+    fn random_loss_during_probe_bw_does_not_restart_startup() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let now = Instant::now();
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr3.full_bw_reached = true;
+        bbr3.min_rtt = Duration::from_millis(85);
+        bbr3.srtt = Duration::from_millis(256);
+        bbr3.bw = 1_000_000.0;
+        bbr3.rs = Some(test_rate_sample(12_000, 100_000));
+
+        assert!(!bbr3.is_inflight_too_high());
+        bbr3.check_queue_delay_guard(now);
+        assert_eq!(bbr3.state, BbrState::ProbeBw(ProbeBwSubstate::Down));
+        assert!(bbr3.full_bw_reached);
     }
 
     #[test]
@@ -2629,6 +4625,68 @@ mod test {
         bbr3.rs = Some(test_rate_sample(1_100_000, 24_000));
         bbr3.adapt_long_term_model();
         assert_eq!(bbr3.cycle_count, 2);
+    }
+
+    #[test]
+    fn no_hint_reprobe_uses_long_rtt_initial_window_rate_not_one_millisecond() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.min_rtt = Duration::from_millis(85);
+        bbr3.max_bw = 25_000.0;
+        let old_one_millisecond_rate = bbr3.startup_pacing_gain * bbr3.initial_cwnd as f64 / 0.001;
+        let expected =
+            bbr3.startup_pacing_gain * (bbr3.initial_cwnd as f64 / bbr3.min_rtt.as_secs_f64());
+
+        bbr3.restart_capacity_discovery();
+
+        assert!((bbr3.pacing_rate - expected).abs() < 1.0);
+        assert!(bbr3.pacing_rate < old_one_millisecond_rate / 10.0);
+    }
+
+    #[test]
+    fn established_idle_probe_keeps_its_validated_bandwidth_model() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.full_bw_reached = true;
+        bbr3.min_rtt = Duration::from_millis(25);
+        bbr3.max_bw = 10_000_000.0;
+        bbr3.bw = 10_000_000.0;
+        bbr3.pacing_rate = 10_000_000.0;
+        bbr3.app_limited = 1;
+
+        bbr3.on_packet_sent(Instant::now(), 1_200, 2);
+
+        assert_eq!(bbr3.state, BbrState::ProbeBw(ProbeBwSubstate::Cruise));
+        assert!(bbr3.full_bw_reached);
+    }
+
+    #[test]
+    fn loss_uses_packet_time_app_limited_marker() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let now = Instant::now();
+        let mut sample = test_rate_sample(0, 1_200);
+        sample.is_app_limited = true;
+        bbr3.rs = Some(sample);
+        bbr3.bw_probe_samples = true;
+        bbr3.packets.push_back(BbrPacket {
+            delivered: 0,
+            delivered_time: now,
+            first_send_time: now,
+            send_time: now,
+            is_app_limited: false,
+            tx_in_flight: 1_200,
+            packet_number: 1,
+            size: 1_200,
+            lost: 0,
+            acknowledged: false,
+            round_count: 0,
+        });
+
+        bbr3.process_lost_packet(1_200, 0, now);
+
+        assert!(
+            !bbr3.rs.expect("loss sample").is_app_limited,
+            "losses and ACKs use their packet-time marker, not a later scheduler state"
+        );
     }
 
     #[test]
@@ -2717,6 +4775,220 @@ mod test {
     }
 
     #[test]
+    fn capacity_probe_generation_restarts_startup_once_per_published_request() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.full_bw_reached = true;
+        bbr3.full_bw = 100_000.0;
+        bbr3.full_bw_count = 3;
+        bbr3.min_rtt = Duration::from_millis(25);
+        bbr3.max_bw = 100_000.0;
+        bbr3.bw = 100_000.0;
+
+        handle.capacity_probe_generation.store(1, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+        bbr3.refresh_params();
+
+        assert_eq!(bbr3.params.capacity_probe_generation, 1);
+        assert_eq!(bbr3.state, BbrState::Startup);
+        assert!(!bbr3.full_bw_reached);
+        assert_eq!(bbr3.full_bw, 0.0);
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS
+        );
+
+        // Neither a packet-timed round without a rate sample nor an
+        // application-limited sample consumes semantic discovery grace.
+        bbr3.round_start = true;
+        bbr3.check_full_bw_reached();
+        let mut sample = test_rate_sample(0, 12_000);
+        sample.delivery_rate = 100_000.0;
+        sample.is_app_limited = true;
+        bbr3.rs = Some(sample);
+        bbr3.check_full_bw_reached();
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS
+        );
+
+        // A syntactically completed sample with no usable delivery-rate
+        // estimate (for example the first ACK or a sub-min-RTT interval) is
+        // not a valid discovery round either.
+        sample.is_app_limited = false;
+        sample.delivery_rate = 0.0;
+        bbr3.rs = Some(sample);
+        bbr3.check_full_bw_reached();
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS
+        );
+        assert_eq!(bbr3.full_bw_count, 0);
+        assert!(!bbr3.full_bw_reached);
+
+        sample.delivery_rate = 100_000.0;
+        sample.is_app_limited = false;
+        bbr3.rs = Some(sample);
+        for _ in 0..MAX_FULL_BW_COUNT {
+            bbr3.check_full_bw_reached();
+        }
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS - MAX_FULL_BW_COUNT as u8
+        );
+        assert_eq!(bbr3.full_bw_count, 0);
+        assert!(!bbr3.full_bw_reached);
+
+        // Publishing unrelated tunable changes with the same request
+        // generation must not repeatedly restart an established model.
+        bbr3.enter_drain();
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.full_bw_reached = true;
+        handle
+            .probe_bw_up_pacing_gain_milli
+            .store(1_300, Ordering::Relaxed);
+        handle.generation.store(2, Ordering::Release);
+        bbr3.refresh_params();
+
+        assert_eq!(bbr3.state, BbrState::ProbeBw(ProbeBwSubstate::Cruise));
+        assert!(bbr3.full_bw_reached);
+        assert_eq!(bbr3.capacity_probe_grace_rounds_remaining, 0);
+    }
+
+    #[test]
+    fn capacity_probe_generation_resets_candidate_fixed_and_protective_guard() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let handle = bbr3.tunables.clone();
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.full_bw_reached = true;
+        bbr3.policer_pacing_candidate_armed = true;
+        bbr3.policer_pacing_scale = POLICER_EPISODE_PACING_SCALE;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 12_540_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_pacing_trial_rejected = true;
+        bbr3.shallow_loss_declaration_stamp = Some(Instant::now());
+        bbr3.shallow_loss_declaration_bytes = 16 * 1_200;
+
+        handle.capacity_probe_generation.store(1, Ordering::Relaxed);
+        handle.generation.store(1, Ordering::Release);
+        bbr3.refresh_params();
+
+        assert_eq!(bbr3.params.capacity_probe_generation, 1);
+        assert_eq!(bbr3.state, BbrState::Startup);
+        assert!(!bbr3.full_bw_reached);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+        assert_eq!(bbr3.shallow_loss_declaration_stamp, None);
+        assert_eq!(bbr3.shallow_loss_declaration_bytes, 0);
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS
+        );
+
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.full_bw_reached = true;
+        bbr3.policer_pacing_transitions = 1;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 12_540_000.0;
+        bbr3.shallow_loss_quantum_guard = true;
+        bbr3.policer_pacing_trial_rejected = true;
+        handle.capacity_probe_generation.store(2, Ordering::Relaxed);
+        handle.generation.store(2, Ordering::Release);
+        bbr3.refresh_params();
+
+        assert_eq!(bbr3.state, BbrState::Startup);
+        assert!(!bbr3.full_bw_reached);
+        assert!(!bbr3.policer_pacing_candidate_armed);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.shallow_loss_quantum_guard);
+        assert!(!bbr3.policer_pacing_trial_rejected);
+        assert_eq!(
+            bbr3.capacity_probe_grace_rounds_remaining,
+            CAPACITY_PROBE_GRACE_ROUNDS
+        );
+    }
+
+    #[test]
+    fn capacity_probe_grace_updates_growth_then_requires_normal_plateau() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.restart_capacity_discovery();
+        bbr3.capacity_probe_grace_rounds_remaining = CAPACITY_PROBE_GRACE_ROUNDS;
+        bbr3.round_start = true;
+        let mut sample = test_rate_sample(0, 12_000);
+        let mut delivery_rate = 100_000.0;
+
+        for expected_remaining in (0..CAPACITY_PROBE_GRACE_ROUNDS).rev() {
+            sample.delivery_rate = delivery_rate;
+            bbr3.rs = Some(sample);
+            bbr3.check_full_bw_reached();
+            assert_eq!(
+                bbr3.capacity_probe_grace_rounds_remaining,
+                expected_remaining
+            );
+            assert_eq!(bbr3.full_bw, delivery_rate);
+            assert_eq!(bbr3.full_bw_count, 0);
+            assert!(!bbr3.full_bw_reached);
+            delivery_rate *= 2.0;
+        }
+
+        // Once all eight valid discovery rounds have elapsed, the unchanged
+        // delivery rate uses the ordinary three-round Startup plateau rule.
+        sample.delivery_rate = bbr3.full_bw;
+        bbr3.rs = Some(sample);
+        for expected_count in 1..MAX_FULL_BW_COUNT {
+            bbr3.check_full_bw_reached();
+            bbr3.check_startup_done();
+            assert_eq!(bbr3.state, BbrState::Startup);
+            assert_eq!(bbr3.full_bw_count, expected_count);
+        }
+        bbr3.check_full_bw_reached();
+        bbr3.check_startup_done();
+        assert_eq!(bbr3.state, BbrState::Drain);
+        assert!(bbr3.full_bw_reached);
+        assert_eq!(bbr3.capacity_probe_grace_rounds_remaining, 0);
+    }
+
+    #[test]
+    fn queue_guard_can_end_capacity_probe_during_grace() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.restart_capacity_discovery();
+        bbr3.capacity_probe_grace_rounds_remaining = CAPACITY_PROBE_GRACE_ROUNDS;
+        bbr3.params.loss_is_congestion = true;
+        bbr3.min_rtt = Duration::from_millis(20);
+        bbr3.srtt = Duration::from_millis(40);
+        bbr3.bw = 1_000_000.0;
+
+        bbr3.check_queue_delay_guard(Instant::now());
+
+        assert_eq!(bbr3.state, BbrState::Drain);
+        assert!(bbr3.full_bw_reached);
+        assert_eq!(bbr3.queue_delay_guard_transitions, 1);
+        assert_eq!(bbr3.capacity_probe_grace_rounds_remaining, 0);
+    }
+
+    #[test]
+    fn ordinary_startup_keeps_the_three_round_plateau_rule() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.restart_capacity_discovery();
+        bbr3.round_start = true;
+        bbr3.full_bw = 100_000.0;
+        let mut sample = test_rate_sample(0, 12_000);
+        sample.delivery_rate = 100_000.0;
+        bbr3.rs = Some(sample);
+
+        for _ in 0..MAX_FULL_BW_COUNT {
+            bbr3.check_full_bw_reached();
+        }
+
+        assert_eq!(bbr3.capacity_probe_grace_rounds_remaining, 0);
+        assert!(bbr3.full_bw_reached);
+    }
+
+    #[test]
     fn runtime_caps_apply_to_pacing_and_cwnd() {
         let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
         bbr3.tunables
@@ -2761,6 +5033,52 @@ mod test {
     }
 
     #[test]
+    fn probe_rtt_window_ignores_runtime_and_bypass_floors_and_completes() {
+        let mut config = Bbr3Config::default();
+        config
+            .pacing_bypass_below_rtt(Some(Duration::from_millis(5)))
+            .low_rtt_cwnd_floor(256 * 1024);
+        let mut bbr3 = Bbr3::new(Arc::new(config), 1_200);
+        let now = Instant::now();
+        bbr3.params.cwnd_floor_bytes = 512 * 1024;
+        bbr3.min_rtt = Duration::from_millis(1);
+        bbr3.bw = 10_000_000.0;
+        bbr3.pacing_bypass_armed = true;
+        bbr3.enter_probe_rtt();
+        bbr3.cwnd = 1024 * 1024;
+
+        let probe_cwnd = bbr3.probe_rtt_cwnd();
+        bbr3.set_cwnd();
+        assert_eq!(bbr3.cwnd, probe_cwnd);
+        assert_eq!(bbr3.window(), probe_cwnd);
+        assert!(!bbr3.pacing_bypass_active());
+
+        bbr3.inflight = probe_cwnd;
+        bbr3.handle_probe_rtt(now);
+        assert!(bbr3.probe_rtt_done_stamp.is_some());
+        bbr3.round_start = true;
+        bbr3.handle_probe_rtt(now + bbr3.probe_rtt_duration + Duration::from_millis(1));
+        assert_ne!(bbr3.state, BbrState::ProbeRtt);
+    }
+
+    #[test]
+    fn confirmed_policer_defers_expired_probe_rtt_until_episode_ends() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        let now = Instant::now();
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.probe_rtt_expired = true;
+        bbr3.policer_pacing_transitions = 1;
+
+        bbr3.check_probe_rtt(now);
+        assert_eq!(bbr3.state, BbrState::ProbeBw(ProbeBwSubstate::Cruise));
+        assert!(bbr3.probe_rtt_expired);
+
+        bbr3.policer_pacing_transitions = 0;
+        bbr3.check_probe_rtt(now + Duration::from_millis(1));
+        assert_eq!(bbr3.state, BbrState::ProbeRtt);
+    }
+
+    #[test]
     fn startup_hint_warms_pacing_and_window_and_handles_are_path_local() {
         let template = Arc::new(Bbr3Tunables::default());
         template
@@ -2795,6 +5113,11 @@ mod test {
         bbr3.inflight_shortterm = bbr3.min_pipe_cwnd;
         bbr3.bw_shortterm = 50_000.0;
         bbr3.policer_pacing_scale = 0.5;
+        bbr3.policer_pacing_transitions = 1;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 40_000.0;
+        bbr3.capacity_probe_quantum_guard_armed = true;
+        bbr3.external_cap_drain_rounds_remaining = EXTERNAL_CAP_DRAIN_ROUNDS;
+        bbr3.delivered = 1_000_000;
 
         bbr3.on_path_activated();
 
@@ -2807,7 +5130,13 @@ mod test {
         assert_eq!(bbr3.inflight_shortterm, u64::MAX);
         assert!(bbr3.bw_shortterm.is_infinite());
         assert_eq!(bbr3.policer_pacing_scale, 1.0);
-        assert!(bbr3.pacing_rate > 50_000.0);
+        assert_eq!(bbr3.policer_pacing_transitions, 0);
+        assert_eq!(bbr3.policer_pacing_ceiling_bytes_per_second, 0.0);
+        assert!(!bbr3.capacity_probe_quantum_guard_armed);
+        assert_eq!(bbr3.external_cap_drain_rounds_remaining, 0);
+        // With neither an RTT sample nor a delivery model, activation keeps
+        // the existing safe rate instead of synthesizing IW/1ms.
+        assert_eq!(bbr3.pacing_rate, 50_000.0);
     }
 
     #[test]

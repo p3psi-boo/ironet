@@ -16,8 +16,9 @@ use super::{TUN_REGULAR_INPUT_BYTES, V2RuntimeConfig};
 // Linux gives fq_codel on a TUN a 32 MiB memory limit by default. Once the
 // userspace reader applies backpressure that can retain seconds of stale
 // inner-TCP data and strand FIN/control payloads behind it. Keep the kernel
-// queue close to the userspace window; fq_codel still owns per-flow fairness,
-// ECN marking and overload drops.
+// queue close to the userspace merge window; fq_codel still owns per-flow
+// fairness, ECN marking and overload drops. This is deliberately derived from
+// the bounded userspace merge window rather than becoming an independent queue.
 const TUN_FQ_CODEL_MEMORY_BYTES: usize = TUN_REGULAR_INPUT_BYTES * 2;
 const TUN_FQ_CODEL_PACKET_LIMIT: usize = 1024;
 const V2_NAT_INGRESS_CHAINS: [&str; 2] = ["IRONET_V2_NAT_IN_A", "IRONET_V2_NAT_IN_B"];
@@ -660,6 +661,13 @@ mod tests {
     use iroh::SecretKey;
 
     use super::*;
+
+    #[test]
+    fn tun_fq_codel_memory_tracks_the_bounded_userspace_merge_window() {
+        assert_eq!(TUN_REGULAR_INPUT_BYTES, 512 * 1024);
+        assert_eq!(TUN_FQ_CODEL_MEMORY_BYTES, 1024 * 1024);
+        assert_eq!(TUN_FQ_CODEL_MEMORY_BYTES, TUN_REGULAR_INPUT_BYTES * 2);
+    }
 
     #[test]
     fn derived_addresses_are_stable_network_and_endpoint_scoped() {

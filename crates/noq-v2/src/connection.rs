@@ -1924,7 +1924,9 @@ impl State {
 
         loop {
             // Retry the last transmit, or get a new one.
-            let t = match self.buffered_transmit.take() {
+            let buffered = self.buffered_transmit.take();
+            let flushing_buffered_transmit = buffered.is_some();
+            let t = match buffered {
                 Some(t) => t,
                 None => {
                     self.send_buffer.clear();
@@ -1955,7 +1957,18 @@ impl State {
                     return Ok(false);
                 }
                 Poll::Ready(Err(e)) => return Err(e),
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(())) => {
+                    if flushing_buffered_transmit {
+                        // The protocol charged this batch to the pacer when
+                        // it was constructed, before socket backpressure made
+                        // it pending. Re-anchor at the actual flush and yield:
+                        // constructing another GSO batch in this poll would
+                        // otherwise place two controller quantums adjacently
+                        // on the wire.
+                        self.inner.on_socket_transmit_flush(self.runtime.now());
+                        return Ok(true);
+                    }
+                }
             }
 
             if transmits >= MAX_TRANSMIT_DATAGRAMS {

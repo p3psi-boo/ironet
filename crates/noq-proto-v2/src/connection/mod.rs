@@ -1228,6 +1228,21 @@ impl Connection {
         }
     }
 
+    /// Record the actual flush time of a transmit that waited for shared UDP
+    /// socket writability.
+    ///
+    /// Socket backpressure blocks every path using that socket. Re-anchoring
+    /// all active pacers prevents the blocked interval from being reused as
+    /// elapsed refill credit after the already-accounted batch is flushed.
+    pub fn on_socket_transmit_flush(&mut self, now: Instant) {
+        let abandoned_paths = &self.abandoned_paths;
+        for (path_id, path) in &mut self.paths {
+            if !abandoned_paths.contains(path_id) {
+                path.data.pacing.on_socket_transmit_flush(now);
+            }
+        }
+    }
+
     fn build_transmit(&mut self, path_id: PathId, transmit: TransmitBuf<'_>) -> Transmit {
         debug_assert!(
             !transmit.is_empty(),

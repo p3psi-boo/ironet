@@ -143,6 +143,16 @@ pub struct V2Tx {
     next_cover_sequence: u64,
 }
 
+fn effective_datagram_maximum(
+    live_quic_maximum: usize,
+    negotiated_maximum: u16,
+    route_maximum: usize,
+) -> usize {
+    live_quic_maximum
+        .min(usize::from(negotiated_maximum))
+        .min(route_maximum)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TxRouteV2 {
     epoch: u32,
@@ -520,12 +530,13 @@ impl V2Tx {
         self.next_train_id = self.next_train_id.wrapping_add(1).max(1);
         // PMTU may shrink asynchronously. Read the live QUIC limit for every
         // train so no Cell admitted after a path change can be oversized.
-        let path_maximum = self
-            .connection
-            .max_datagram_size()
-            .context("peer does not support QUIC DATAGRAM")?
-            .min(self.negotiated.limits.max_datagram_size.into())
-            .min(route.datagram_maximum);
+        let path_maximum = effective_datagram_maximum(
+            self.connection
+                .max_datagram_size()
+                .context("peer does not support QUIC DATAGRAM")?,
+            self.negotiated.limits.max_datagram_size,
+            route.datagram_maximum,
+        );
         let maximum_datagram_size = match &self.fec_encoder {
             Some(encoder) if encoder.geometry().parity_cells > 0 => {
                 protected_cell_maximum(path_maximum, encoder.geometry().data_cells)?
@@ -1660,6 +1671,24 @@ mod tests {
     use crate::protocol::v2::tuning::{
         Bbr3PresetV2, Bbr3ProposalV2, CoverTrafficProfileV2, TuneDecisionV2, TuneReasonV2,
     };
+
+    #[test]
+    fn live_quic_datagram_maximum_remains_authoritative() {
+        assert_eq!(
+            effective_datagram_maximum(1_414, u16::MAX, usize::from(u16::MAX)),
+            1_414
+        );
+        assert_eq!(
+            effective_datagram_maximum(1_414, 1_382, usize::from(u16::MAX)),
+            1_382,
+            "an older peer's negotiated ceiling remains compatible"
+        );
+        assert_eq!(
+            effective_datagram_maximum(1_414, u16::MAX, 1_200),
+            1_200,
+            "a compiled transit-path minimum remains authoritative"
+        );
+    }
 
     fn repair_key(stripe_id: u32) -> RepairKeyV2 {
         RepairKeyV2 {

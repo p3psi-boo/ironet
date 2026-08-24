@@ -61,6 +61,383 @@ use crate::{
 const ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES: u64 = 16 * 1024;
 const ADAPTIVE_CWND_FLOOR_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) const LOW_RTT_CWND_FLOOR_BYTES: u64 = 512 * 1024;
+const CAPACITY_PROBE_EDGE_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AdaptiveCwndFloorModeV2 {
+    #[default]
+    Probe,
+    Track,
+}
+
+/// Host-owned hysteresis for the telemetry-driven BBR floor.
+///
+/// A pure one-sample rule made a saturated flow alternate between a large
+/// floor and zero: the large floor drained the producer queue or briefly
+/// raised RTT, which removed the floor on the next one-second sample. Keep a
+/// small amount of per-path state so those expected consequences of probing
+/// become a transition to measured-BDP tracking instead of an on/off switch.
+#[derive(Debug, Clone, Copy, Default)]
+struct AdaptiveCwndFloorStateV2 {
+    path_epoch: u64,
+    mode: AdaptiveCwndFloorModeV2,
+    held_bytes: u64,
+    inactive_ticks: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum InitialBulkProbeV2 {
+    /// No initial Bulk service has reached either edge detector yet.
+    #[default]
+    AwaitingEdge,
+    /// The first Bulk edge was observed inside the current telemetry window.
+    /// Cross the next sample boundary without publishing from that partial
+    /// interval. A hard-safe pressure observation may be retained for the
+    /// complete interval's one-shot decision.
+    AwaitingSampleBoundary,
+    /// The edge is now aligned to a sample boundary; the following tick is
+    /// the first complete post-edge interval and may make the decision.
+    AwaitingCompleteTick,
+    /// The initial epoch's one-shot decision has been consumed.
+    Consumed,
+}
+
+/// Per-connection edge detector for serviced Bulk traffic.
+///
+/// Control and latency traffic never increment the Bulk service counter, so
+/// this cross-layer signal can request capacity discovery without asking BBR
+/// to infer application semantics from ACK timing.
+#[derive(Debug, Clone, Copy, Default)]
+struct CapacityProbeStateV2 {
+    path_epoch: u64,
+    bulk_service_counter: u64,
+    bulk_active: bool,
+    bulk_idle_ticks: u8,
+    bulk_idle_verified: bool,
+    bulk_service_since_tick: bool,
+    /// An explicit path reset, or a fast edge that could not be published,
+    /// still owes the controller one capacity-discovery request. Initial
+    /// connection traffic is deliberately not represented by this flag.
+    probe_pending: bool,
+    initial_bulk_probe: InitialBulkProbeV2,
+    /// A partial initial-Bulk interval showed clean demand above the current
+    /// controller pacing rate. It is evidence only: publication still waits
+    /// for a complete, currently safe interval.
+    initial_clean_demand_seen: bool,
+    /// Set by `update` when this tick only establishes the initial Bulk
+    /// sample boundary. Other edge detectors must ignore the same partial
+    /// telemetry window so it cannot seed a later duplicate restart.
+    initial_sample_incomplete: bool,
+    previous_pacing_cap_bytes_per_second: Option<u64>,
+    loss_episode: bool,
+    loss_signal_latched: bool,
+    consecutive_clean_loss_ticks: u8,
+}
+
+fn controller_policer_episode_active(policer_pacing_transitions: u64) -> bool {
+    // A fixed absolute ceiling can be active at a 1.0 multiplicative scale.
+    // The controller's one-way transition counter is the episode marker.
+    policer_pacing_transitions != 0
+}
+
+impl CapacityProbeStateV2 {
+    fn initialize_bulk_service_counter(&mut self, path_epoch: u64, counter: u64) {
+        self.path_epoch = path_epoch;
+        self.bulk_service_counter = counter;
+        self.initial_bulk_probe = InitialBulkProbeV2::AwaitingEdge;
+        self.initial_clean_demand_seen = false;
+        self.initial_sample_incomplete = false;
+    }
+
+    fn reset_for_path(&mut self, path_epoch: u64) {
+        let bulk_service_counter = self.bulk_service_counter;
+        *self = Self {
+            path_epoch,
+            bulk_service_counter,
+            probe_pending: true,
+            initial_bulk_probe: InitialBulkProbeV2::Consumed,
+            ..Self::default()
+        };
+    }
+
+    /// Observe the cumulative Bulk service byte counter on the lightweight
+    /// edge tick. Initial Bulk traffic only marks a one-shot decision pending:
+    /// the complete one-second telemetry sample decides whether native Startup
+    /// underestimated clean demand without racing shallow-policer
+    /// classification. A later increase requests discovery only after the
+    /// ordinary telemetry path has verified a complete idle horizon (or an
+    /// explicit path reset left a request pending).
+    fn update_bulk_service_counter(&mut self, counter: u64) -> bool {
+        let increased = counter > self.bulk_service_counter;
+        self.bulk_service_counter = counter;
+        if !increased {
+            return false;
+        }
+
+        self.bulk_service_since_tick = true;
+        if self.bulk_active {
+            // Sustained service is positive application-epoch evidence even
+            // if ingress accounting momentarily lags. It must cancel any
+            // partial idle horizon rather than allowing a false re-edge.
+            self.bulk_idle_ticks = 0;
+            self.bulk_idle_verified = false;
+            return false;
+        }
+
+        let verified_new_epoch = self.bulk_idle_verified;
+        let request_capacity_probe = verified_new_epoch || self.probe_pending;
+        if !request_capacity_probe && self.initial_bulk_probe == InitialBulkProbeV2::AwaitingEdge {
+            self.initial_bulk_probe = InitialBulkProbeV2::AwaitingSampleBoundary;
+        }
+        self.bulk_active = true;
+        self.bulk_idle_ticks = 0;
+        self.bulk_idle_verified = false;
+        self.probe_pending = false;
+        // Whether this was the initial epoch or a verified reactivation, the
+        // edge has been consumed. A later backlog observation belongs to the
+        // same epoch and must not restart Startup again.
+        request_capacity_probe
+    }
+
+    fn cancel_bulk_service_edge(&mut self) {
+        self.bulk_active = false;
+        self.bulk_idle_ticks = 0;
+        self.bulk_idle_verified = false;
+        self.bulk_service_since_tick = false;
+        // This method is called only after a requested fast publication could
+        // not find controller tunables. Preserve that explicit request for
+        // the normal telemetry path without pretending idle was verified.
+        self.probe_pending = true;
+    }
+
+    fn update(
+        &mut self,
+        telemetry: PathTelemetryV2,
+        controller_policer_episode_active: bool,
+    ) -> bool {
+        self.initial_sample_incomplete = false;
+        if self.path_epoch == 0 {
+            // The first observed path is connection initialization, not a
+            // path migration. Its native controller Startup is sufficient.
+            self.path_epoch = telemetry.path_epoch;
+        } else if self.path_epoch != telemetry.path_epoch {
+            self.reset_for_path(telemetry.path_epoch);
+        }
+
+        let tun_ingress = telemetry.tun_ingress_bytes_per_second;
+        let producer_backlogged =
+            telemetry.packet_train_queue_bytes >= TX_ADMISSION_BATCH_BYTES as u64;
+        let bulk_serviced = std::mem::take(&mut self.bulk_service_since_tick);
+        // A retained controller-internal queue keeps an established Bulk
+        // epoch active, but cannot create an application epoch by itself.
+        let bulk_activity =
+            tun_ingress > 0 || bulk_serviced || (self.bulk_active && producer_backlogged);
+        let initial_probe_state = self.initial_bulk_probe;
+        let initial_complete_tick = initial_probe_state == InitialBulkProbeV2::AwaitingCompleteTick;
+        let initial_clean_demand_seen = self.initial_clean_demand_seen;
+        if initial_probe_state == InitialBulkProbeV2::AwaitingSampleBoundary {
+            // This sample may contain almost a full second from before the
+            // fast edge. Never publish from it, but retain a hard-safe clean
+            // pressure observation so a rate fall in the next full interval
+            // does not erase evidence that native Startup under-estimated the
+            // initial demand.
+            self.initial_clean_demand_seen =
+                initial_bulk_clean_demand_is_safe(telemetry, controller_policer_episode_active);
+            self.initial_bulk_probe = InitialBulkProbeV2::AwaitingCompleteTick;
+            self.initial_sample_incomplete = true;
+        } else if initial_complete_tick {
+            // Exactly one complete telemetry interval may decide the initial
+            // epoch. A later clean sample must never resurrect a decision
+            // suppressed by Startup, loss, or a policer transition.
+            self.initial_bulk_probe = InitialBulkProbeV2::Consumed;
+            self.initial_clean_demand_seen = false;
+        }
+        let verified_new_epoch = self.bulk_idle_verified;
+        if bulk_activity && self.bulk_active {
+            // A renewed Bulk byte or retained admission backlog belongs to
+            // the current epoch; a one-tick producer lull must not rearm a
+            // second capacity probe.
+            self.bulk_idle_ticks = 0;
+            self.bulk_idle_verified = false;
+            if initial_complete_tick {
+                return initial_bulk_capacity_probe_is_safe(
+                    telemetry,
+                    controller_policer_episode_active,
+                    initial_clean_demand_seen,
+                );
+            }
+        }
+        let new_active_epoch = bulk_activity && !self.bulk_active;
+        if new_active_epoch {
+            let initial_partial_tick = initial_probe_state == InitialBulkProbeV2::AwaitingEdge;
+            if initial_partial_tick {
+                // Without a preceding fast edge this is still the first
+                // boundary at which initial Bulk is known to be active. The
+                // following interval is the first one allowed to publish.
+                self.initial_clean_demand_seen =
+                    initial_bulk_clean_demand_is_safe(telemetry, controller_policer_episode_active);
+                self.initial_bulk_probe = InitialBulkProbeV2::AwaitingCompleteTick;
+                self.initial_sample_incomplete = true;
+            }
+            let request_capacity_probe = verified_new_epoch
+                || self.probe_pending
+                || (initial_complete_tick
+                    && initial_bulk_capacity_probe_is_safe(
+                        telemetry,
+                        controller_policer_episode_active,
+                        initial_clean_demand_seen,
+                    ));
+            self.bulk_active = true;
+            self.bulk_idle_verified = false;
+            self.probe_pending = false;
+            return request_capacity_probe;
+        }
+        if !bulk_activity && self.bulk_active {
+            self.bulk_idle_ticks = self.bulk_idle_ticks.saturating_add(1);
+            let idle_horizon = if controller_policer_episode_active {
+                5
+            } else {
+                2
+            };
+            if self.bulk_idle_ticks >= idle_horizon {
+                self.bulk_active = false;
+                self.bulk_idle_ticks = 0;
+                self.bulk_idle_verified = true;
+            }
+        }
+        false
+    }
+
+    fn update_loss_episode(
+        &mut self,
+        telemetry: PathTelemetryV2,
+        controller_policer_episode_active: bool,
+    ) -> bool {
+        if telemetry.path_epoch != self.path_epoch {
+            self.reset_for_path(telemetry.path_epoch);
+            return false;
+        }
+        // A controller-confirmed shallow-policer episode is expected to turn
+        // a lossy probe into clean delivery. Treating those clean ticks as a
+        // recovery edge would restart Startup, discard the fixed ceiling and
+        // recreate the same loss. A true idle/new-Bulk epoch is still handled
+        // by `update`/the fast Bulk service edge, and a path change resets all
+        // state above.
+        if controller_policer_episode_active {
+            self.loss_episode = false;
+            self.loss_signal_latched = false;
+            self.consecutive_clean_loss_ticks = 0;
+            return false;
+        }
+        if telemetry.tun_ingress_bytes_per_second == 0 {
+            self.loss_episode = false;
+            self.loss_signal_latched = false;
+            self.consecutive_clean_loss_ticks = 0;
+            return false;
+        }
+
+        const LOSS_EPISODE_THRESHOLD_PPM: u32 = 10_000;
+        let episode_signal = telemetry.loss_ppm >= LOSS_EPISODE_THRESHOLD_PPM
+            || telemetry.residual_loss_ppm >= LOSS_EPISODE_THRESHOLD_PPM
+            || telemetry.burst_loss_cells >= 3;
+        if !episode_signal {
+            self.loss_signal_latched = false;
+        } else if !self.loss_signal_latched {
+            self.loss_signal_latched = true;
+            self.loss_episode = true;
+            self.consecutive_clean_loss_ticks = 0;
+            return false;
+        }
+        if !self.loss_episode {
+            return false;
+        }
+        if telemetry.loss_ppm != 0 || telemetry.residual_loss_ppm != 0 {
+            self.consecutive_clean_loss_ticks = 0;
+            return false;
+        }
+
+        self.consecutive_clean_loss_ticks = self.consecutive_clean_loss_ticks.saturating_add(1);
+        if self.consecutive_clean_loss_ticks < 2 {
+            return false;
+        }
+        self.loss_episode = false;
+        self.consecutive_clean_loss_ticks = 0;
+        true
+    }
+
+    fn update_loss_episode_if_complete(
+        &mut self,
+        telemetry: PathTelemetryV2,
+        controller_policer_episode_active: bool,
+    ) -> bool {
+        !self.initial_sample_incomplete
+            && self.update_loss_episode(telemetry, controller_policer_episode_active)
+    }
+
+    fn update_pacing_cap(&mut self, pacing_cap_bytes_per_second: u64, tun_active: bool) -> bool {
+        let released = tun_active
+            && self
+                .previous_pacing_cap_bytes_per_second
+                .is_some_and(|previous| previous > 0 && pacing_cap_bytes_per_second == 0);
+        self.previous_pacing_cap_bytes_per_second = Some(pacing_cap_bytes_per_second);
+        released
+    }
+
+    fn update_pacing_cap_if_complete(
+        &mut self,
+        pacing_cap_bytes_per_second: u64,
+        tun_active: bool,
+    ) -> bool {
+        if self.initial_sample_incomplete {
+            // A cap transition inside the discarded partial interval is not
+            // a capacity-discovery edge. Still advance the remembered value:
+            // otherwise a release that happened in this interval would be
+            // reported one tick late, after the complete initial-Bulk sample
+            // has already made its own one-shot decision.
+            self.previous_pacing_cap_bytes_per_second = Some(pacing_cap_bytes_per_second);
+            return false;
+        }
+        self.update_pacing_cap(pacing_cap_bytes_per_second, tun_active)
+    }
+}
+
+fn initial_bulk_capacity_probe_is_safe(
+    telemetry: PathTelemetryV2,
+    controller_policer_episode_active: bool,
+    initial_clean_demand_seen: bool,
+) -> bool {
+    initial_bulk_sample_is_safe(telemetry, controller_policer_episode_active)
+        && (initial_clean_demand_seen
+            || telemetry.tun_ingress_bytes_per_second
+                > telemetry.controller_pacing_rate_bytes_per_second)
+}
+
+fn initial_bulk_clean_demand_is_safe(
+    telemetry: PathTelemetryV2,
+    controller_policer_episode_active: bool,
+) -> bool {
+    initial_bulk_sample_is_safe(telemetry, controller_policer_episode_active)
+        && telemetry.tun_ingress_bytes_per_second
+            > telemetry.controller_pacing_rate_bytes_per_second
+}
+
+fn initial_bulk_sample_is_safe(
+    telemetry: PathTelemetryV2,
+    controller_policer_episode_active: bool,
+) -> bool {
+    !controller_policer_episode_active
+        && telemetry.controller_state != 0
+        && telemetry.loss_ppm == 0
+        && telemetry.residual_loss_ppm == 0
+        && telemetry.burst_loss_cells == 0
+}
+
+fn fast_capacity_probe_path_matches(current_identity: &str, selected_identity: &str) -> bool {
+    // Before the first complete sample there is no path-owned state to
+    // publish. During migration, let the normal tick advance the path epoch
+    // and reset the state before any edge can touch the new path's tunables.
+    !current_identity.is_empty() && current_identity == selected_identity
+}
 
 #[derive(Debug, Clone, Copy)]
 struct AutotuneTapSampleV2<'a> {
@@ -264,49 +641,161 @@ fn autotune_tap_record(
     })
 }
 
+fn quantize_adaptive_cwnd_floor(bytes: u64) -> u64 {
+    bytes
+        .min(ADAPTIVE_CWND_FLOOR_MAX_BYTES)
+        .div_ceil(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
+        .saturating_mul(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
+        .min(ADAPTIVE_CWND_FLOOR_MAX_BYTES)
+}
+
+fn measured_cwnd_floor(telemetry: PathTelemetryV2, effective: &BbrEffectiveV1) -> u64 {
+    let demand_rate = telemetry
+        .tun_ingress_bytes_per_second
+        .max(telemetry.delivery_rate_bytes_per_second)
+        .max(telemetry.real_traffic_bytes_per_second);
+    cwnd_floor_for_rate(demand_rate, telemetry.min_rtt, effective)
+}
+
+fn cwnd_floor_for_rate(
+    rate_bytes_per_second: u64,
+    min_rtt: Duration,
+    effective: &BbrEffectiveV1,
+) -> u64 {
+    let bdp = u128::from(rate_bytes_per_second).saturating_mul(min_rtt.as_micros()) / 1_000_000;
+    quantize_adaptive_cwnd_floor(
+        bdp.saturating_mul(u128::from(effective.default_cwnd_gain_milli))
+            .div_ceil(1_000)
+            .min(u128::from(ADAPTIVE_CWND_FLOOR_MAX_BYTES)) as u64,
+    )
+}
+
+impl AdaptiveCwndFloorStateV2 {
+    fn clear(&mut self, path_epoch: u64) -> u64 {
+        self.path_epoch = path_epoch;
+        self.mode = AdaptiveCwndFloorModeV2::Probe;
+        self.held_bytes = 0;
+        self.inactive_ticks = 0;
+        0
+    }
+
+    fn update(
+        &mut self,
+        telemetry: PathTelemetryV2,
+        effective: &BbrEffectiveV1,
+        congestion_window_bytes: u64,
+    ) -> u64 {
+        if self.path_epoch != telemetry.path_epoch {
+            self.clear(telemetry.path_epoch);
+        }
+        if telemetry.reliability != PathReliability::Datagram
+            || effective.loss_is_congestion
+            || telemetry.controller_app_limited
+            || telemetry.cpu_utilization_per_mille >= 900
+            || telemetry.min_rtt.is_zero()
+        {
+            return self.clear(telemetry.path_epoch);
+        }
+
+        let demand_rate = telemetry
+            .tun_ingress_bytes_per_second
+            .max(telemetry.delivery_rate_bytes_per_second)
+            .max(telemetry.real_traffic_bytes_per_second);
+        if demand_rate == 0 && telemetry.packet_train_queue_bytes == 0 {
+            self.inactive_ticks = self.inactive_ticks.saturating_add(1);
+            if self.inactive_ticks >= 2 {
+                return self.clear(telemetry.path_epoch);
+            }
+            return self.held_bytes;
+        }
+        self.inactive_ticks = 0;
+
+        let measured = measured_cwnd_floor(telemetry, effective);
+        let modeled = cwnd_floor_for_rate(
+            telemetry.controller_bw_bytes_per_second,
+            telemetry.min_rtt,
+            effective,
+        );
+        let queue_budget = Duration::from_millis(5).max(telemetry.min_rtt / 2);
+        let queue_inflated = telemetry.queue_delay > queue_budget;
+        let producer_queued = telemetry.packet_train_queue_bytes >= TX_ADMISSION_BATCH_BYTES as u64;
+        let cwnd_matches_model = modeled != 0
+            && u128::from(congestion_window_bytes).saturating_mul(4)
+                >= u128::from(modeled).saturating_mul(3)
+            && u128::from(congestion_window_bytes).saturating_mul(4)
+                <= u128::from(modeled).saturating_mul(5);
+        let controller_model_is_serving_demand =
+            telemetry.controller_bw_bytes_per_second >= demand_rate;
+        // Startup is itself an active capacity probe.  A model that happens
+        // to match its still-growing cwnd must not retire the host floor: the
+        // producer backlog is evidence that Startup still needs room to
+        // discover capacity.  Once Startup has exited, matching model/cwnd
+        // evidence is sufficient to switch to bounded BDP tracking.
+        let controller_has_exited_startup = telemetry.controller_state != 0;
+
+        self.held_bytes = match self.mode {
+            AdaptiveCwndFloorModeV2::Probe if queue_inflated => {
+                // The probe found the bottleneck. Retire its overshoot, but
+                // retain the measured BDP instead of dropping to zero.
+                self.mode = AdaptiveCwndFloorModeV2::Track;
+                measured
+            }
+            AdaptiveCwndFloorModeV2::Probe
+                if controller_has_exited_startup
+                    && producer_queued
+                    && cwnd_matches_model
+                    && controller_model_is_serving_demand =>
+            {
+                // BBR already has a capacity model and its current cwnd is
+                // within one bounded step of that model's BDP. Doubling here
+                // is not discovery: it is a host-created overshoot. Track the
+                // larger of live demand and the controller model directly.
+                self.mode = AdaptiveCwndFloorModeV2::Track;
+                measured.max(modeled)
+            }
+            AdaptiveCwndFloorModeV2::Probe if producer_queued => {
+                // Recovery from an underfilled model still needs an explicit
+                // upward probe; a measured-only floor can be self-limiting.
+                let probe = congestion_window_bytes
+                    .max(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
+                    .saturating_mul(2);
+                measured.max(quantize_adaptive_cwnd_floor(probe))
+            }
+            AdaptiveCwndFloorModeV2::Probe => {
+                // Draining one admission batch is not proof that producer
+                // demand ended. Hold the last probe until the queue returns or
+                // all traffic-rate evidence becomes idle.
+                if self.held_bytes == 0 {
+                    0
+                } else {
+                    self.held_bytes.max(measured)
+                }
+            }
+            AdaptiveCwndFloorModeV2::Track if queue_inflated => {
+                // Congestion may reduce immediately to the measured target;
+                // it must never increase a held floor.
+                self.held_bytes.min(measured)
+            }
+            AdaptiveCwndFloorModeV2::Track => {
+                // Smooth rate-estimator noise while retaining bounded upward
+                // adaptation after a real capacity increase.
+                let lower = quantize_adaptive_cwnd_floor(self.held_bytes.saturating_mul(3) / 4);
+                let upper =
+                    quantize_adaptive_cwnd_floor(self.held_bytes.saturating_mul(5).div_ceil(4));
+                measured.clamp(lower, upper)
+            }
+        };
+        self.held_bytes
+    }
+}
+
+#[cfg(test)]
 fn adaptive_cwnd_floor(
     telemetry: PathTelemetryV2,
     effective: &BbrEffectiveV1,
     congestion_window_bytes: u64,
 ) -> u64 {
-    if telemetry.reliability != PathReliability::Datagram
-        || effective.loss_is_congestion
-        || telemetry.controller_app_limited
-        || telemetry.cpu_utilization_per_mille >= 900
-        || telemetry.packet_train_queue_bytes < TX_ADMISSION_BATCH_BYTES as u64
-        || telemetry.min_rtt.is_zero()
-    {
-        return 0;
-    }
-    let queue_budget = Duration::from_millis(5).max(telemetry.min_rtt / 2);
-    if telemetry.queue_delay > queue_budget {
-        return 0;
-    }
-    let demand_rate = telemetry
-        .tun_ingress_bytes_per_second
-        .max(telemetry.delivery_rate_bytes_per_second)
-        .max(telemetry.real_traffic_bytes_per_second);
-    if demand_rate == 0 {
-        return 0;
-    }
-    let bdp = u128::from(demand_rate).saturating_mul(telemetry.min_rtt.as_micros()) / 1_000_000;
-    let measured_target = bdp
-        .saturating_mul(u128::from(effective.default_cwnd_gain_milli))
-        .div_ceil(1_000)
-        .min(u128::from(ADAPTIVE_CWND_FLOOR_MAX_BYTES)) as u64;
-    // Do not make recovery from a loss-limited startup depend exclusively on
-    // the already-throttled delivery/TUN rate.  While a real producer backlog
-    // remains and propagation delay is not inflated, probe one bounded cwnd
-    // step upward per telemetry tick.  The queue-delay guard above stops the
-    // ratchet as soon as the extra flight becomes queue rather than delivery.
-    let probe_target = congestion_window_bytes
-        .max(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
-        .saturating_mul(2)
-        .min(ADAPTIVE_CWND_FLOOR_MAX_BYTES);
-    let target = measured_target.max(probe_target);
-    target
-        .div_ceil(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
-        .saturating_mul(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
+    AdaptiveCwndFloorStateV2::default().update(telemetry, effective, congestion_window_bytes)
 }
 
 /// Finalize the host-owned, telemetry-dependent BBR floor before publication.
@@ -316,12 +805,29 @@ fn adaptive_cwnd_floor(
 /// value to an explicit nonzero cap. The return value remains the
 /// telemetry-only addition for the autotune tap; `effective` is the complete
 /// value subsequently written to the controller.
+#[cfg(test)]
 fn finalize_bbr3_effective(
     telemetry: PathTelemetryV2,
     congestion_window_bytes: u64,
     effective: &mut BbrEffectiveV1,
 ) -> u64 {
     let adaptive_cwnd_floor = adaptive_cwnd_floor(telemetry, effective, congestion_window_bytes);
+    let combined_floor = effective.cwnd_floor_bytes.max(adaptive_cwnd_floor);
+    effective.cwnd_floor_bytes = if effective.cwnd_cap_bytes == 0 {
+        combined_floor
+    } else {
+        combined_floor.min(effective.cwnd_cap_bytes)
+    };
+    adaptive_cwnd_floor
+}
+
+fn finalize_bbr3_effective_with_state(
+    state: &mut AdaptiveCwndFloorStateV2,
+    telemetry: PathTelemetryV2,
+    congestion_window_bytes: u64,
+    effective: &mut BbrEffectiveV1,
+) -> u64 {
+    let adaptive_cwnd_floor = state.update(telemetry, effective, congestion_window_bytes);
     let combined_floor = effective.cwnd_floor_bytes.max(adaptive_cwnd_floor);
     effective.cwnd_floor_bytes = if effective.cwnd_cap_bytes == 0 {
         combined_floor
@@ -416,6 +922,38 @@ fn apply_bbr3_effective(tunables: &Bbr3Tunables, effective: &BbrEffectiveV1) -> 
         tunables.generation.fetch_add(1, Ordering::Release);
     }
     changed
+}
+
+/// Publish one capacity-discovery edge without waiting for a full policy tick.
+fn publish_capacity_probe(tunables: &Bbr3Tunables) {
+    tunables
+        .capacity_probe_generation
+        .fetch_add(1, Ordering::Relaxed);
+    tunables.generation.fetch_add(1, Ordering::Release);
+}
+
+/// Publish policy tunables and an optional real-TUN capacity-discovery edge
+/// as one controller-visible generation. The dedicated generation is bumped
+/// before the release publication so BBR cannot observe a request half-way
+/// through the tunable update.
+fn publish_bbr3_effective(
+    tunables: &Bbr3Tunables,
+    effective: &BbrEffectiveV1,
+    request_capacity_probe: bool,
+) -> bool {
+    if request_capacity_probe {
+        tunables
+            .capacity_probe_generation
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    let changed = apply_bbr3_effective(tunables, effective);
+    if request_capacity_probe && !changed {
+        // `apply_bbr3_effective` did not publish a generation for the probe.
+        // The capacity generation was already incremented above, so only the
+        // paired Release store remains here.
+        tunables.generation.fetch_add(1, Ordering::Release);
+    }
+    changed || request_capacity_probe
 }
 
 fn parse_forced_usize(
@@ -793,6 +1331,8 @@ pub(super) async fn tuner_loop(
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut capacity_probe_edge_interval = tokio::time::interval(CAPACITY_PROBE_EDGE_INTERVAL);
+    capacity_probe_edge_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let bounds = AutoTuneBoundsV2::default();
     let tuner = AutoTunerV2::new(bounds, 1);
     let objective = match runtime_state.autotune.objective {
@@ -956,6 +1496,12 @@ pub(super) async fn tuner_loop(
     let mut remote_burst_loss_cells = 0_u16;
     let mut path_identity = String::new();
     let mut path_epoch = 1_u64;
+    let mut adaptive_cwnd_floor_state = AdaptiveCwndFloorStateV2::default();
+    let mut capacity_probe_state = CapacityProbeStateV2::default();
+    capacity_probe_state.initialize_bulk_service_counter(
+        path_epoch,
+        metrics.bulk_service_bytes.load(Ordering::Relaxed),
+    );
     let mut minimum_rtt = Duration::MAX;
     let mut previous_controller_guard_transitions = 0_u64;
     let mut telemetry_failures = 0_u64;
@@ -965,8 +1511,36 @@ pub(super) async fn tuner_loop(
     let mut last_wasm_reload_error: Option<String> = None;
     let mut shadow_pending: Option<tokio::task::JoinHandle<Result<WasmPolicyBackend>>> = None;
     interval.tick().await;
+    capacity_probe_edge_interval.tick().await;
     loop {
-        interval.tick().await;
+        let full_policy_tick = tokio::select! {
+            biased;
+            _ = interval.tick() => true,
+            _ = capacity_probe_edge_interval.tick() => false,
+        };
+        if !full_policy_tick {
+            let bulk_service_counter = metrics.bulk_service_bytes.load(Ordering::Relaxed);
+            let path_sample = selected_path_sample(&connection).ok();
+            let path_matches = path_sample.as_ref().is_some_and(|sample| {
+                fast_capacity_probe_path_matches(&path_identity, &sample.identity)
+            });
+            if path_matches
+                && capacity_probe_state.update_bulk_service_counter(bulk_service_counter)
+            {
+                let published = path_sample
+                    .and_then(|sample| sample.controller_tunables)
+                    .is_some_and(|tunables| {
+                        publish_capacity_probe(&tunables);
+                        true
+                    });
+                if !published {
+                    // The normal one-second telemetry path remains the
+                    // fallback if a selected BBR path was transiently absent.
+                    capacity_probe_state.cancel_bulk_service_edge();
+                }
+            }
+            continue;
+        }
         let sampled_at = Instant::now();
         policy_reload_tick = policy_reload_tick.wrapping_add(1);
         if wasm_selection {
@@ -1442,6 +2016,12 @@ pub(super) async fn tuner_loop(
             repair_response_latency: remote_repair_response_latency,
             real_traffic_bytes_per_second: rate_per_second(real_delta, sample_elapsed),
         };
+        let controller_policer_episode_active =
+            controller_policer_episode_active(controller_policer_pacing_transitions);
+        let bulk_capacity_probe =
+            capacity_probe_state.update(telemetry, controller_policer_episode_active);
+        let loss_recovery_probe = capacity_probe_state
+            .update_loss_episode_if_complete(telemetry, controller_policer_episode_active);
         let wire_cost = current_sample_counters
             .utility_tx_bytes
             .delta(sample_counters.utility_tx_bytes)
@@ -1461,11 +2041,21 @@ pub(super) async fn tuner_loop(
                 .view(egress_peer_key, sampled_at),
         );
         let mut outcome = tick.run(telemetry, &wire_cost, sampled_at);
-        let adaptive_cwnd_floor_bytes = finalize_bbr3_effective(
+        let adaptive_cwnd_floor_bytes = finalize_bbr3_effective_with_state(
+            &mut adaptive_cwnd_floor_state,
             telemetry,
             congestion_window_bytes,
             &mut outcome.effective.bbr,
         );
+        let pacing_cap_release_probe = capacity_probe_state.update_pacing_cap_if_complete(
+            outcome.effective.bbr.pacing_cap_bytes_per_second,
+            telemetry.tun_ingress_bytes_per_second > 0,
+        );
+        // Bulk and loss state machines consume prohibited edges at their
+        // source. Verified-idle Bulk epochs and explicit cap releases retain
+        // independent authority to restart discovery.
+        let request_capacity_probe =
+            bulk_capacity_probe || loss_recovery_probe || pacing_cap_release_probe;
         let egress_requested_bytes_per_second =
             outcome.effective.egress.desired_rate_bytes_per_second;
         runtime_state.egress_coordinator.publish(
@@ -1557,7 +2147,7 @@ pub(super) async fn tuner_loop(
             last_policy_fault = outcome.fault;
         }
         if let Some(tunables) = bbr_tunables.as_deref() {
-            apply_bbr3_effective(tunables, &outcome.effective.bbr);
+            publish_bbr3_effective(tunables, &outcome.effective.bbr, request_capacity_probe);
         }
         let utility = outcome.utility;
         let learner_trace = outcome.trace;
@@ -2376,6 +2966,724 @@ mod tests {
     }
 
     #[test]
+    fn bursty_single_empty_tick_does_not_repeat_capacity_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, false));
+
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, false));
+        assert!(state.bulk_active);
+        assert_eq!(state.bulk_idle_ticks, 1);
+
+        // One empty producer sample between bursts remains the same active
+        // epoch, so it cannot ask BBR to reprobe a second time.
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        assert!(!state.update(telemetry, false));
+        assert_eq!(state.bulk_idle_ticks, 0);
+
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, false));
+        assert!(state.bulk_active);
+        assert!(!state.update(telemetry, false));
+        assert!(!state.bulk_active);
+
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        assert!(state.update(telemetry, false));
+    }
+
+    #[test]
+    fn bulk_service_counter_edge_fires_once_and_rearms_after_idle() {
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        let mut state = CapacityProbeStateV2::default();
+        let tunables = Bbr3Tunables::default();
+        state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
+
+        // Control/latency traffic and repeated polls do not change the Bulk
+        // counter, so neither can request capacity discovery.
+        assert!(!state.update_bulk_service_counter(100));
+        assert!(!state.update_bulk_service_counter(100));
+
+        if state.update_bulk_service_counter(101) {
+            publish_capacity_probe(&tunables);
+        }
+        assert_eq!(
+            tunables.capacity_probe_generation.load(Ordering::Acquire),
+            0
+        );
+        assert!(state.bulk_active);
+        // Further bytes in the same active epoch are coalesced.
+        assert!(!state.update_bulk_service_counter(102));
+        assert!(!state.update_bulk_service_counter(103));
+
+        // The first full tick consumes service observed by the fast path, so
+        // it is active rather than the first idle tick.
+        assert!(!state.update(telemetry, false));
+        assert!(state.bulk_active);
+        assert_eq!(state.bulk_idle_ticks, 0);
+        assert!(!state.update(telemetry, false));
+        assert!(state.bulk_active);
+        assert_eq!(state.bulk_idle_ticks, 1);
+        assert!(!state.update(telemetry, false));
+        assert!(!state.bulk_active);
+        assert!(state.bulk_idle_verified);
+
+        if state.update_bulk_service_counter(104) {
+            publish_capacity_probe(&tunables);
+        }
+        assert_eq!(
+            tunables.capacity_probe_generation.load(Ordering::Acquire),
+            1
+        );
+        assert!(!state.update_bulk_service_counter(105));
+    }
+
+    #[test]
+    fn clean_underestimated_initial_bulk_requests_one_delayed_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        state.initialize_bulk_service_counter(1, 100);
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.controller_state = 3; // ProbeBW Cruise.
+        telemetry.controller_pacing_rate_bytes_per_second = 40_000_000;
+        telemetry.tun_ingress_bytes_per_second = 80_000_000;
+        telemetry.loss_ppm = 0;
+        telemetry.residual_loss_ppm = 0;
+        telemetry.burst_loss_cells = 0;
+
+        assert!(!state.update_bulk_service_counter(101));
+        assert_eq!(
+            state.initial_bulk_probe,
+            InitialBulkProbeV2::AwaitingSampleBoundary
+        );
+        let mut partial = telemetry;
+        partial.tun_ingress_bytes_per_second = 1_000_000;
+        assert!(!state.update(partial, false));
+        assert_eq!(
+            state.initial_bulk_probe,
+            InitialBulkProbeV2::AwaitingCompleteTick
+        );
+        assert!(state.update(telemetry, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+        // The decision is one-shot even while demand remains above pacing.
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update_bulk_service_counter(102));
+        assert!(state.bulk_active);
+    }
+
+    #[test]
+    fn home_like_partial_pressure_is_retained_until_the_clean_complete_tick() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut partial = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(partial.path_epoch, 100);
+        partial.controller_state = 3; // ProbeBW Cruise.
+        partial.controller_pacing_rate_bytes_per_second = 308_267;
+        partial.tun_ingress_bytes_per_second = 653_600;
+        partial.loss_ppm = 0;
+        partial.residual_loss_ppm = 0;
+        partial.burst_loss_cells = 0;
+
+        assert!(!state.update_bulk_service_counter(101));
+        assert!(!state.update(partial, false));
+        assert!(state.initial_sample_incomplete);
+        assert!(state.initial_clean_demand_seen);
+        assert!(!state.update_loss_episode_if_complete(partial, false));
+
+        let mut complete = partial;
+        complete.controller_state = 5;
+        complete.controller_pacing_rate_bytes_per_second = 507_945;
+        complete.tun_ingress_bytes_per_second = 424_041;
+        assert!(
+            complete.tun_ingress_bytes_per_second
+                < complete.controller_pacing_rate_bytes_per_second
+        );
+        assert!(state.update(complete, false));
+        assert!(!state.initial_clean_demand_seen);
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+
+        assert!(!state.update(complete, false));
+        assert!(!state.update_loss_episode_if_complete(complete, false));
+    }
+
+    #[test]
+    fn p2_like_partial_without_pressure_and_lossy_complete_is_suppressed() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut partial = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(partial.path_epoch, 100);
+        partial.controller_state = 3; // ProbeBW Cruise.
+        partial.controller_pacing_rate_bytes_per_second = 875_843;
+        partial.tun_ingress_bytes_per_second = 394_628;
+        partial.loss_ppm = 0;
+        partial.residual_loss_ppm = 0;
+        partial.burst_loss_cells = 0;
+
+        assert!(!state.update_bulk_service_counter(101));
+        assert!(!state.update(partial, false));
+        assert!(state.initial_sample_incomplete);
+        assert!(!state.initial_clean_demand_seen);
+        assert!(!state.update_loss_episode_if_complete(partial, false));
+
+        let mut complete = partial;
+        complete.controller_pacing_rate_bytes_per_second = 300_000;
+        complete.tun_ingress_bytes_per_second = 600_000;
+        complete.loss_ppm = 40_523;
+        assert!(!state.update(complete, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+        assert!(!state.update_loss_episode_if_complete(complete, false));
+        assert!(state.loss_episode);
+
+        // A later clean high-pressure sample cannot resurrect the consumed
+        // initial decision. The complete tick's real loss episode remains
+        // independently owned by the loss-recovery state machine.
+        complete.loss_ppm = 0;
+        for _ in 0..3 {
+            assert!(!state.update(complete, false));
+        }
+    }
+
+    #[test]
+    fn lossy_partial_initial_bulk_sample_cannot_seed_a_second_recovery_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
+        telemetry.controller_state = 3; // ProbeBW Cruise.
+        telemetry.controller_pacing_rate_bytes_per_second = 4_000_000;
+        telemetry.tun_ingress_bytes_per_second = 8_000_000;
+        telemetry.loss_ppm = 0;
+        telemetry.residual_loss_ppm = 0;
+        telemetry.burst_loss_cells = 0;
+
+        assert!(!state.update_bulk_service_counter(101));
+
+        let mut partial = telemetry;
+        partial.loss_ppm = 20_000;
+        assert!(!state.update(partial, false));
+        assert!(state.initial_sample_incomplete);
+        assert!(!state.update_loss_episode_if_complete(partial, false));
+        assert!(!state.loss_episode);
+
+        // The first complete clean interval makes exactly the initial-Bulk
+        // decision. The discarded partial loss must not mature into a second
+        // loss-recovery restart on later clean intervals.
+        assert!(state.update(telemetry, false));
+        assert!(!state.update_loss_episode_if_complete(telemetry, false));
+        let mut requests = 1;
+        for _ in 0..3 {
+            requests += usize::from(state.update(telemetry, false));
+            requests += usize::from(state.update_loss_episode_if_complete(telemetry, false));
+        }
+        assert_eq!(requests, 1);
+        assert!(!state.loss_episode);
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+    }
+
+    #[test]
+    fn startup_lossy_partial_then_probebw_clean_complete_probes_only_once() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut partial = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(partial.path_epoch, 100);
+        partial.controller_state = 0; // Native Startup owns the partial tick.
+        partial.controller_pacing_rate_bytes_per_second = 4_000_000;
+        partial.tun_ingress_bytes_per_second = 8_000_000;
+        partial.loss_ppm = 20_000;
+
+        assert!(!state.update_bulk_service_counter(101));
+        assert!(!state.update(partial, false));
+        assert!(state.initial_sample_incomplete);
+        assert!(!state.update_loss_episode_if_complete(partial, false));
+        assert!(!state.loss_episode);
+
+        let mut complete = partial;
+        complete.controller_state = 3; // ProbeBW Cruise.
+        complete.loss_ppm = 0;
+        complete.residual_loss_ppm = 0;
+        complete.burst_loss_cells = 0;
+        assert!(state.update(complete, false));
+        assert!(!state.update_loss_episode_if_complete(complete, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+
+        for _ in 0..3 {
+            assert!(!state.update(complete, false));
+            assert!(!state.update_loss_episode_if_complete(complete, false));
+        }
+        assert!(!state.loss_episode);
+    }
+
+    #[test]
+    fn initial_bulk_probe_decision_is_consumed_only_once() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.controller_state = 3; // ProbeBW Cruise.
+        telemetry.controller_pacing_rate_bytes_per_second = 4_000_000;
+        telemetry.tun_ingress_bytes_per_second = 8_000_000;
+        telemetry.loss_ppm = 0;
+        telemetry.residual_loss_ppm = 0;
+        telemetry.burst_loss_cells = 0;
+
+        // The normal path may observe initial Bulk first, but that first
+        // sample is still a partial window. Only the following complete tick
+        // may make the one-shot decision.
+        assert!(!state.update(telemetry, false));
+        assert_eq!(
+            state.initial_bulk_probe,
+            InitialBulkProbeV2::AwaitingCompleteTick
+        );
+        assert!(state.update(telemetry, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, false));
+    }
+
+    #[test]
+    fn lossy_initial_bulk_tick_is_permanently_suppressed() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
+        telemetry.controller_state = 3; // ProbeBW Cruise.
+        telemetry.controller_pacing_rate_bytes_per_second = 8_000_000;
+        telemetry.tun_ingress_bytes_per_second = 12_000_000;
+        telemetry.loss_ppm = 20_000;
+
+        assert!(!state.update_bulk_service_counter(101));
+        let mut partial = telemetry;
+        partial.loss_ppm = 0;
+        assert!(!state.update(partial, false));
+        assert!(!state.update(telemetry, false));
+        telemetry.loss_ppm = 0;
+        assert!(!state.update(telemetry, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+    }
+
+    #[test]
+    fn native_startup_permanently_suppresses_initial_bulk_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
+        telemetry.controller_state = 0; // Startup is already probing.
+        telemetry.controller_pacing_rate_bytes_per_second = 8_000_000;
+        telemetry.tun_ingress_bytes_per_second = 12_000_000;
+
+        assert!(!state.update_bulk_service_counter(101));
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, false));
+        telemetry.controller_state = 3;
+        assert!(!state.update(telemetry, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+    }
+
+    #[test]
+    fn initial_bulk_probe_is_suppressed_during_controller_policer_episode() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
+        telemetry.controller_state = 3;
+        telemetry.controller_pacing_rate_bytes_per_second = 8_000_000;
+        telemetry.tun_ingress_bytes_per_second = 12_000_000;
+
+        assert!(!state.update_bulk_service_counter(101));
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, true));
+        assert!(!state.update(telemetry, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+    }
+
+    #[test]
+    fn fast_capacity_probe_requires_the_current_selected_path_identity() {
+        assert!(!fast_capacity_probe_path_matches("", "ip:2001:db8::1"));
+        assert!(fast_capacity_probe_path_matches(
+            "ip:2001:db8::1",
+            "ip:2001:db8::1"
+        ));
+        assert!(!fast_capacity_probe_path_matches(
+            "ip:2001:db8::1",
+            "ip:2001:db8::2"
+        ));
+    }
+
+    #[test]
+    fn bulk_service_clears_a_partial_confirmed_idle_horizon() {
+        let mut state = CapacityProbeStateV2::default();
+        state.initialize_bulk_service_counter(1, 100);
+        assert!(!state.update_bulk_service_counter(101));
+
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        // Consume the fast-path service observation, then begin idling.
+        assert!(!state.update(telemetry, true));
+        assert!(!state.update(telemetry, true));
+        assert_eq!(state.bulk_idle_ticks, 1);
+
+        assert!(!state.update_bulk_service_counter(102));
+        assert_eq!(state.bulk_idle_ticks, 0);
+        assert!(!state.bulk_idle_verified);
+        assert!(state.bulk_active);
+    }
+
+    #[test]
+    fn confirmed_epoch_requires_five_complete_idle_ticks_before_reprobe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, true));
+
+        telemetry.tun_ingress_bytes_per_second = 0;
+        for expected in 1..5 {
+            assert!(!state.update(telemetry, true));
+            assert!(state.bulk_active);
+            assert_eq!(state.bulk_idle_ticks, expected);
+            assert!(!state.bulk_idle_verified);
+        }
+        assert!(!state.update(telemetry, true));
+        assert!(!state.bulk_active);
+        assert_eq!(state.bulk_idle_ticks, 0);
+        assert!(state.bulk_idle_verified);
+
+        telemetry.tun_ingress_bytes_per_second = 1;
+        assert!(state.update(telemetry, true));
+        assert!(state.bulk_active);
+        assert!(!state.bulk_idle_verified);
+    }
+
+    #[test]
+    fn unconfirmed_epoch_rearms_after_two_complete_idle_ticks() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, false));
+
+        telemetry.tun_ingress_bytes_per_second = 0;
+        assert!(!state.update(telemetry, false));
+        assert!(state.bulk_active);
+        assert_eq!(state.bulk_idle_ticks, 1);
+        assert!(!state.bulk_idle_verified);
+        assert!(!state.update(telemetry, false));
+        assert!(!state.bulk_active);
+        assert!(state.bulk_idle_verified);
+
+        telemetry.tun_ingress_bytes_per_second = 1;
+        assert!(state.update(telemetry, false));
+        assert!(!state.bulk_idle_verified);
+    }
+
+    #[test]
+    fn confirmed_first_backlog_is_consumed_without_request() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, true));
+
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        assert!(!state.update(telemetry, true));
+        // Disabling the controller marker cannot resurrect the consumed edge.
+        assert!(!state.update(telemetry, false));
+    }
+
+    #[test]
+    fn cancelled_fast_edge_preserves_request_without_fabricating_verified_idle() {
+        let mut state = CapacityProbeStateV2::default();
+        state.initialize_bulk_service_counter(1, 100);
+        state.bulk_idle_verified = true;
+
+        assert!(state.update_bulk_service_counter(101));
+        state.cancel_bulk_service_edge();
+        assert!(!state.bulk_active);
+        assert!(!state.bulk_idle_verified);
+        assert!(state.update_bulk_service_counter(102));
+        assert!(!state.bulk_idle_verified);
+        assert!(!state.update_bulk_service_counter(103));
+    }
+
+    #[test]
+    fn verified_idle_allows_one_confirmed_fast_publish() {
+        let mut state = CapacityProbeStateV2::default();
+        let tunables = Bbr3Tunables::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, true));
+        telemetry.tun_ingress_bytes_per_second = 0;
+        for _ in 0..5 {
+            assert!(!state.update(telemetry, true));
+        }
+        assert!(state.bulk_idle_verified);
+
+        state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
+        if state.update_bulk_service_counter(101) {
+            publish_capacity_probe(&tunables);
+        }
+        assert_eq!(
+            tunables.capacity_probe_generation.load(Ordering::Acquire),
+            1
+        );
+        assert!(!state.bulk_idle_verified);
+        assert!(!state.update_bulk_service_counter(102));
+        assert_eq!(
+            tunables.capacity_probe_generation.load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[test]
+    fn fast_capacity_probe_publication_is_one_release_generation() {
+        let tunables = Bbr3Tunables::default();
+
+        publish_capacity_probe(&tunables);
+
+        assert_eq!(
+            tunables.capacity_probe_generation.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(tunables.generation.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn initial_unverified_backlog_cannot_request_or_repeat_a_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = 0;
+
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, false));
+
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64 - 1;
+        assert!(!state.update(telemetry, false));
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, false));
+    }
+
+    #[test]
+    fn backlog_present_on_first_tun_tick_needs_no_extra_reprobe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, false));
+    }
+
+    #[test]
+    fn bulk_probe_rearms_only_after_idle_or_path_reset() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 1;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, false));
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        assert!(!state.update(telemetry, false));
+
+        // A nominally idle tick with a retained producer queue does not start
+        // a new epoch. The queue must drain below the protection threshold.
+        telemetry.tun_ingress_bytes_per_second = 0;
+        assert!(!state.update(telemetry, false));
+        assert!(state.bulk_active);
+        assert_eq!(state.bulk_idle_ticks, 0);
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, false));
+        assert!(state.bulk_active);
+        assert_eq!(state.bulk_idle_ticks, 1);
+        assert!(!state.update(telemetry, false));
+        assert!(!state.bulk_active);
+
+        telemetry.tun_ingress_bytes_per_second = 1;
+        assert!(state.update(telemetry, false));
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        assert!(!state.update(telemetry, false));
+
+        telemetry.path_epoch += 1;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(state.update(telemetry, false));
+        assert_eq!(state.bulk_idle_ticks, 0);
+        telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        assert!(!state.update(telemetry, false));
+    }
+
+    #[test]
+    fn idle_control_traffic_cannot_request_capacity_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 0;
+        // Even a controller-internal train backlog is not evidence of TUN
+        // demand when no TUN bytes crossed this connection.
+        telemetry.packet_train_queue_bytes = 8 * TX_ADMISSION_BATCH_BYTES as u64;
+
+        assert!(!state.update(telemetry, false));
+        assert!(!state.bulk_active);
+    }
+
+    #[test]
+    fn active_tun_step_cap_release_requests_capacity_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        let telemetry = queued_adaptive_floor_telemetry();
+        assert!(!state.update(telemetry, false));
+
+        assert!(!state.update_pacing_cap(6_500_000, true));
+        assert!(state.update_pacing_cap(0, true));
+        assert!(!state.update_pacing_cap(0, true));
+
+        // A cap disappearing while the connection has no TUN demand is not
+        // a capacity-discovery event.
+        assert!(!state.update_pacing_cap(65_536, false));
+        assert!(!state.update_pacing_cap(0, false));
+    }
+
+    #[test]
+    fn partial_initial_bulk_sample_absorbs_pacing_cap_release_without_replay() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
+        assert!(!state.update_pacing_cap(6_500_000, true));
+        assert!(!state.update_bulk_service_counter(101));
+
+        assert!(!state.update(telemetry, false));
+        assert!(state.initial_sample_incomplete);
+        assert!(!state.update_pacing_cap_if_complete(0, true));
+        assert_eq!(state.previous_pacing_cap_bytes_per_second, Some(0));
+
+        telemetry.controller_state = 0;
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update_pacing_cap_if_complete(0, true));
+    }
+
+    #[test]
+    fn active_loss_episode_requests_one_probe_after_two_clean_ticks() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        assert!(!state.update(telemetry, false));
+
+        telemetry.loss_ppm = 10_000;
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert!(state.loss_episode);
+
+        telemetry.loss_ppm = 0;
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert_eq!(state.consecutive_clean_loss_ticks, 1);
+        assert!(state.update_loss_episode(telemetry, false));
+        assert!(!state.loss_episode);
+        assert_eq!(state.consecutive_clean_loss_ticks, 0);
+        assert!(!state.update_loss_episode(telemetry, false));
+    }
+
+    #[test]
+    fn confirmed_controller_policer_episode_suppresses_clean_recovery_probe() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        assert!(!state.update(telemetry, false));
+
+        telemetry.loss_ppm = 10_000;
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert!(state.loss_episode);
+
+        telemetry.loss_ppm = 0;
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert_eq!(state.consecutive_clean_loss_ticks, 1);
+        assert!(!state.update_loss_episode(telemetry, true));
+        assert!(!state.loss_episode);
+        assert!(!state.loss_signal_latched);
+        assert_eq!(state.consecutive_clean_loss_ticks, 0);
+
+        // Releasing the guard cannot publish a stale edge from the old
+        // episode; a real idle/new-Bulk transition still uses `update`.
+        assert!(!state.update_loss_episode(telemetry, false));
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, false));
+        assert!(!state.update(telemetry, false));
+        telemetry.tun_ingress_bytes_per_second = 1;
+        assert!(state.update(telemetry, false));
+    }
+
+    #[test]
+    fn controller_policer_episode_activity_depends_on_transition_not_scale() {
+        assert!(!controller_policer_episode_active(0));
+        assert!(controller_policer_episode_active(1));
+
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        assert!(!state.update(telemetry, false));
+        telemetry.loss_ppm = 10_000;
+        assert!(!state.update_loss_episode(telemetry, false));
+        telemetry.loss_ppm = 0;
+        assert!(!state.update_loss_episode(telemetry, controller_policer_episode_active(1),));
+        assert!(!state.loss_episode);
+    }
+
+    #[test]
+    fn residual_or_burst_loss_arms_but_isolated_clean_and_idle_do_not_trigger() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        state.update(telemetry, false);
+
+        telemetry.residual_loss_ppm = 10_000;
+        assert!(!state.update_loss_episode(telemetry, false));
+        telemetry.residual_loss_ppm = 0;
+        assert!(!state.update_loss_episode(telemetry, false));
+        telemetry.loss_ppm = 1;
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert_eq!(state.consecutive_clean_loss_ticks, 0);
+
+        telemetry.loss_ppm = 0;
+        telemetry.burst_loss_cells = 3;
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert!(state.update_loss_episode(telemetry, false));
+        assert!(!state.update_loss_episode(telemetry, false));
+        telemetry.burst_loss_cells = 0;
+
+        telemetry.tun_ingress_bytes_per_second = 0;
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert!(!state.loss_episode);
+        assert_eq!(state.consecutive_clean_loss_ticks, 0);
+    }
+
+    #[test]
+    fn loss_recovery_does_not_cross_path_epochs() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        state.update(telemetry, false);
+        telemetry.loss_ppm = 10_000;
+        state.update_loss_episode(telemetry, false);
+
+        telemetry.path_epoch += 1;
+        telemetry.loss_ppm = 0;
+        assert!(state.update(telemetry, false));
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert!(!state.update_loss_episode(telemetry, false));
+        assert!(!state.loss_episode);
+    }
+
+    #[test]
+    fn capacity_probe_request_is_published_even_when_policy_tunables_are_unchanged() {
+        let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
+        let effective = BbrEffectiveV1::from_proposal(&proposal);
+        let tunables = Bbr3Tunables::default();
+        assert!(apply_bbr3_effective(&tunables, &effective));
+        let before = tunables.generation.load(Ordering::Acquire);
+
+        assert!(publish_bbr3_effective(&tunables, &effective, true));
+
+        assert_eq!(
+            tunables.capacity_probe_generation.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(tunables.generation.load(Ordering::Acquire), before + 1);
+    }
+
+    #[test]
     fn finalization_respects_cwnd_cap_and_preserves_low_rtt_preset_floor() {
         let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
         let mut capped = BbrEffectiveV1::from_proposal(&proposal);
@@ -2431,9 +3739,9 @@ mod tests {
         let mut queue_delayed = BbrEffectiveV1::from_proposal(&proposal);
         assert_eq!(
             finalize_bbr3_effective(telemetry, 96 * 1024, &mut queue_delayed),
-            0
+            208 * 1024
         );
-        assert_eq!(queue_delayed.cwnd_floor_bytes, 0);
+        assert_eq!(queue_delayed.cwnd_floor_bytes, 208 * 1024);
         telemetry.queue_delay = Duration::from_millis(2);
         telemetry.packet_train_queue_bytes = 0;
         let mut queue_empty = BbrEffectiveV1::from_proposal(&proposal);
@@ -2442,6 +3750,152 @@ mod tests {
             0
         );
         assert_eq!(queue_empty.cwnd_floor_bytes, 0);
+    }
+
+    #[test]
+    fn adaptive_floor_tracks_measured_bdp_after_probe_overshoot_without_toggling() {
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
+        let effective = BbrEffectiveV1::from_proposal(&proposal);
+        let mut state = AdaptiveCwndFloorStateV2::default();
+
+        let probe = state.update(telemetry, &effective, 512 * 1024);
+        assert_eq!(probe, 1024 * 1024);
+        assert_eq!(state.mode, AdaptiveCwndFloorModeV2::Probe);
+
+        telemetry.queue_delay = Duration::from_millis(11);
+        telemetry.rtt = telemetry.min_rtt + telemetry.queue_delay;
+        let tracked = state.update(telemetry, &effective, probe);
+        assert_eq!(tracked, 208 * 1024);
+        assert_eq!(state.mode, AdaptiveCwndFloorModeV2::Track);
+
+        // The large probe drained one producer batch. Active rate evidence
+        // keeps the measured floor instead of recreating the old 0/high
+        // alternation.
+        telemetry.queue_delay = Duration::from_millis(2);
+        telemetry.rtt = telemetry.min_rtt + telemetry.queue_delay;
+        telemetry.packet_train_queue_bytes = 0;
+        assert_eq!(state.update(telemetry, &effective, tracked), tracked);
+    }
+
+    #[test]
+    fn adaptive_floor_tracks_an_already_modeled_bdp_without_doubling_cwnd() {
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.controller_state = 3; // ProbeBW Cruise.
+        telemetry.controller_bw_bytes_per_second = telemetry.delivery_rate_bytes_per_second;
+        let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
+        let effective = BbrEffectiveV1::from_proposal(&proposal);
+        let mut state = AdaptiveCwndFloorStateV2::default();
+        let modeled = cwnd_floor_for_rate(
+            telemetry.delivery_rate_bytes_per_second,
+            telemetry.min_rtt,
+            &effective,
+        );
+        let current_cwnd = modeled * 15 / 16;
+
+        let floor = state.update(telemetry, &effective, current_cwnd);
+
+        assert_eq!(floor, modeled);
+        assert_eq!(state.mode, AdaptiveCwndFloorModeV2::Track);
+        assert!(floor < current_cwnd * 2);
+    }
+
+    #[test]
+    fn startup_with_self_demand_probes_even_when_cwnd_matches_the_current_model() {
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.controller_state = 0; // Startup.
+        telemetry.controller_bw_bytes_per_second = telemetry.delivery_rate_bytes_per_second;
+        let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
+        let effective = BbrEffectiveV1::from_proposal(&proposal);
+        let mut state = AdaptiveCwndFloorStateV2::default();
+        let modeled = cwnd_floor_for_rate(
+            telemetry.delivery_rate_bytes_per_second,
+            telemetry.min_rtt,
+            &effective,
+        );
+        let current_cwnd = modeled * 15 / 16;
+        let expected_probe = quantize_adaptive_cwnd_floor(current_cwnd * 2);
+
+        let floor = state.update(telemetry, &effective, current_cwnd);
+
+        assert!(floor >= expected_probe);
+        assert_eq!(state.mode, AdaptiveCwndFloorModeV2::Probe);
+    }
+
+    #[test]
+    fn startup_with_inflated_queue_tracks_the_measured_floor() {
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.controller_state = 0; // Startup.
+        telemetry.controller_bw_bytes_per_second = telemetry.delivery_rate_bytes_per_second;
+        telemetry.queue_delay = Duration::from_millis(11);
+        telemetry.rtt = telemetry.min_rtt + telemetry.queue_delay;
+        let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
+        let effective = BbrEffectiveV1::from_proposal(&proposal);
+        let mut state = AdaptiveCwndFloorStateV2::default();
+        let measured = measured_cwnd_floor(telemetry, &effective);
+
+        let floor = state.update(telemetry, &effective, 512 * 1024);
+
+        assert_eq!(floor, measured);
+        assert_eq!(state.mode, AdaptiveCwndFloorModeV2::Track);
+    }
+
+    #[test]
+    fn adaptive_floor_still_probes_when_cwnd_is_below_a_valid_model() {
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.tun_ingress_bytes_per_second = 128 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 128 * 1024;
+        telemetry.real_traffic_bytes_per_second = 128 * 1024;
+        telemetry.controller_bw_bytes_per_second = 4_200_000;
+        let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
+        let effective = BbrEffectiveV1::from_proposal(&proposal);
+        let mut state = AdaptiveCwndFloorStateV2::default();
+
+        assert_eq!(state.update(telemetry, &effective, 48 * 1024), 96 * 1024);
+        assert_eq!(state.mode, AdaptiveCwndFloorModeV2::Probe);
+    }
+
+    #[test]
+    fn tracked_adaptive_floor_bounds_growth_and_clears_on_invalid_evidence() {
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
+        let effective = BbrEffectiveV1::from_proposal(&proposal);
+        let mut state = AdaptiveCwndFloorStateV2 {
+            mode: AdaptiveCwndFloorModeV2::Track,
+            path_epoch: telemetry.path_epoch,
+            held_bytes: 208 * 1024,
+            ..AdaptiveCwndFloorStateV2::default()
+        };
+        telemetry.tun_ingress_bytes_per_second *= 4;
+        telemetry.delivery_rate_bytes_per_second *= 4;
+        telemetry.real_traffic_bytes_per_second *= 4;
+        assert_eq!(state.update(telemetry, &effective, 208 * 1024), 272 * 1024);
+
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.delivery_rate_bytes_per_second = 0;
+        telemetry.real_traffic_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        assert_eq!(state.update(telemetry, &effective, 208 * 1024), 272 * 1024);
+        assert_eq!(state.update(telemetry, &effective, 208 * 1024), 0);
+
+        telemetry.tun_ingress_bytes_per_second = 4 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 4 * 1024 * 1024;
+        telemetry.real_traffic_bytes_per_second = 4 * 1024 * 1024;
+        telemetry.packet_train_queue_bytes = 256 * 1024;
+        assert_ne!(state.update(telemetry, &effective, 48 * 1024), 0);
+        telemetry.controller_app_limited = true;
+        assert_eq!(state.update(telemetry, &effective, 208 * 1024), 0);
+        assert_eq!(state.mode, AdaptiveCwndFloorModeV2::Probe);
+
+        telemetry.controller_app_limited = false;
+        telemetry.path_epoch += 1;
+        let reprobe = state.update(telemetry, &effective, 48 * 1024);
+        assert!(reprobe >= 96 * 1024);
+        assert_eq!(state.path_epoch, telemetry.path_epoch);
+
+        let mut policer = effective;
+        policer.loss_is_congestion = true;
+        assert_eq!(state.update(telemetry, &policer, reprobe), 0);
     }
 
     #[test]

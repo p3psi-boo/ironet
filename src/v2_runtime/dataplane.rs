@@ -18,7 +18,10 @@ use iroh::{EndpointId, SecretKey, endpoint::Connection};
 use rustc_hash::{FxHashMap as HashMap, FxHasher};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
-use tun_rs::{IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN, VirtioNetHdr, gso_split};
+use tun_rs::{
+    IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_HDR_GSO_TCPV6,
+    VIRTIO_NET_HDR_GSO_UDP_L4, VIRTIO_NET_HDR_LEN, VirtioNetHdr, gso_split,
+};
 
 use super::{
     V2RuntimeState,
@@ -36,7 +39,7 @@ use crate::{
             MAX_REPAIR_REQUESTS_PER_TICK, V2ControlRx, V2Rx, V2Tx, completed_record_to_tun,
         },
         feedback::FecFeedbackV2,
-        gso::encode_train_record_observed,
+        gso::{GsoObservationV2, encode_train_record_observed},
         presence::{PresenceDirectoryV2, PresenceUpdateV2, SignedPresenceV2},
         reassembly::ReassemblyOutput,
         repair::{RepairControlV2, RepairRequestV2, RepairResponseV2},
@@ -48,23 +51,26 @@ use crate::{
 
 const RAW_TUN_BYTES: usize = VIRTIO_NET_HDR_LEN + u16::MAX as usize;
 const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+const VIRTIO_NET_HDR_GSO_ECN: u8 = 0x80;
 pub(super) const TUN_INPUT_SLOTS: usize = 64;
 pub(super) const TUN_PRIORITY_INPUT_SLOTS: usize = 128;
 const TX_BULK_ADMISSION_HIGH_WATER_BYTES: usize = 512 * 1024;
 pub(super) const TX_LATENCY_ADMISSION_HIGH_WATER_BYTES: usize = 128 * 1024;
-// Keep ordinary admission shallow enough that an inner TCP sender observes
-// the real path rather than an 8 MiB userspace queue. The hard scheduler
-// limits remain larger for control/repair safety; this is the normal producer
-// watermark, with a separately driven strict-priority path.
+// Keep each adjacency's ordinary scheduler admission shallow enough that an
+// inner TCP sender observes the real path rather than the upstream merge
+// burst budget. The hard scheduler limits remain larger for control/repair
+// safety; this is the normal producer watermark, with a separately driven
+// strict-priority path.
 const TX_APPLICATION_ADMISSION_HIGH_WATER_BYTES: usize = 512 * 1024;
 pub(super) const TX_ADMISSION_BATCH_BYTES: usize = 128 * 1024;
 pub(super) const MAX_CLASSIFIERS: usize = 65_536;
 pub(super) const CLASSIFIER_IDLE: Duration = Duration::from_secs(60);
 
 /// Bounds the number of scheduler sends that may overtake a ready strict
-/// priority admission. `tokio::select! { biased; }` otherwise lets either
-/// always-ready future starve the other during a sustained recovery burst.
-const MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS: u8 = 8;
+/// priority admission. One send is enough to make progress for a preceding
+/// TUN batch, while a longer burst made the reserved ICMP/ACK lane wait
+/// behind a full paced quantum sequence on shallow paths.
+const MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrioritySendTurnV2 {
@@ -103,14 +109,42 @@ impl PrioritySendArbiterV2 {
     }
 }
 
+/// The first ready ingress future wins because the TX loops deliberately use
+/// `tokio::select! { biased; }`. Keep this order as a data-only helper so the
+/// single-peer and mesh loops retain the same ready-race contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IngressReadyOrderV2 {
+    PriorityThenSend,
+    SendThenPriority,
+    PriorityThenSendThenRegular,
+    SendThenPriorityThenRegular,
+}
+
+pub(super) fn ingress_ready_order(
+    saturated: bool,
+    priority_turn: PrioritySendTurnV2,
+) -> IngressReadyOrderV2 {
+    match (saturated, priority_turn) {
+        (true, PrioritySendTurnV2::PriorityAdmission) => IngressReadyOrderV2::PriorityThenSend,
+        (true, PrioritySendTurnV2::Send) => IngressReadyOrderV2::SendThenPriority,
+        (false, PrioritySendTurnV2::PriorityAdmission) => {
+            IngressReadyOrderV2::PriorityThenSendThenRegular
+        }
+        (false, PrioritySendTurnV2::Send) => IngressReadyOrderV2::SendThenPriorityThenRegular,
+    }
+}
+
 /// A raw TUN record plus its byte-budget ownership. Slot-bounded channels are
 /// insufficient here because one slot may hold either a 60-byte ACK or a
 /// 65-KiB GSO record. The permit remains attached until the dispatcher
 /// actually consumes the record, making the admission edge byte-bounded
-/// without a mutex or a second queue-length state machine.
+/// without a mutex or a second queue-length state machine. A one-shot GSO
+/// observation follows the first admitted segment so mesh routing can charge
+/// the original aggregate to the selected adjacency.
 pub(super) struct TunIngressRecordV2 {
     pub(super) bytes: Bytes,
     pub(super) info: PacketInfo,
+    pub(super) gso: GsoObservationV2,
     pub(super) _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -119,6 +153,7 @@ impl TunIngressRecordV2 {
         Self {
             bytes,
             info,
+            gso: GsoObservationV2::default(),
             _permit: None,
         }
     }
@@ -127,8 +162,14 @@ impl TunIngressRecordV2 {
         Self {
             bytes,
             info,
+            gso: GsoObservationV2::default(),
             _permit: Some(permit),
         }
+    }
+
+    fn with_gso_observation(mut self, gso: GsoObservationV2) -> Self {
+        self.gso = gso;
+        self
     }
 
     fn len(&self) -> usize {
@@ -263,6 +304,7 @@ pub(super) async fn prioritized_tun_reader(
     priority: mpsc::Sender<TunIngressRecordV2>,
     regular_budget: Arc<Semaphore>,
     metrics: Arc<RuntimeMetrics>,
+    tun_mtu: u16,
 ) -> Result<()> {
     let mut pool = PacketSlotPool::with_payload_sizes(1, 0, RAW_TUN_BYTES, RAW_TUN_BYTES);
     let mut split_pool = PacketSlotPool::with_payload_sizes(
@@ -290,62 +332,53 @@ pub(super) async fn prioritized_tun_reader(
             }
         };
         metrics.tun_tx_packets.fetch_add(1, Ordering::Relaxed);
-        if info.latency_protected {
+        let regular_admission_ready =
+            regular.capacity() > 0 && regular_budget.available_permits() >= length;
+        let oversized = tun_record_exceeds_mtu(length, tun_mtu);
+        if !oversized && (info.latency_protected || regular_admission_ready) {
+            // The common path neither decodes nor rewrites the virtio header.
+            // A configured 32-KiB TUN MTU bounds ordinary records, while the
+            // kernel may still hand us a larger GSO aggregate for amortized
+            // reads; only those aggregates need software segmentation.
             let record = pool.take(0, length);
-            if let Some((kind, sequence)) = icmpv4_echo_probe(&record[VIRTIO_NET_HDR_LEN..]) {
-                tracing::trace!(
-                    target: "ironet::latency_probe",
-                    stage = "tun-read",
-                    kind,
-                    sequence,
-                    "V2 ICMP latency probe"
-                );
+            if info.latency_protected {
+                if let Some((kind, sequence)) = icmpv4_echo_probe(&record[VIRTIO_NET_HDR_LEN..]) {
+                    tracing::trace!(
+                        target: "ironet::latency_probe",
+                        stage = "tun-read",
+                        kind,
+                        sequence,
+                        "V2 ICMP latency probe"
+                    );
+                }
+                priority
+                    .send(TunIngressRecordV2::priority(record, info))
+                    .await
+                    .context("V2 priority TX task stopped")?;
+            } else {
+                try_admit_regular_tun_record(&regular, &regular_budget, record, info, &metrics)?;
             }
-            priority
-                .send(TunIngressRecordV2::priority(record, info))
-                .await
-                .context("V2 priority TX task stopped")?;
-        } else if regular.capacity() > 0 && regular_budget.available_permits() >= length {
-            // The uncontended path retains the kernel's GSO aggregate and its
-            // zero-copy recycling allocation.
-            let record = pool.take(0, length);
-            try_admit_regular_tun_record(&regular, &regular_budget, record, info, &metrics)?;
         } else {
             // Admission overload must not stop reading the TUN: doing so moves
             // the queue into the opaque kernel/TUN ring and leaves ICMP, ACKs
             // and FINs behind seconds of stale bulk data. If this is a large
-            // TCP/UDP GSO record, split it before controlled tail shedding so
-            // one admission miss does not erase up to 64 KiB of inner TCP.
+            // TCP/UDP GSO record, split it before controlled tail shedding.
+            // Independently, split an aggregate larger than the configured
+            // TUN MTU even without admission pressure: preserving that 64-KiB
+            // failure domain would undo the MTU bound after one lost Cell.
             let header = VirtioNetHdr::decode(&pool.slots_mut()[0][..VIRTIO_NET_HDR_LEN])
-                .context("decoding overloaded V2 TUN virtio header")?;
-            if header.gso_type == VIRTIO_NET_HDR_GSO_NONE {
-                let record = pool.take(0, length);
-                try_admit_regular_tun_record(&regular, &regular_budget, record, info, &metrics)?;
+                .context("decoding V2 TUN virtio header for bounded admission")?;
+            let Some(split_header) = normalized_tun_gso_header(header) else {
+                record_invalid_tun_gso_type(&metrics, length, header.gso_type);
                 continue;
-            }
-            split_sizes.fill(0);
-            let ip_version = pool.slots_mut()[0][VIRTIO_NET_HDR_LEN] >> 4;
-            let segments = gso_split(
-                &mut pool.slots_mut()[0][VIRTIO_NET_HDR_LEN..length],
-                header,
-                split_pool.slots_mut(),
-                &mut split_sizes,
-                VIRTIO_NET_HDR_LEN,
-                ip_version == 6,
-            )
-            .context("splitting overloaded V2 TUN GSO record")?;
-            pool.recycle_empty(0);
-            for (index, payload_len) in split_sizes.iter().copied().take(segments).enumerate() {
-                split_pool.slots_mut()[index][..VIRTIO_NET_HDR_LEN].fill(0);
-                let record = split_pool.take(index, VIRTIO_NET_HDR_LEN + payload_len);
-                let info = match inspect_ip_packet(&record[VIRTIO_NET_HDR_LEN..]) {
-                    Ok(info) => info,
-                    Err(error) => {
-                        warn!(%error, "dropped invalid split V2 IP input at TUN admission");
-                        continue;
-                    }
-                };
-                metrics.tun_tx_packets.fetch_add(1, Ordering::Relaxed);
+            };
+            if !should_split_tun_gso_record(
+                length,
+                tun_mtu,
+                split_header.gso_type,
+                !info.latency_protected && !regular_admission_ready,
+            ) {
+                let record = pool.take(0, length);
                 if info.latency_protected {
                     priority
                         .send(TunIngressRecordV2::priority(record, info))
@@ -360,9 +393,134 @@ pub(super) async fn prioritized_tun_reader(
                         &metrics,
                     )?;
                 }
+                continue;
+            }
+            split_sizes.fill(0);
+            let ip_version = pool.slots_mut()[0][VIRTIO_NET_HDR_LEN] >> 4;
+            let segments = gso_split(
+                &mut pool.slots_mut()[0][VIRTIO_NET_HDR_LEN..length],
+                split_header,
+                split_pool.slots_mut(),
+                &mut split_sizes,
+                VIRTIO_NET_HDR_LEN,
+                ip_version == 6,
+            );
+            let segments = match segments {
+                Ok(segments) => segments,
+                Err(error) => {
+                    let (errors, sampled) = metrics.record_protocol_datagram_error();
+                    if sampled {
+                        warn!(
+                            %error,
+                            errors,
+                            length,
+                            gso_type = split_header.gso_type,
+                            "dropped invalid V2 TUN GSO record"
+                        );
+                    }
+                    continue;
+                }
+            };
+            let mut gso_observation =
+                tun_gso_fallback_observation(length.saturating_sub(VIRTIO_NET_HDR_LEN));
+            pool.recycle_empty(0);
+            for (index, payload_len) in split_sizes.iter().copied().take(segments).enumerate() {
+                split_pool.slots_mut()[index][..VIRTIO_NET_HDR_LEN].fill(0);
+                let record = split_pool.take(index, VIRTIO_NET_HDR_LEN + payload_len);
+                let info = match inspect_ip_packet(&record[VIRTIO_NET_HDR_LEN..]) {
+                    Ok(segment_info) => {
+                        inherit_aggregate_latency_class(segment_info, info.latency_protected)
+                    }
+                    Err(error) => {
+                        warn!(%error, "dropped invalid split V2 IP input at TUN admission");
+                        continue;
+                    }
+                };
+                metrics.tun_tx_packets.fetch_add(1, Ordering::Relaxed);
+                if info.latency_protected {
+                    let record = TunIngressRecordV2::priority(record, info)
+                        .with_gso_observation(gso_observation);
+                    priority
+                        .send(record)
+                        .await
+                        .context("V2 priority TX task stopped")?;
+                    gso_observation = GsoObservationV2::default();
+                } else {
+                    if try_admit_regular_tun_record_observed(
+                        &regular,
+                        &regular_budget,
+                        record,
+                        info,
+                        gso_observation,
+                        &metrics,
+                    )? {
+                        gso_observation = GsoObservationV2::default();
+                    }
+                }
             }
         }
     }
+}
+
+fn tun_record_exceeds_mtu(record_len: usize, tun_mtu: u16) -> bool {
+    record_len.saturating_sub(VIRTIO_NET_HDR_LEN) > usize::from(tun_mtu)
+}
+
+/// tun-rs dispatches TCP versus UDP by exact GSO-type equality. The ECN bit is
+/// virtio metadata rather than a distinct segmentation algorithm, so validate
+/// the base type and remove the bit before calling tun-rs.
+fn normalized_tun_gso_header(mut header: VirtioNetHdr) -> Option<VirtioNetHdr> {
+    let base_type = header.gso_type & !VIRTIO_NET_HDR_GSO_ECN;
+    if !matches!(
+        base_type,
+        VIRTIO_NET_HDR_GSO_NONE
+            | VIRTIO_NET_HDR_GSO_TCPV4
+            | VIRTIO_NET_HDR_GSO_TCPV6
+            | VIRTIO_NET_HDR_GSO_UDP_L4
+    ) {
+        return None;
+    }
+    header.gso_type = base_type;
+    Some(header)
+}
+
+fn inherit_aggregate_latency_class(
+    mut segment: crate::packet::PacketInfo,
+    aggregate_latency_protected: bool,
+) -> crate::packet::PacketInfo {
+    // All segments from one aggregate use one FIFO lane. In particular,
+    // tun-rs clears FIN on non-final TCP segments; reclassifying them
+    // independently would let the final priority FIN overtake its payload.
+    segment.latency_protected = aggregate_latency_protected;
+    segment
+}
+
+fn tun_gso_fallback_observation(input_bytes: usize) -> GsoObservationV2 {
+    GsoObservationV2 {
+        input_bytes: u64::try_from(input_bytes).unwrap_or(u64::MAX),
+        preserved_bytes: 0,
+        fallback_splits: 1,
+    }
+}
+
+fn record_invalid_tun_gso_type(metrics: &RuntimeMetrics, bytes: usize, gso_type: u8) {
+    let (errors, sampled) = metrics.record_protocol_datagram_error();
+    if sampled {
+        warn!(
+            errors,
+            bytes, gso_type, "dropped V2 TUN record with unsupported GSO type"
+        );
+    }
+}
+
+fn should_split_tun_gso_record(
+    record_len: usize,
+    tun_mtu: u16,
+    gso_type: u8,
+    regular_admission_overloaded: bool,
+) -> bool {
+    gso_type != VIRTIO_NET_HDR_GSO_NONE
+        && (regular_admission_overloaded || tun_record_exceeds_mtu(record_len, tun_mtu))
 }
 
 fn try_admit_regular_tun_record(
@@ -371,18 +529,38 @@ fn try_admit_regular_tun_record(
     record: Bytes,
     info: crate::packet::PacketInfo,
     metrics: &RuntimeMetrics,
-) -> Result<()> {
+) -> Result<bool> {
+    try_admit_regular_tun_record_observed(
+        regular,
+        regular_budget,
+        record,
+        info,
+        GsoObservationV2::default(),
+        metrics,
+    )
+}
+
+fn try_admit_regular_tun_record_observed(
+    regular: &mpsc::Sender<TunIngressRecordV2>,
+    regular_budget: &Arc<Semaphore>,
+    record: Bytes,
+    info: crate::packet::PacketInfo,
+    gso: GsoObservationV2,
+    metrics: &RuntimeMetrics,
+) -> Result<bool> {
     let length = record.len();
     let permits = u32::try_from(record.len()).context("V2 TUN record length overflow")?;
     let Ok(permit) = regular_budget.clone().try_acquire_many_owned(permits) else {
         record_tun_admission_drop(metrics, length);
-        return Ok(());
+        return Ok(false);
     };
-    match regular.try_send(TunIngressRecordV2::regular(record, info, permit)) {
-        Ok(()) => Ok(()),
+    match regular
+        .try_send(TunIngressRecordV2::regular(record, info, permit).with_gso_observation(gso))
+    {
+        Ok(()) => Ok(true),
         Err(mpsc::error::TrySendError::Full(record)) => {
             record_tun_admission_drop(metrics, record.len());
-            Ok(())
+            Ok(false)
         }
         Err(mpsc::error::TrySendError::Closed(_)) => bail!("V2 TX task stopped"),
     }
@@ -460,7 +638,9 @@ pub(super) async fn tx_loop(
         }
         let depth = tx.depth();
         let event = if tx.has_pending() && admission_saturated(depth, high_water) {
-            if priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
+            if ingress_ready_order(true, priority_send.next())
+                == IngressReadyOrderV2::PriorityThenSend
+            {
                 tokio::select! {
                     biased;
                     changed = tuning.changed() => {
@@ -484,7 +664,9 @@ pub(super) async fn tx_loop(
                 }
             }
         } else if tx.has_pending() || !deferred_input.is_empty() {
-            if tx.has_pending() && priority_send.next() == PrioritySendTurnV2::PriorityAdmission {
+            if ingress_ready_order(false, priority_send.next())
+                == IngressReadyOrderV2::PriorityThenSendThenRegular
+            {
                 tokio::select! {
                     biased;
                     changed = tuning.changed() => {
@@ -753,6 +935,7 @@ fn enqueue_tun_batch(
         let TunIngressRecordV2 {
             bytes: raw,
             info,
+            gso: reader_gso,
             _permit: _,
         } = record;
         let packet = &raw[VIRTIO_NET_HDR_LEN..];
@@ -772,13 +955,20 @@ fn enqueue_tun_batch(
         let class = state
             .classifier
             .observe(now, packet_len, 0, info.latency_protected);
-        let (metadata, data, gso) = match encode_train_record_observed(raw) {
+        let (metadata, data, mut gso) = match encode_train_record_observed(raw) {
             Ok(record) => record,
             Err(error) => {
                 warn!(%error, "dropped invalid V2 GSO metadata");
                 continue;
             }
         };
+        gso.input_bytes = gso.input_bytes.saturating_add(reader_gso.input_bytes);
+        gso.preserved_bytes = gso
+            .preserved_bytes
+            .saturating_add(reader_gso.preserved_bytes);
+        gso.fallback_splits = gso
+            .fallback_splits
+            .saturating_add(reader_gso.fallback_splits);
         ingress.observe(packet_len, gso);
         grouped
             .entry((flow_id, class, overlay_hop_limit))
@@ -1315,6 +1505,166 @@ mod tests {
     }
 
     #[test]
+    fn tun_gso_split_is_bounded_by_mtu_and_admission_pressure() {
+        const MTU: u16 = 32 * 1024;
+        let at_mtu = VIRTIO_NET_HDR_LEN + usize::from(MTU);
+        let tcpv4 = tun_rs::VIRTIO_NET_HDR_GSO_TCPV4;
+
+        assert!(!tun_record_exceeds_mtu(at_mtu, MTU));
+        assert!(tun_record_exceeds_mtu(at_mtu + 1, MTU));
+        assert!(!should_split_tun_gso_record(at_mtu, MTU, tcpv4, false));
+        assert!(should_split_tun_gso_record(at_mtu + 1, MTU, tcpv4, false));
+        assert!(should_split_tun_gso_record(at_mtu, MTU, tcpv4, true));
+        assert!(!should_split_tun_gso_record(
+            at_mtu + 1,
+            MTU,
+            VIRTIO_NET_HDR_GSO_NONE,
+            false
+        ));
+        assert!(!should_split_tun_gso_record(
+            at_mtu,
+            MTU,
+            VIRTIO_NET_HDR_GSO_NONE,
+            true
+        ));
+    }
+
+    fn tcpv4_gso_packet(payload_len: usize, tcp_flags: u8) -> Vec<u8> {
+        const IP_HEADER_LEN: usize = 20;
+        const TCP_HEADER_LEN: usize = 20;
+        let packet_len = IP_HEADER_LEN + TCP_HEADER_LEN + payload_len;
+        let mut packet = vec![0_u8; packet_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(packet_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet[16..20].copy_from_slice(&[198, 51, 100, 2]);
+        packet[20..22].copy_from_slice(&40_000_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&5_201_u16.to_be_bytes());
+        packet[32] = 5 << 4;
+        packet[33] = tcp_flags;
+        packet
+    }
+
+    #[test]
+    fn ecn_tcp_gso_is_normalized_split_and_kept_in_one_lane() {
+        const TCP_FIN_ACK: u8 = 0x11;
+        let mut packet = tcpv4_gso_packet(3_000, TCP_FIN_ACK);
+        let aggregate_info = inspect_ip_packet(&packet).unwrap();
+        assert!(aggregate_info.latency_protected);
+
+        let header = VirtioNetHdr {
+            flags: 1, // VIRTIO_NET_HDR_F_NEEDS_CSUM
+            gso_type: VIRTIO_NET_HDR_GSO_TCPV4 | VIRTIO_NET_HDR_GSO_ECN,
+            hdr_len: 40,
+            gso_size: 1_200,
+            csum_start: 20,
+            csum_offset: 16,
+        };
+        let normalized = normalized_tun_gso_header(header).unwrap();
+        assert_eq!(normalized.gso_type, VIRTIO_NET_HDR_GSO_TCPV4);
+
+        let mut outputs = vec![vec![0_u8; 1_500]; 4];
+        let mut sizes = vec![0_usize; outputs.len()];
+        let segments =
+            gso_split(&mut packet, normalized, &mut outputs, &mut sizes, 0, false).unwrap();
+        assert_eq!(segments, 3);
+
+        let independently_classified = outputs
+            .iter()
+            .zip(&sizes)
+            .take(segments)
+            .map(|(packet, &len)| inspect_ip_packet(&packet[..len]).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!independently_classified[0].latency_protected);
+        assert!(independently_classified[segments - 1].latency_protected);
+        assert!(
+            independently_classified
+                .into_iter()
+                .map(|info| inherit_aggregate_latency_class(info, aggregate_info.latency_protected))
+                .all(|info| info.latency_protected)
+        );
+    }
+
+    #[test]
+    fn unsupported_gso_type_is_rejected_and_counted_once() {
+        let header = VirtioNetHdr {
+            gso_type: 0x7f,
+            ..VirtioNetHdr::default()
+        };
+        assert!(normalized_tun_gso_header(header).is_none());
+        assert_eq!(
+            normalized_tun_gso_header(VirtioNetHdr {
+                gso_type: VIRTIO_NET_HDR_GSO_TCPV6 | VIRTIO_NET_HDR_GSO_ECN,
+                ..VirtioNetHdr::default()
+            })
+            .unwrap()
+            .gso_type,
+            VIRTIO_NET_HDR_GSO_TCPV6
+        );
+
+        let metrics = RuntimeMetrics::default();
+        record_invalid_tun_gso_type(&metrics, 65_535, header.gso_type);
+        assert_eq!(metrics.protocol_datagram_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reader_gso_split_metrics_fill_the_pre_admission_observation_gap() {
+        let observation = tun_gso_fallback_observation(60_000);
+        let record = TunIngressRecordV2::priority(Bytes::new(), test_packet_info())
+            .with_gso_observation(observation);
+        let mut batch = TunIngressBatchV2::default();
+        batch.observe(1_200, record.gso);
+        let metrics = RuntimeMetrics::default();
+        metrics.observe_tun_ingress_batch(batch);
+        assert_eq!(metrics.gso_input_bytes.load(Ordering::Relaxed), 60_000);
+        assert_eq!(metrics.gso_preserved_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.gso_fallback_splits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn split_gso_observation_follows_the_first_successful_regular_admission() {
+        let budget = Arc::new(Semaphore::new(100));
+        let held = budget.clone().try_acquire_many_owned(100).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let metrics = RuntimeMetrics::default();
+        let observation = tun_gso_fallback_observation(60_000);
+
+        assert!(
+            !try_admit_regular_tun_record_observed(
+                &sender,
+                &budget,
+                Bytes::from(vec![1; 100]),
+                test_packet_info(),
+                observation,
+                &metrics,
+            )
+            .unwrap()
+        );
+        drop(held);
+        assert!(
+            try_admit_regular_tun_record_observed(
+                &sender,
+                &budget,
+                Bytes::from(vec![2; 100]),
+                test_packet_info(),
+                observation,
+                &metrics,
+            )
+            .unwrap()
+        );
+        assert_eq!(receiver.try_recv().unwrap().gso, observation);
+    }
+
+    #[test]
+    fn merge_burst_budget_does_not_raise_per_adjacency_scheduler_watermarks() {
+        assert_eq!(crate::v2_runtime::TUN_REGULAR_INPUT_BYTES, 512 * 1024);
+        assert_eq!(TX_BULK_ADMISSION_HIGH_WATER_BYTES, 512 * 1024);
+        assert_eq!(TX_APPLICATION_ADMISSION_HIGH_WATER_BYTES, 512 * 1024);
+    }
+
+    #[test]
     fn repair_wait_policy_scales_the_adaptive_minimum_age() {
         let metrics = RuntimeMetrics::default();
         metrics
@@ -1475,13 +1825,54 @@ mod tests {
     fn send_ready_race_forces_a_priority_admission_after_a_bounded_send_burst() {
         let mut arbiter = PrioritySendArbiterV2::default();
         arbiter.admitted_priority();
-        for _ in 0..MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS - 1 {
+        let sends_before_boundary = MAX_SENDS_BETWEEN_PRIORITY_ADMISSIONS.saturating_sub(1);
+        for _ in 0..sends_before_boundary {
             assert_eq!(arbiter.next(), PrioritySendTurnV2::Send);
             arbiter.completed_send();
         }
         assert_eq!(arbiter.next(), PrioritySendTurnV2::Send);
         arbiter.completed_send();
         assert_eq!(arbiter.next(), PrioritySendTurnV2::PriorityAdmission);
+    }
+
+    #[test]
+    fn ingress_ready_order_preserves_priority_and_regular_ready_races() {
+        assert_eq!(
+            ingress_ready_order(true, PrioritySendTurnV2::PriorityAdmission),
+            IngressReadyOrderV2::PriorityThenSend
+        );
+        assert_eq!(
+            ingress_ready_order(true, PrioritySendTurnV2::Send),
+            IngressReadyOrderV2::SendThenPriority
+        );
+        assert_eq!(
+            ingress_ready_order(false, PrioritySendTurnV2::PriorityAdmission),
+            IngressReadyOrderV2::PriorityThenSendThenRegular
+        );
+        assert_eq!(
+            ingress_ready_order(false, PrioritySendTurnV2::Send),
+            IngressReadyOrderV2::SendThenPriorityThenRegular
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_turn_polls_a_ready_send_before_regular_ingress() {
+        let (_priority_sender, mut priority) = mpsc::channel::<()>(1);
+        let (regular_sender, mut regular) = mpsc::channel(1);
+        regular_sender.send(()).await.unwrap();
+
+        assert_eq!(
+            ingress_ready_order(false, PrioritySendTurnV2::PriorityAdmission),
+            IngressReadyOrderV2::PriorityThenSendThenRegular
+        );
+        let selected = tokio::select! {
+            biased;
+            _ = priority.recv() => "priority",
+            _ = std::future::ready(()) => "send",
+            _ = regular.recv() => "regular",
+        };
+        assert_eq!(selected, "send");
+        assert_eq!(regular.try_recv(), Ok(()));
     }
 
     #[test]

@@ -1315,8 +1315,10 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     value == &T::default()
 }
 
+pub(crate) const DEFAULT_TUN_MTU: u16 = 32 * 1024;
+
 fn default_tun_mtu() -> u16 {
-    u16::MAX
+    DEFAULT_TUN_MTU
 }
 
 fn is_default_tun_mtu(value: &u16) -> bool {
@@ -1493,11 +1495,17 @@ profile_id = 7
         )
         .unwrap();
         config.validate().unwrap();
-        assert_eq!(config.tun_mtu, u16::MAX);
+        assert_eq!(config.tun_mtu, 32 * 1024);
         assert_eq!(config.node_interface, "ironet0");
         assert_eq!(config.cover.profile_id, 7);
         assert_eq!(config.autotune, AutotuneConfig::default());
         assert_eq!(config.path_migration, PathMigrationConfig::default());
+    }
+
+    #[test]
+    fn documented_example_uses_the_default_tun_mtu() {
+        let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        assert_eq!(config.tun_mtu, DEFAULT_TUN_MTU);
     }
 
     #[test]

@@ -17,7 +17,8 @@ use super::{
 
 pub(crate) const RECEIVE_PRESSURE_GROWTH_STEP_BYTES: usize = 8 * 1024 * 1024;
 const RECEIVE_PRESSURE_HOLD_SAMPLES: u8 = 10;
-pub const INITIAL_SEND_BUFFER_BYTES_V2: usize = 256 * 1024;
+const SHORT_RTT_POLICER_CLEAN_DELIVERY_SAMPLES: usize = 5;
+pub const INITIAL_SEND_BUFFER_BYTES_V2: usize = 512 * 1024;
 /// Host default Repair cache retention when the policy leaves
 /// `TuneDecisionV2::repair_retention_millis` at zero.
 pub const REPAIR_CACHE_DEFAULT_TTL_V2: Duration = Duration::from_secs(2);
@@ -28,12 +29,24 @@ const MINIMUM_PROTECTION_PACKETS_PER_SECOND: u64 = 128;
 // backlog distinguishes that state from idle keepalive/PMTU probe loss.
 const MINIMUM_BACKLOG_PROTECTION_BYTES: u64 = 64 * 1024;
 const MINIMUM_BACKLOG_PROTECTION_PACKETS_PER_SECOND: u64 = 32;
+const MINIMUM_SHORT_RTT_POLICER_MODEL_BYTES_PER_SECOND: u64 = 8 * 1024 * 1024;
+const BULK_QUANTUM_BACKLOG_BYTES: u64 = 128 * 1024;
 
 fn has_protection_evidence(sample: PathTelemetryV2) -> bool {
     (sample.real_traffic_bytes_per_second >= MINIMUM_PROTECTION_TRAFFIC_BYTES_PER_SECOND
         && sample.packets_per_second >= MINIMUM_PROTECTION_PACKETS_PER_SECOND)
         || (sample.packet_train_queue_bytes >= MINIMUM_BACKLOG_PROTECTION_BYTES
             && sample.packets_per_second >= MINIMUM_BACKLOG_PROTECTION_PACKETS_PER_SECOND)
+}
+
+fn rates_track_within_ten_percent(left: u64, right: u64) -> bool {
+    if left == 0 || right == 0 {
+        return false;
+    }
+
+    let left = u128::from(left);
+    let right = u128::from(right);
+    left * 1_100 >= right * 1_000 && right * 1_100 >= left * 1_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +135,7 @@ impl Default for AutoTuneBoundsV2 {
             // Bulk retains enough staged work to amortize connection-driver
             // wakes. Semantic latency uses a separate strict QUIC admission
             // lane and therefore does not wait behind this ordinary buffer.
-            minimum_socket_buffer_bytes: 256 * 1024,
+            minimum_socket_buffer_bytes: 512 * 1024,
             // RX reassembly can have several interleaved PacketTrains per TUN
             // queue before QUIC delivers their end Cells. Keep the cold-start
             // floor independent from the much smaller TX admission floor.
@@ -214,6 +227,8 @@ impl Bbr3ProposalV2 {
                 up_gain_milli: 1_100,
                 headroom_milli: 250,
                 cwnd_gain_milli: 2_000,
+                // Keep only a small estimate margin: controller bandwidth can include
+                // token-burst samples, while 900‰ measurably underfeeds shallow policers.
                 pacing_cap_bytes_per_second: controller_bw.saturating_mul(970) / 1_000,
                 loss_is_congestion: true,
             },
@@ -391,8 +406,15 @@ pub struct FilteredTelemetryV1 {
     pub repair_latency_micros: u64,
     /// Matched Repair completions folded into the hit/latency EWMAs.
     pub repair_observations: u64,
-    /// Samples that carried protection evidence since the last reset.
+    /// Samples that carried protection evidence since the last filter reset
+    /// or retired policer episode.
     pub protection_samples: u64,
+    /// Stateful short-RTT policer classification after its enter/hold
+    /// hysteresis has been applied by [`TelemetryFilterV1`].
+    pub short_rtt_policer_limited: bool,
+    /// Pacing cap captured at short-RTT policer entry and held for the active
+    /// episode so shaped delivery cannot feed back into its own ceiling.
+    pub short_rtt_policer_pacing_cap_bytes_per_second: Option<u64>,
     /// Receive-buffer floor currently held after reassembly pressure; zero
     /// when no pressure hold is active.
     pub receive_pressure_floor_bytes: usize,
@@ -431,6 +453,16 @@ impl FilteredTelemetryV1 {
             && self.rtt_micros > self.min_rtt_micros.saturating_add(budget)
     }
 
+    /// Whether the live sample, rather than its EWMA, reports a queue above
+    /// the path-relative delay budget. Classification entry and protection
+    /// decisions use this to avoid treating a deep Wi-Fi queue as a shallow
+    /// token bucket merely because the smoothed RTT has not caught up yet.
+    pub fn raw_queue_inflated(&self) -> bool {
+        let min_rtt_micros = micros(self.raw.min_rtt);
+        let budget = 5_000_u64.max(min_rtt_micros / 2);
+        micros(self.raw.queue_delay) > budget
+    }
+
     /// A credible sample arms the directional classifier. Once armed, keep
     /// protection stable through a loss-induced goodput collapse while the
     /// application still has any real/queued work; otherwise the old
@@ -444,27 +476,26 @@ impl FilteredTelemetryV1 {
     }
 
     /// A shallow token-bucket/policer can drop at line rate without retaining
-    /// a queue long enough to inflate RTT. Sustained >=2% loss below 20 ms is
-    /// therefore congestion-like; BBR's matching automatic pacing loop backs
-    /// off the total QUIC wire rate. Random-loss WANs are excluded by the RTT
-    /// bound and continue to use FEC/Repair.
+    /// a queue long enough to inflate RTT. The telemetry filter enters this
+    /// state on the first credible active sample at 1.5% smoothed loss and
+    /// holds it for the path activation while traffic remains active.
+    /// Successful pacing naturally creates clean loss
+    /// samples, so loss alone cannot disprove the policer that produced them;
+    /// two truly idle samples or a path/filter reset release the latch.
     pub fn policer_limited(&self) -> bool {
-        self.protection_evidence()
-            && self.rtt_micros <= 20_000
-            && self.min_rtt_micros <= 20_000
-            && self.loss_ppm >= 20_000
+        self.short_rtt_policer_limited
     }
 
     pub fn congested(&self) -> bool {
         self.queue_inflated() || self.policer_limited()
     }
 
-    /// The live sample carries protection evidence and crosses the 0.1%
-    /// loss (or two-Cell burst) threshold: protection is installed without
+    /// The live sample carries protection evidence and crosses the 1%
+    /// loss (or three-Cell burst) threshold: protection is installed without
     /// hysteresis and a candidate may not switch it off.
     pub fn protection_emergency(&self) -> bool {
         has_protection_evidence(self.raw)
-            && (self.raw.loss_ppm >= 1_000 || self.raw.burst_loss_cells >= 2)
+            && (self.raw.loss_ppm >= 10_000 || self.raw.burst_loss_cells >= 3)
     }
 
     /// Latency traffic is queued: Bulk may not overtake it.
@@ -532,6 +563,11 @@ pub struct TelemetryFilterV1 {
     last_repair_completed_requests: u64,
     repair_counter_initialized: bool,
     protection_samples: u64,
+    short_rtt_policer_limited: bool,
+    short_rtt_policer_inactive_ticks: u8,
+    short_rtt_policer_pacing_cap_bytes_per_second: Option<u64>,
+    short_rtt_policer_clean_delivery_samples: [u64; SHORT_RTT_POLICER_CLEAN_DELIVERY_SAMPLES],
+    short_rtt_policer_clean_delivery_next: usize,
     receive_pressure_floor_bytes: usize,
     receive_pressure_hold_samples: u8,
 }
@@ -561,6 +597,11 @@ impl TelemetryFilterV1 {
             last_repair_completed_requests: 0,
             repair_counter_initialized: false,
             protection_samples: 0,
+            short_rtt_policer_limited: false,
+            short_rtt_policer_inactive_ticks: 0,
+            short_rtt_policer_pacing_cap_bytes_per_second: None,
+            short_rtt_policer_clean_delivery_samples: [0; SHORT_RTT_POLICER_CLEAN_DELIVERY_SAMPLES],
+            short_rtt_policer_clean_delivery_next: 0,
             receive_pressure_floor_bytes: 0,
             receive_pressure_hold_samples: 0,
         }
@@ -603,7 +644,110 @@ impl TelemetryFilterV1 {
         }
         self.samples = self.samples.saturating_add(1);
         self.smooth(sample);
+        let active_direction = sample.real_traffic_bytes_per_second != 0
+            || sample.tun_ingress_bytes_per_second != 0
+            || sample.packet_train_queue_bytes != 0;
+        if !active_direction {
+            self.clear_short_rtt_policer_clean_delivery_samples();
+        } else if sample.loss_ppm == 0 && sample.delivery_rate_bytes_per_second != 0 {
+            self.record_short_rtt_policer_clean_delivery(sample.delivery_rate_bytes_per_second);
+        }
+        if self.short_rtt_policer_limited {
+            if active_direction {
+                self.short_rtt_policer_inactive_ticks = 0;
+            } else {
+                self.short_rtt_policer_inactive_ticks =
+                    self.short_rtt_policer_inactive_ticks.saturating_add(1);
+                if self.short_rtt_policer_inactive_ticks >= 2 {
+                    self.short_rtt_policer_limited = false;
+                    self.short_rtt_policer_inactive_ticks = 0;
+                    self.short_rtt_policer_pacing_cap_bytes_per_second = None;
+                    // The next activation must establish fresh loss evidence;
+                    // otherwise the retained EWMA can immediately relatch a
+                    // clean flow after this episode has gone idle.
+                    self.loss_ppm = 0;
+                    self.burst_loss_cells = 0;
+                    self.protection_samples = 0;
+                }
+            }
+        } else {
+            self.short_rtt_policer_inactive_ticks = 0;
+            let short_rtt = self.rtt_micros <= 10_000 && self.min_rtt_micros <= 10_000;
+            // A startup controller model can lag throughput the same sample
+            // already proved. Do not freeze that stale estimate; wait until a
+            // model reaches the shallow-policer operating range and catches
+            // up with current delivered payload. Lower-rate random loss stays
+            // on the LossyRadio/FEC path instead of pinning a startup cap.
+            let model_in_policer_range = sample.controller_bw_bytes_per_second
+                >= MINIMUM_SHORT_RTT_POLICER_MODEL_BYTES_PER_SECOND;
+            let unqueued_credible_model = model_in_policer_range
+                && sample.controller_bw_bytes_per_second >= sample.delivery_rate_bytes_per_second;
+            let raw_queue_inflated = self.view(sample).raw_queue_inflated();
+            // A shallow policer can inflate the instantaneous queue before
+            // the classifier sees enough loss. Once BBR has left Startup, a
+            // model tracking delivery within 10% is independent evidence that
+            // this is a short physical path rather than deep Wi-Fi queuing.
+            let tracking_band_credible_model = model_in_policer_range
+                && self.min_rtt_micros <= 10_000
+                && micros(sample.min_rtt) <= 10_000
+                && micros(sample.rtt) <= 20_000
+                && sample.controller_state != 0
+                && rates_track_within_ten_percent(
+                    sample.controller_bw_bytes_per_second,
+                    sample.delivery_rate_bytes_per_second,
+                );
+            let credible_shallow_policer =
+                (short_rtt && unqueued_credible_model && !raw_queue_inflated)
+                    || tracking_band_credible_model;
+            self.short_rtt_policer_limited = self.protection_samples != 0
+                && active_direction
+                && (sample.tun_ingress_bytes_per_second != 0
+                    || sample.packet_train_queue_bytes != 0)
+                && credible_shallow_policer
+                && self.loss_ppm >= 15_000;
+            if self.short_rtt_policer_limited {
+                // Reserve 5% below the UDP-payload controller model for
+                // physical IP/UDP wire overhead. The bounded two-millisecond
+                // send quantum permits this small near-line-rate margin
+                // without recreating the former burst overflow. A credible
+                // recent clean delivery peak may lower that cap, but never
+                // raise it above the payload rate the path has already proved.
+                // The lossy entry interval is deliberately not recorded: its
+                // low delivery is an effect of the policer, not a new capacity
+                // estimate. Capture this cap once for the active episode so
+                // subsequent shaped samples cannot ratchet it downward.
+                let model_cap = (sample.controller_bw_bytes_per_second != 0)
+                    .then(|| sample.controller_bw_bytes_per_second.saturating_mul(950) / 1_000);
+                self.short_rtt_policer_pacing_cap_bytes_per_second = model_cap.map(|model_cap| {
+                    self.short_rtt_policer_clean_delivery_peak()
+                        .filter(|clean_cap| *clean_cap >= model_cap.saturating_mul(95) / 100)
+                        .map_or(model_cap, |clean_cap| model_cap.min(clean_cap))
+                });
+            }
+        }
         self.view(sample)
+    }
+
+    fn record_short_rtt_policer_clean_delivery(&mut self, delivery_rate: u64) {
+        self.short_rtt_policer_clean_delivery_samples[self.short_rtt_policer_clean_delivery_next] =
+            delivery_rate;
+        self.short_rtt_policer_clean_delivery_next = (self.short_rtt_policer_clean_delivery_next
+            + 1)
+            % SHORT_RTT_POLICER_CLEAN_DELIVERY_SAMPLES;
+    }
+
+    fn clear_short_rtt_policer_clean_delivery_samples(&mut self) {
+        self.short_rtt_policer_clean_delivery_samples =
+            [0; SHORT_RTT_POLICER_CLEAN_DELIVERY_SAMPLES];
+        self.short_rtt_policer_clean_delivery_next = 0;
+    }
+
+    fn short_rtt_policer_clean_delivery_peak(&self) -> Option<u64> {
+        self.short_rtt_policer_clean_delivery_samples
+            .iter()
+            .copied()
+            .max()
+            .filter(|peak| *peak != 0)
     }
 
     /// Non-mutating snapshot of the current filter state paired with
@@ -631,6 +775,9 @@ impl TelemetryFilterV1 {
             repair_latency_micros: self.repair_latency_micros,
             repair_observations: self.repair_observations,
             protection_samples: self.protection_samples,
+            short_rtt_policer_limited: self.short_rtt_policer_limited,
+            short_rtt_policer_pacing_cap_bytes_per_second: self
+                .short_rtt_policer_pacing_cap_bytes_per_second,
             receive_pressure_floor_bytes: self.receive_pressure_floor_bytes,
         }
     }
@@ -736,9 +883,9 @@ impl TelemetryFilterV1 {
 /// telemetry (plus the host limits that define the action space) to a
 /// [`CandidateActionV1`]. It proposes every V1 domain it has an opinion on
 /// and leaves host-derived fields (Repair cache, cover padding, egress)
-/// unset. Like any other policy output it is untrusted: reliable-underlay,
-/// CPU, queue, memory and wire-overhead limits are enforced afterwards by
-/// [`GuardrailsV1`], not here.
+/// unset. The native baseline responds directly to reliable-underlay, CPU and
+/// queue evidence; like any other policy output it remains untrusted, and
+/// [`GuardrailsV1`] independently enforces the authoritative host limits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NativePolicyV1;
 
@@ -749,10 +896,10 @@ impl NativePolicyV1 {
         limits: &HostLimitsV1,
     ) -> CandidateActionV1 {
         let raw = &filtered.raw;
-        let queue_inflated = filtered.queue_inflated();
         let protection_evidence = filtered.protection_evidence();
         let policer_limited = filtered.policer_limited();
-        let congested = filtered.congested();
+        let short_rtt_congestion_candidate = filtered.min_rtt_micros <= 10_000
+            && (raw.loss_ppm >= 10_000 || filtered.loss_ppm >= 10_000);
         let cpu_limited = filtered.cpu_limited();
         let reliable = filtered.reliable();
         let reason = filtered.classify();
@@ -768,84 +915,61 @@ impl NativePolicyV1 {
             && filtered.repair_hit_per_mille >= 800
             && filtered.repair_latency_micros != 0
             && filtered.repair_latency_micros <= repair_latency_budget_micros;
-        // On a low-RTT shallow policer, loss is the congestion signal itself.
-        // Adding parity raises the same bottleneck's offered load and creates
-        // a positive feedback loop (loss -> FEC -> more loss -> Repair). QUIC
-        // and the inner transport already retransmit; retain FEC only when an
-        // actual queue or non-policer loss signature disproves this case.
-        let unqueued_shallow_policer = policer_limited && !queue_inflated;
-        let proven_wasteful_short_path = filtered.rtt_micros < 20_000
-            && repair_effective
-            && filtered.wasted_parity_per_mille >= 750
-            && filtered.recovery_per_mille <= 250;
-        // QUIC's lost-packet counter includes congestion loss. Suppressing all
-        // FEC merely because a shallow policer also built a queue amplified
-        // one lost outer Cell into a complete 16-64 KiB PacketTrain loss.
-        // Under queue congestion retain exactly one sparse parity Cell; BBR
-        // accounts for those wire bytes and converges on the usable
-        // bottleneck rate. (Reliable-underlay and CPU suppression are host
-        // guardrails applied after this proposal.)
-        let fec = if !protection_evidence
-            || filtered.loss_ppm < 1_000
-            || unqueued_shallow_policer
-            || proven_wasteful_short_path
-        {
+        let low_random_loss =
+            filtered.loss_ppm != 0 && filtered.loss_ppm < 10_000 && filtered.burst_loss_cells < 3;
+        let fec = if !protection_evidence || filtered.loss_ppm == 0 {
             None
-        } else if congested {
-            Some(FecGeometryV2 {
-                data_cells: 8,
-                parity_cells: 1,
-            })
-        } else if repair_effective
-            && filtered.loss_ppm < 10_000
-            && filtered.wasted_parity_per_mille > 800
-            && filtered.recovery_per_mille < 50
-        {
-            // A short path may report a multi-Cell burst even when absolute
-            // loss is below 1%. Once authenticated feedback proves that
-            // almost every parity Cell is wasted and Repair reliably closes
-            // the rare hole, the burst classifier must not pin 8+1 forever.
-            // This check deliberately precedes the burst branches below.
+        } else if short_rtt_congestion_candidate {
+            // On a very short path, one-percent loss is credible congestion
+            // evidence before the controller's bounded policer trial can be
+            // confirmed. Parity crosses the same bottleneck and therefore
+            // makes that trial slower and less causal; keep it off from the
+            // first raw or retained filtered loss sample.
             None
-        } else if filtered.loss_ppm < 10_000
-            && filtered.wasted_parity_per_mille > 900
-            && filtered.recovery_per_mille < 50
-        {
-            // Receiver evidence already proves dense parity is wasteful, but
-            // Repair has not accumulated enough completed requests to turn
-            // protection fully off. Widen the stripe instead of holding 8+1
-            // at ~12.5% wire cost for tens of seconds on a lightly lossy
-            // short path.
-            Some(FecGeometryV2 {
-                data_cells: 16,
-                parity_cells: 1,
-            })
-        } else if filtered.burst_loss_cells >= 3 || filtered.loss_ppm >= 30_000 {
+        } else if policer_limited || filtered.queue_inflated() {
+            // Parity consumes the same constrained wire budget and therefore
+            // amplifies congestion loss. In particular, receiver gaps from a
+            // shallow-policer overshoot must not create a residual-loss -> FEC
+            // feedback loop while BBR settles onto its fixed ceiling.
+            None
+        } else if low_random_loss {
+            // Sparse sub-one-percent loss does not justify a permanent 16+1
+            // tax: receiver evidence shows almost every parity Cell is
+            // wasted, while QUIC and the inner transport recover the rare
+            // miss. Protection resumes at one percent or a three-Cell burst.
+            None
+        } else if filtered.loss_ppm >= 80_000 {
             Some(if filtered.rtt_micros < 80_000 {
                 // A shallow policer can report a large instantaneous loss
-                // percentage without retaining an RTT queue. On such
-                // short-feedback paths 4+2 parity raises wire load by 50%,
-                // causing still more policer loss. One 8+1 stripe plus
-                // fast Repair bounds redundancy and breaks that loop.
+                // percentage without retaining an RTT queue. On such short
+                // feedback paths, dense parity can overdrive the same
+                // bottleneck; one 8+1 stripe plus fast Repair bounds that
+                // feedback loop.
                 FecGeometryV2 {
                     data_cells: 8,
                     parity_cells: 1,
                 }
-            } else if repair_effective
-                && filtered.wasted_parity_per_mille > 800
-                && filtered.recovery_per_mille < 100
-            {
-                // Start severe/unclassified loss at 4+2, but do not keep
-                // spending two parity Cells after directional receiver
-                // evidence proves nearly all parity is wasted and Repair
-                // returns within the RTT-derived budget. A 6+1 stripe
-                // retains immediate isolated-loss recovery while halving
-                // wire redundancy and leaves burst tails to proven Repair.
+            } else {
+                // At >=8% sustained loss on a non-congested WAN, the observed
+                // correlated burst tail needs four recovery symbols. These
+                // paths have ample unused wire headroom; receiver expiry is
+                // more costly than the bounded 100% parity overhead.
                 FecGeometryV2 {
-                    data_cells: 6,
+                    data_cells: 4,
+                    parity_cells: 4,
+                }
+            })
+        } else if filtered.burst_loss_cells >= 3 || filtered.loss_ppm >= 30_000 {
+            Some(if filtered.rtt_micros < 80_000 {
+                FecGeometryV2 {
+                    data_cells: 8,
                     parity_cells: 1,
                 }
             } else {
+                // Do not thin severe high-RTT protection in response to
+                // wasted-parity or fast-Repair samples. Under correlated
+                // loss, those signals are biased toward completed stripes;
+                // retaining 4+2 prevents the missing tails from expiring.
                 FecGeometryV2 {
                     data_cells: 4,
                     parity_cells: 2,
@@ -891,7 +1015,7 @@ impl NativePolicyV1 {
 
         let minimum_train = usize_from_u64(u64::from(limits.train_target_floor_bytes));
         let maximum_train = usize_from_u64(u64::from(limits.train_target_cap_bytes));
-        let train_target = if cpu_limited || congested {
+        let train_target = if cpu_limited || filtered.congested() {
             16 * 1024
         } else if filtered.delivery_rate_bytes_per_second >= 50 * 1024 * 1024
             && raw.packet_train_queue_bytes >= 64 * 1024
@@ -904,16 +1028,13 @@ impl NativePolicyV1 {
         }
         .clamp(minimum_train, maximum_train);
 
-        // QUIC still paces every datagram, so admitting a four-Cell Bulk
-        // quantum does not create a wire burst. Under Bulk-only
-        // congestion/CPU pressure, batching amortizes the connection lock;
-        // the one-Cell bound while latency traffic is queued is a host
-        // guardrail.
-        let bulk_quantum_cells = if cpu_limited
-            || congested
-            || filtered.delivery_rate_bytes_per_second >= 20 * 1024 * 1024
-        {
-            4
+        // An eight-Cell quantum does not bypass QUIC's cwnd, but it does make
+        // one userspace submission larger. Only actual packet-train backlog
+        // justifies that batching tradeoff: ingress/rate snapshots can lead
+        // the queue and otherwise expand the first burst. Queued latency
+        // remains a final one-Cell guardrail.
+        let bulk_quantum_cells = if raw.packet_train_queue_bytes >= BULK_QUANTUM_BACKLOG_BYTES {
+            8
         } else {
             2
         };
@@ -1003,9 +1124,12 @@ impl NativePolicyV1 {
                 up_gain_milli: 1_100,
                 headroom_milli: 250,
                 cwnd_gain_milli: 2_000,
-                pacing_cap_bytes_per_second: raw.controller_bw_bytes_per_second.saturating_mul(970)
-                    / 1_000,
-                loss_is_congestion: true,
+                // Avoid a second feedback controller over the same loss
+                // signal. BBR's internal policer scale and shallow-queue guard
+                // adapt the wire rate; the filter's fixed entry estimate
+                // remains observational state only.
+                pacing_cap_bytes_per_second: 0,
+                loss_is_congestion: false,
             }
         } else if filtered.min_rtt_micros >= 120_000 {
             Bbr3ProposalV2 {
@@ -1661,24 +1785,682 @@ pub(crate) mod tests_fixture {
     }
 
     #[test]
-    fn shallow_policer_with_an_actual_queue_keeps_bounded_sparse_fec() {
-        let start = Instant::now();
-        let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
+    fn queue_inflated_tracking_band_detects_short_rtt_policer() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_micros(4_044);
+        telemetry.rtt = Duration::from_micros(16_542);
+        telemetry.queue_delay = Duration::from_micros(12_497);
+        telemetry.loss_ppm = 40_523;
+        telemetry.controller_state = 3;
+        telemetry.controller_bw_bytes_per_second = 11_674_318;
+        telemetry.delivery_rate_bytes_per_second = 12_587_250;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.rtt_micros > 10_000);
+        assert!(filtered.raw_queue_inflated());
+        assert!(filtered.policer_limited());
+    }
+
+    #[test]
+    fn rate_matched_deep_wifi_does_not_match_policer_tracking_band() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_micros(5_725);
+        telemetry.rtt = Duration::from_micros(92_054);
+        telemetry.queue_delay = Duration::from_micros(86_329);
+        telemetry.loss_ppm = 26_424;
+        telemetry.controller_state = 4;
+        telemetry.controller_bw_bytes_per_second = 9 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 9 * 1024 * 1024;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.raw_queue_inflated());
+        assert!(!filtered.policer_limited());
+    }
+
+    #[test]
+    fn retired_policer_loss_does_not_relatch_clean_tracking_traffic() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(4);
+        telemetry.rtt = Duration::from_millis(16);
+        telemetry.queue_delay = Duration::from_millis(12);
+        telemetry.loss_ppm = 40_000;
+        telemetry.controller_state = 3;
+        telemetry.controller_bw_bytes_per_second = 9 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 9 * 1024 * 1024;
+        assert!(filter.update(telemetry, 8 * 1024 * 1024).policer_limited());
+
+        telemetry.loss_ppm = 0;
+        telemetry.real_traffic_bytes_per_second = 0;
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(filter.update(telemetry, 8 * 1024 * 1024).policer_limited());
+        let retired = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(!retired.policer_limited());
+        assert_eq!(retired.loss_ppm, 0);
+        assert_eq!(retired.protection_samples, 0);
+
+        telemetry.real_traffic_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.tun_ingress_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.packet_train_queue_bytes = 128 * 1024;
+        let clean = filter.update(telemetry, 8 * 1024 * 1024);
+        assert_eq!(clean.loss_ppm, 0);
+        assert!(!clean.policer_limited());
+    }
+
+    #[test]
+    fn rate_tracking_band_has_inclusive_ten_percent_boundaries() {
+        assert!(rates_track_within_ten_percent(10_000, 11_000));
+        assert!(!rates_track_within_ten_percent(10_000, 11_001));
+        assert!(rates_track_within_ten_percent(11_000, 10_000));
+        assert!(!rates_track_within_ten_percent(11_001, 10_000));
+        assert!(!rates_track_within_ten_percent(0, 10_000));
+        assert!(!rates_track_within_ten_percent(10_000, 0));
+        assert!(rates_track_within_ten_percent(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn unqueued_policer_keeps_accepting_model_far_above_delivery_in_startup() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(4);
+        telemetry.rtt = Duration::from_millis(5);
+        telemetry.queue_delay = Duration::from_millis(1);
+        telemetry.loss_ppm = 20_000;
+        telemetry.controller_state = 0;
+        telemetry.controller_bw_bytes_per_second = 14_332_836;
+        telemetry.delivery_rate_bytes_per_second = 8_718_812;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(!filtered.raw_queue_inflated());
+        assert!(filtered.policer_limited());
+    }
+
+    #[test]
+    fn short_rtt_deep_queue_is_not_a_policer_but_still_suppresses_fec() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
         let mut telemetry = sample(1);
         telemetry.min_rtt = Duration::from_millis(5);
         telemetry.rtt = Duration::from_millis(12);
         telemetry.queue_delay = Duration::from_millis(7);
         telemetry.loss_ppm = 80_000;
         telemetry.burst_loss_cells = 4;
-        let decision = tuner.observe_at(telemetry, start);
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.raw_queue_inflated());
+        assert!(!filtered.policer_limited());
+        let candidate = NativePolicyV1.propose(&filtered, &HostLimitsV1::default());
+        let fec = candidate.fec.expect("deep-queue FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+    }
+
+    #[test]
+    fn short_rtt_policer_activation_latches_across_clean_pacing_samples() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(4);
+        telemetry.rtt = Duration::from_millis(5);
+        telemetry.queue_delay = Duration::from_millis(1);
+        telemetry.controller_bw_bytes_per_second = 25 * 1024 * 1024;
+
+        // The first credible lossy sample caps immediately. Later clean
+        // samples prove pacing works without releasing the latch.
+        for loss_ppm in [17_942, 0, 0, 0, 0, 0, 65_479, 5_313, 0, 0, 0] {
+            telemetry.loss_ppm = loss_ppm;
+            let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+            assert!(
+                filtered.policer_limited(),
+                "loss={loss_ppm}, filtered={filtered:?}"
+            );
+            assert_eq!(filtered.classify(), TuneReasonV2::Congested);
+        }
+
+        telemetry.loss_ppm = 0;
+        telemetry.real_traffic_bytes_per_second = 0;
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        assert!(filter.update(telemetry, 8 * 1024 * 1024).policer_limited());
+        assert!(!filter.update(telemetry, 8 * 1024 * 1024).policer_limited());
+
+        // Reset is authoritative even if the preceding activation was pinned.
+        telemetry.real_traffic_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.tun_ingress_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.packet_train_queue_bytes = 128 * 1024;
+        telemetry.loss_ppm = 80_000;
+        assert!(filter.update(telemetry, 8 * 1024 * 1024).policer_limited());
+        filter.reset();
+        telemetry.loss_ppm = 0;
+        assert!(!filter.view(telemetry).policer_limited());
+    }
+
+    #[test]
+    fn short_rtt_policer_holds_entry_estimate_without_publishing_external_cap() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(4);
+        telemetry.rtt = Duration::from_millis(5);
+        telemetry.queue_delay = Duration::from_millis(1);
+        telemetry.loss_ppm = 20_000;
+        telemetry.controller_bw_bytes_per_second = 10 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 8 * 1024 * 1024;
+        let held_cap = 10 * 1024 * 1024 * 950 / 1_000;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.policer_limited());
         assert_eq!(
-            decision.fec,
-            Some(FecGeometryV2 {
-                data_cells: 8,
-                parity_cells: 1
-            })
+            filtered.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(held_cap)
         );
-        assert_eq!(decision.reason, TuneReasonV2::Congested);
+        let candidate = NativePolicyV1.propose(&filtered, &HostLimitsV1::default());
+        let fec = candidate.fec.expect("short-RTT policer FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+        let bbr = candidate.bbr.expect("short-RTT policer candidate");
+        assert_eq!(bbr.pacing_cap_bytes_per_second, Some(0));
+        assert_eq!(bbr.loss_is_congestion, Some(false));
+
+        // Once entered, neither later loss nor a collapsed controller/delivery
+        // estimate may feed a shaped result back into the episode cap.
+        telemetry.loss_ppm = 1_405;
+        telemetry.controller_bw_bytes_per_second = 2 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 2 * 1024 * 1024;
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.policer_limited());
+        assert_eq!(
+            filtered.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(held_cap)
+        );
+        let candidate = NativePolicyV1.propose(&filtered, &HostLimitsV1::default());
+        let fec = candidate
+            .fec
+            .expect("held low-loss short-RTT policer FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+        let bbr = candidate.bbr.expect("held short-RTT policer candidate");
+        assert_eq!(bbr.pacing_cap_bytes_per_second, Some(0));
+        assert_eq!(bbr.loss_is_congestion, Some(false));
+
+        // Severe loss and receiver evidence remain inside the same constrained
+        // wire budget and therefore cannot turn parity back on.
+        telemetry.loss_ppm = 80_000;
+        telemetry.residual_loss_ppm = 5_000;
+        telemetry.remote_expired_stripes_delta = 1;
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert_eq!(
+            filtered.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(held_cap)
+        );
+        let candidate = NativePolicyV1.propose(&filtered, &HostLimitsV1::default());
+        let fec = candidate.fec.expect("receiver-evidence FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+        let bbr = candidate.bbr.expect("fixed-cap policer candidate");
+        assert_eq!(bbr.pacing_cap_bytes_per_second, Some(0));
+        assert_eq!(bbr.loss_is_congestion, Some(false));
+
+        // Two truly idle samples retire both the classifier and its held cap.
+        telemetry.real_traffic_bytes_per_second = 0;
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.policer_limited());
+        assert_eq!(
+            filtered.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(held_cap)
+        );
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(!filtered.policer_limited());
+        assert_eq!(filtered.short_rtt_policer_pacing_cap_bytes_per_second, None);
+
+        // A path/filter reset also cannot carry the former policer cap.
+        filter.reset();
+        assert_eq!(
+            filter
+                .view(telemetry)
+                .short_rtt_policer_pacing_cap_bytes_per_second,
+            None
+        );
+
+        // A missing or lagging model cannot latch below delivery the same
+        // sample already proved. Once the model catches up, entry is
+        // immediate and captures the normal discounted model cap.
+        telemetry.real_traffic_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.tun_ingress_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.packet_train_queue_bytes = 128 * 1024;
+        telemetry.loss_ppm = 20_000;
+        telemetry.delivery_rate_bytes_per_second = 5 * 1024 * 1024;
+        telemetry.controller_bw_bytes_per_second = 0;
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(!filtered.policer_limited());
+        assert_eq!(filtered.short_rtt_policer_pacing_cap_bytes_per_second, None);
+        telemetry.controller_bw_bytes_per_second = 4 * 1024 * 1024;
+        assert!(!filter.update(telemetry, 8 * 1024 * 1024).policer_limited());
+        telemetry.controller_bw_bytes_per_second = 7 * 1024 * 1024;
+        assert!(
+            !filter.update(telemetry, 8 * 1024 * 1024).policer_limited(),
+            "a model above delivery but below the 8 MiB/s policer floor stays LossyRadio"
+        );
+        telemetry.controller_bw_bytes_per_second = 9 * 1024 * 1024;
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.policer_limited());
+        let bbr = NativePolicyV1
+            .propose(&filtered, &HostLimitsV1::default())
+            .bbr
+            .expect("credible-model short-RTT policer candidate");
+        assert_eq!(bbr.pacing_cap_bytes_per_second, Some(0));
+        assert_eq!(bbr.loss_is_congestion, Some(false));
+    }
+
+    #[test]
+    fn short_rtt_policer_entry_uses_clean_peak_and_ignores_lossy_delivery() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(4);
+        telemetry.rtt = Duration::from_millis(5);
+        telemetry.queue_delay = Duration::from_millis(1);
+        telemetry.loss_ppm = 0;
+        telemetry.controller_bw_bytes_per_second = 14_400_000;
+        telemetry.delivery_rate_bytes_per_second = 13_150_000;
+        assert!(!filter.update(telemetry, 8 * 1024 * 1024).policer_limited());
+
+        // Gate20/22 report a model peak above the clean wire peak, followed
+        // by a roughly 7 MB/s lossy entry interval. The entry interval must
+        // retain the preceding clean evidence rather than becoming the cap.
+        telemetry.loss_ppm = 20_000;
+        telemetry.delivery_rate_bytes_per_second = 7_000_000;
+        let clean_peak_cap = 13_150_000;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.policer_limited());
+        assert_eq!(
+            filtered.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(clean_peak_cap),
+            "the recent clean peak should ceiling the optimistic controller model"
+        );
+
+        telemetry.loss_ppm = 0;
+        telemetry.controller_bw_bytes_per_second = 2 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 2 * 1024 * 1024;
+        let held = filter.update(telemetry, 8 * 1024 * 1024);
+        assert_eq!(
+            held.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(clean_peak_cap),
+            "later low delivery must not ratchet the fixed entry cap"
+        );
+
+        // A ramp sample at only 90% of the discounted model is still not
+        // credible clean capacity evidence and must not freeze the whole
+        // policer activation below the later steady payload rate.
+        let mut startup_filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        telemetry.loss_ppm = 0;
+        telemetry.controller_bw_bytes_per_second = 15_100_000;
+        let startup_model_cap = 15_100_000 * 950 / 1_000;
+        telemetry.delivery_rate_bytes_per_second = startup_model_cap * 90 / 100;
+        startup_filter.update(telemetry, 8 * 1024 * 1024);
+        telemetry.loss_ppm = 20_000;
+        telemetry.delivery_rate_bytes_per_second = 7_000_000;
+        let filtered = startup_filter.update(telemetry, 8 * 1024 * 1024);
+        assert_eq!(
+            filtered.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(startup_model_cap),
+            "clean evidence below 95% of the model cap must be ignored"
+        );
+    }
+
+    #[test]
+    fn short_rtt_policer_clean_peak_rolls_and_idle_or_reset_clears_it() {
+        fn short_sample() -> PathTelemetryV2 {
+            let mut telemetry = sample(1);
+            telemetry.min_rtt = Duration::from_millis(4);
+            telemetry.rtt = Duration::from_millis(5);
+            telemetry.queue_delay = Duration::from_millis(1);
+            telemetry.loss_ppm = 0;
+            telemetry.controller_bw_bytes_per_second = 15_200_000;
+            telemetry
+        }
+
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = short_sample();
+        // Six observations prove that the peak is over the most recent five,
+        // not the maximum seen over the entire activation.
+        for delivery in [
+            20_000_000, 10_000_000, 11_000_000, 12_000_000, 13_000_000, 14_000_000,
+        ] {
+            telemetry.delivery_rate_bytes_per_second = delivery;
+            filter.update(telemetry, 8 * 1024 * 1024);
+        }
+        telemetry.loss_ppm = 20_000;
+        telemetry.delivery_rate_bytes_per_second = 7_000_000;
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert_eq!(
+            filtered.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(14_000_000)
+        );
+
+        // A true idle tick clears the clean-capacity window immediately,
+        // independently of the classifier's two-tick inactive hold.
+        let mut idle_filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        telemetry = short_sample();
+        telemetry.delivery_rate_bytes_per_second = 12_000_000;
+        idle_filter.update(telemetry, 8 * 1024 * 1024);
+        telemetry.real_traffic_bytes_per_second = 0;
+        telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
+        idle_filter.update(telemetry, 8 * 1024 * 1024);
+        telemetry.real_traffic_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.tun_ingress_bytes_per_second = 20 * 1024 * 1024;
+        telemetry.packet_train_queue_bytes = 128 * 1024;
+        telemetry.loss_ppm = 20_000;
+        telemetry.controller_bw_bytes_per_second = 20_000_000;
+        assert_eq!(
+            idle_filter
+                .update(telemetry, 8 * 1024 * 1024)
+                .short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(20_000_000 * 950 / 1_000),
+            "idle must force the no-clean-evidence model fallback"
+        );
+
+        let mut reset_filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        telemetry = short_sample();
+        telemetry.delivery_rate_bytes_per_second = 12_000_000;
+        reset_filter.update(telemetry, 8 * 1024 * 1024);
+        reset_filter.reset();
+        telemetry.loss_ppm = 20_000;
+        telemetry.controller_bw_bytes_per_second = 20_000_000;
+        telemetry.delivery_rate_bytes_per_second = 7_000_000;
+        assert_eq!(
+            reset_filter
+                .update(telemetry, 8 * 1024 * 1024)
+                .short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(20_000_000 * 950 / 1_000),
+            "path/filter reset must discard the former clean peak"
+        );
+
+        let mut no_delivery = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        telemetry = short_sample();
+        telemetry.loss_ppm = 20_000;
+        telemetry.controller_bw_bytes_per_second = 10 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 0;
+        let fallback = no_delivery.update(telemetry, 8 * 1024 * 1024);
+        assert_eq!(
+            fallback.short_rtt_policer_pacing_cap_bytes_per_second,
+            Some(10 * 1024 * 1024 * 950 / 1_000),
+            "zero delivery retains the controller-margin fallback"
+        );
+    }
+
+    #[test]
+    fn short_rtt_policer_entry_rejects_home_loss_spikes_and_high_rtt_loss() {
+        let mut home = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(17);
+        telemetry.rtt = Duration::from_millis(19);
+        telemetry.queue_delay = Duration::from_millis(2);
+        for loss_ppm in [0, 4_415, 2_680, 1_486, 1_087, 0, 647, 2_761, 10_582] {
+            telemetry.loss_ppm = loss_ppm;
+            assert!(!home.update(telemetry, 8 * 1024 * 1024).policer_limited());
+        }
+
+        let mut high_rtt = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        telemetry.min_rtt = Duration::from_millis(8);
+        telemetry.rtt = Duration::from_millis(45);
+        telemetry.queue_delay = Duration::from_millis(37);
+        telemetry.loss_ppm = 80_000;
+        for _ in 0..4 {
+            assert!(
+                !high_rtt
+                    .update(telemetry, 8 * 1024 * 1024)
+                    .policer_limited()
+            );
+        }
+    }
+
+    #[test]
+    fn short_rtt_policer_entry_requires_both_filtered_rtts_at_most_ten_ms() {
+        let mut telemetry = sample(1);
+        telemetry.queue_delay = Duration::ZERO;
+        telemetry.loss_ppm = 80_000;
+        telemetry.controller_bw_bytes_per_second = 25 * 1024 * 1024;
+
+        telemetry.min_rtt = Duration::from_millis(10);
+        telemetry.rtt = Duration::from_millis(10);
+        let mut boundary = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        assert!(
+            boundary
+                .update(telemetry, 8 * 1024 * 1024)
+                .policer_limited()
+        );
+
+        telemetry.min_rtt = Duration::from_micros(10_001);
+        telemetry.rtt = Duration::from_micros(10_001);
+        let mut wifi = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        assert!(!wifi.update(telemetry, 8 * 1024 * 1024).policer_limited());
+    }
+
+    #[test]
+    fn short_rtt_congestion_candidate_uses_raw_one_percent_loss_boundary() {
+        let limits = HostLimitsV1::default();
+
+        let mut below_filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut below = sample(1);
+        below.min_rtt = Duration::from_millis(10);
+        below.rtt = Duration::from_millis(11);
+        below.queue_delay = Duration::from_millis(1);
+        below.loss_ppm = 9_999;
+        below.burst_loss_cells = 3;
+        let filtered = below_filter.update(below, 8 * 1024 * 1024);
+        assert_eq!(filtered.loss_ppm, 9_999);
+        let fec = NativePolicyV1
+            .propose(&filtered, &limits)
+            .fec
+            .expect("sub-boundary burst FEC candidate");
+        assert_eq!(fec.enabled, Some(true));
+        assert_eq!((fec.data_cells, fec.parity_cells), (Some(8), Some(1)));
+
+        let mut boundary_filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut boundary = below;
+        boundary.loss_ppm = 10_000;
+        boundary.burst_loss_cells = 0;
+        let filtered = boundary_filter.update(boundary, 8 * 1024 * 1024);
+        assert_eq!(filtered.loss_ppm, 10_000);
+        let fec = NativePolicyV1
+            .propose(&filtered, &limits)
+            .fec
+            .expect("raw-boundary FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+    }
+
+    #[test]
+    fn short_rtt_congestion_candidate_uses_retained_filtered_loss_boundary() {
+        let limits = HostLimitsV1::default();
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(10);
+        telemetry.rtt = Duration::from_millis(11);
+        telemetry.queue_delay = Duration::from_millis(1);
+        telemetry.loss_ppm = 11_000;
+        filter.update(telemetry, 8 * 1024 * 1024);
+
+        telemetry.loss_ppm = 9_999;
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert_eq!(filtered.raw.loss_ppm, 9_999);
+        assert!(filtered.loss_ppm >= 10_000);
+        let fec = NativePolicyV1
+            .propose(&filtered, &limits)
+            .fec
+            .expect("filtered-boundary FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+    }
+
+    #[test]
+    fn wan_loss_above_one_percent_retains_fec_protection() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(85);
+        telemetry.rtt = Duration::from_millis(90);
+        telemetry.queue_delay = Duration::from_millis(5);
+        telemetry.loss_ppm = 20_000;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        let fec = NativePolicyV1
+            .propose(&filtered, &HostLimitsV1::default())
+            .fec
+            .expect("WAN loss FEC candidate");
+        assert_eq!(fec.enabled, Some(true));
+        assert_eq!((fec.data_cells, fec.parity_cells), (Some(6), Some(2)));
+    }
+
+    #[test]
+    fn low_random_loss_keeps_fec_off_for_ordinary_policer_cpu_and_relay_paths() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(20);
+        telemetry.rtt = Duration::from_millis(50);
+        telemetry.queue_delay = Duration::from_millis(30);
+        telemetry.loss_ppm = 9_999;
+        telemetry.burst_loss_cells = 2;
+        telemetry.residual_loss_ppm = 1_000;
+        telemetry.remote_expired_stripes_delta = 1;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(!filtered.protection_emergency());
+        let fec = NativePolicyV1
+            .propose(&filtered, &HostLimitsV1::default())
+            .fec
+            .expect("ordinary low-random-loss FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+
+        // A short-RTT policer remains FEC-off after pacing turns the live
+        // sample clean; its payload cap already reserves physical wire
+        // overhead, and parity would consume that constrained payload budget.
+        let mut policer = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        telemetry.min_rtt = Duration::from_millis(4);
+        telemetry.rtt = Duration::from_millis(5);
+        telemetry.queue_delay = Duration::from_millis(1);
+        telemetry.controller_bw_bytes_per_second = 10 * 1024 * 1024;
+        telemetry.burst_loss_cells = 0;
+        telemetry.residual_loss_ppm = 0;
+        telemetry.remote_expired_stripes_delta = 0;
+        telemetry.loss_ppm = 20_000;
+        telemetry.delivery_rate_bytes_per_second = 8 * 1024 * 1024;
+        policer.update(telemetry, 8 * 1024 * 1024);
+        telemetry.loss_ppm = 0;
+        policer.update(telemetry, 8 * 1024 * 1024);
+        let filtered = policer.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.policer_limited());
+        assert!(filtered.loss_ppm < 10_000);
+        let fec = NativePolicyV1
+            .propose(&filtered, &HostLimitsV1::default())
+            .fec
+            .expect("policer FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+
+        telemetry.min_rtt = Duration::from_millis(20);
+        telemetry.rtt = Duration::from_millis(50);
+        telemetry.queue_delay = Duration::from_millis(30);
+        telemetry.loss_ppm = 9_999;
+        telemetry.cpu_utilization_per_mille = 950;
+        let decision = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1).observe(telemetry);
+        assert_eq!(decision.fec, None, "CPU host guardrail suppresses FEC");
+
+        telemetry.cpu_utilization_per_mille = 0;
+        telemetry.reliability = PathReliability::ReliableRelay;
+        let decision = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1).observe(telemetry);
+        assert_eq!(decision.fec, None, "reliable host guardrail suppresses FEC");
+    }
+
+    #[test]
+    fn policer_receiver_gap_evidence_does_not_amplify_the_constrained_wire() {
+        for (residual_loss_ppm, expired_stripes) in [(5_000, 0), (0, 1)] {
+            let start = Instant::now();
+            let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
+            let mut telemetry = sample(1);
+            telemetry.min_rtt = Duration::from_millis(4);
+            telemetry.rtt = Duration::from_millis(5);
+            telemetry.queue_delay = Duration::from_millis(1);
+            telemetry.loss_ppm = 20_000;
+            telemetry.controller_bw_bytes_per_second = 10 * 1024 * 1024;
+            telemetry.delivery_rate_bytes_per_second = 8 * 1024 * 1024;
+            let entered = tuner.observe_at(telemetry, start);
+            assert_eq!(entered.bbr.pacing_cap_bytes_per_second, 0);
+            assert_eq!(entered.fec, None);
+
+            // Receiver gaps produced by the original overshoot are not
+            // independent loss evidence: parity would consume the same fixed
+            // policer budget and perpetuate those gaps.
+            telemetry.loss_ppm = 0;
+            telemetry.residual_loss_ppm = residual_loss_ppm;
+            telemetry.remote_expired_stripes_delta = expired_stripes;
+            let mut decision = entered;
+            for offset in 1..=3 {
+                decision = tuner.observe_at(telemetry, start + Duration::from_secs(offset));
+            }
+            assert_eq!(decision.fec, None);
+            assert_eq!(decision.bbr.pacing_cap_bytes_per_second, 0);
+            assert!(!decision.bbr.loss_is_congestion);
+        }
+    }
+
+    #[test]
+    fn active_zero_loss_keeps_fec_off_even_with_receiver_gap_evidence() {
+        let start = Instant::now();
+        let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
+        let mut telemetry = sample(1);
+        telemetry.loss_ppm = 0;
+        telemetry.residual_loss_ppm = 1_000;
+        telemetry.remote_expired_stripes_delta = 1;
+
+        for offset in 0..=4 {
+            let decision = tuner.observe_at(telemetry, start + Duration::from_secs(offset));
+            assert_eq!(decision.reason, TuneReasonV2::HealthyLowLoss);
+            assert_eq!(decision.fec, None);
+        }
+    }
+
+    #[test]
+    fn congested_path_does_not_spend_its_wire_budget_on_parity() {
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(20);
+        telemetry.rtt = Duration::from_millis(50);
+        telemetry.queue_delay = Duration::from_millis(30);
+        telemetry.loss_ppm = 80_000;
+        telemetry.burst_loss_cells = 4;
+
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.congested());
+        let fec = NativePolicyV1
+            .propose(&filtered, &HostLimitsV1::default())
+            .fec
+            .expect("congested FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+    }
+
+    #[test]
+    fn congestion_suppresses_fec_even_at_the_protection_emergency_threshold() {
+        let mut filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(20);
+        telemetry.rtt = Duration::from_millis(50);
+        telemetry.queue_delay = Duration::from_millis(30);
+        telemetry.loss_ppm = 10_000;
+
+        let filtered = filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(filtered.protection_emergency());
+        let fec = NativePolicyV1
+            .propose(&filtered, &HostLimitsV1::default())
+            .fec
+            .expect("one-percent congested FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
+
+        let mut burst_filter = TelemetryFilterV1::new(AutoTuneBoundsV2::default());
+        telemetry.loss_ppm = 3_000;
+        telemetry.burst_loss_cells = 3;
+        let burst = burst_filter.update(telemetry, 8 * 1024 * 1024);
+        assert!(burst.protection_emergency());
+        let fec = NativePolicyV1
+            .propose(&burst, &HostLimitsV1::default())
+            .fec
+            .expect("three-cell-burst congested FEC-off candidate");
+        assert_eq!(fec.enabled, Some(false));
     }
 
     #[test]
@@ -1697,7 +2479,7 @@ pub(crate) mod tests_fixture {
             decision.fec,
             Some(FecGeometryV2 {
                 data_cells: 4,
-                parity_cells: 2,
+                parity_cells: 4,
             })
         );
         assert!((16 * 1024 * 1024..=32 * 1024 * 1024).contains(&decision.repair_cache_bytes));
@@ -1775,7 +2557,7 @@ pub(crate) mod tests_fixture {
         let mut telemetry = sample(1);
         telemetry.min_rtt = Duration::from_millis(18);
         telemetry.rtt = Duration::from_millis(20);
-        telemetry.loss_ppm = 5_000;
+        telemetry.loss_ppm = 10_000;
         assert_eq!(
             tuner.observe_at(telemetry, start).fec,
             Some(FecGeometryV2 {
@@ -1790,12 +2572,14 @@ pub(crate) mod tests_fixture {
         let start = Instant::now();
         let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
         let mut telemetry = sample(1);
-        telemetry.min_rtt = Duration::from_millis(5);
-        telemetry.rtt = Duration::from_millis(6);
-        telemetry.loss_ppm = 250_000;
+        telemetry.min_rtt = Duration::from_millis(8);
+        telemetry.rtt = Duration::from_millis(9);
+        telemetry.loss_ppm = 9_999;
+        telemetry.controller_bw_bytes_per_second = 16 * 1024 * 1024;
         telemetry.packets_per_second = 8;
         telemetry.real_traffic_bytes_per_second = 0;
         telemetry.tun_ingress_bytes_per_second = 0;
+        telemetry.packet_train_queue_bytes = 0;
 
         for offset in 0..5 {
             let decision = tuner.observe_at(telemetry, start + Duration::from_secs(offset));
@@ -1823,7 +2607,7 @@ pub(crate) mod tests_fixture {
     }
 
     #[test]
-    fn unqueued_shallow_policer_never_adds_loss_amplifying_parity() {
+    fn unqueued_shallow_policer_keeps_fec_and_external_cap_off() {
         let start = Instant::now();
         let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
         let mut telemetry = sample(1);
@@ -1831,11 +2615,14 @@ pub(crate) mod tests_fixture {
         telemetry.rtt = Duration::from_millis(6);
         telemetry.queue_delay = Duration::from_millis(1);
         telemetry.loss_ppm = 200_000;
+        telemetry.controller_bw_bytes_per_second = 10 * 1024 * 1024;
+        telemetry.delivery_rate_bytes_per_second = 8 * 1024 * 1024;
 
         for offset in 0..5 {
             let decision = tuner.observe_at(telemetry, start + Duration::from_secs(offset));
             assert_eq!(decision.reason, TuneReasonV2::Congested);
             assert_eq!(decision.fec, None);
+            assert_eq!(decision.bbr.pacing_cap_bytes_per_second, 0);
         }
     }
 
@@ -1890,14 +2677,14 @@ pub(crate) mod tests_fixture {
     }
 
     #[test]
-    fn proven_repair_halves_wasteful_severe_loss_redundancy() {
+    fn five_percent_high_rtt_loss_keeps_dense_fec_despite_repair_feedback() {
         let start = Instant::now();
         let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
         let mut telemetry = sample(1);
         telemetry.min_rtt = Duration::from_millis(85);
         telemetry.rtt = Duration::from_millis(90);
         telemetry.queue_delay = Duration::from_millis(5);
-        telemetry.loss_ppm = 80_000;
+        telemetry.loss_ppm = 50_000;
         telemetry.burst_loss_cells = 4;
         assert_eq!(
             tuner.observe_at(telemetry, start).fec,
@@ -1919,31 +2706,53 @@ pub(crate) mod tests_fixture {
         assert_eq!(
             decision.fec,
             Some(FecGeometryV2 {
-                data_cells: 6,
-                parity_cells: 1
-            })
+                data_cells: 4,
+                parity_cells: 2
+            }),
+            "severe correlated loss must not thin protection from survivor-biased Repair feedback"
         );
         assert!(decision.repair_cache_bytes > 0);
     }
 
     #[test]
-    fn proven_fast_repair_retires_wasteful_short_rtt_severe_fec() {
-        let start = Instant::now();
+    fn short_feedback_severe_loss_keeps_bounded_eight_plus_one_fec() {
         let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
         let mut telemetry = sample(1);
-        telemetry.min_rtt = Duration::from_millis(5);
-        telemetry.rtt = Duration::from_millis(12);
-        telemetry.queue_delay = Duration::from_millis(7);
-        telemetry.loss_ppm = 80_000;
+        telemetry.min_rtt = Duration::from_millis(45);
+        telemetry.rtt = Duration::from_millis(50);
+        telemetry.queue_delay = Duration::from_millis(5);
+        telemetry.loss_ppm = 100_000;
         telemetry.burst_loss_cells = 4;
+
+        let decision = tuner.observe(telemetry);
+        assert_eq!(decision.reason, TuneReasonV2::BurstLoss);
         assert_eq!(
-            tuner.observe_at(telemetry, start).fec,
+            decision.fec,
             Some(FecGeometryV2 {
                 data_cells: 8,
                 parity_cells: 1,
             })
         );
+    }
 
+    #[test]
+    fn latched_short_rtt_policer_keeps_fec_off_across_a_live_deep_queue() {
+        let start = Instant::now();
+        let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
+        let mut telemetry = sample(1);
+        telemetry.min_rtt = Duration::from_millis(5);
+        telemetry.rtt = Duration::from_millis(6);
+        telemetry.queue_delay = Duration::from_millis(1);
+        telemetry.loss_ppm = 80_000;
+        telemetry.burst_loss_cells = 4;
+        telemetry.controller_bw_bytes_per_second = 25 * 1024 * 1024;
+        assert_eq!(tuner.observe_at(telemetry, start).fec, None);
+
+        // The classifier remains activation-latched across a later live deep
+        // queue; its wire-overhead reservation and FEC suppression are
+        // independent of Repair's survivor-biased evidence.
+        telemetry.rtt = Duration::from_millis(12);
+        telemetry.queue_delay = Duration::from_millis(7);
         telemetry.wasted_parity_per_mille = 1_000;
         telemetry.fec_recovery_per_mille = 0;
         telemetry.repair_hit_per_mille = 1_000;
@@ -1955,70 +2764,6 @@ pub(crate) mod tests_fixture {
         }
         assert_eq!(decision.fec, None);
         assert_eq!(decision.reason, TuneReasonV2::Congested);
-    }
-
-    #[test]
-    fn light_loss_keeps_fec_until_repair_is_proven_fast_and_effective() {
-        let start = Instant::now();
-        let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
-        let mut telemetry = sample(1);
-        telemetry.min_rtt = Duration::from_millis(18);
-        telemetry.rtt = Duration::from_millis(20);
-        telemetry.loss_ppm = 5_000;
-        telemetry.burst_loss_cells = 4;
-        telemetry.wasted_parity_per_mille = 950;
-        telemetry.fec_recovery_per_mille = 0;
-
-        for offset in 0..=3 {
-            tuner.observe_at(telemetry, start + Duration::from_secs(offset));
-        }
-        assert_eq!(
-            tuner.current().fec,
-            Some(FecGeometryV2 {
-                data_cells: 16,
-                parity_cells: 1
-            }),
-            "unused parity should become sparse while Repair is still unproven"
-        );
-
-        telemetry.repair_hit_per_mille = 1_000;
-        telemetry.repair_response_latency = Duration::from_millis(150);
-        for offset in 4..=8 {
-            telemetry.repair_completed_requests += 1;
-            tuner.observe_at(telemetry, start + Duration::from_secs(offset));
-        }
-        assert_eq!(
-            tuner.current().fec,
-            None,
-            "three stable sub-RTO Repair observations should retire wasteful light-loss FEC"
-        );
-    }
-
-    #[test]
-    fn slow_or_low_hit_repair_does_not_displace_light_loss_fec() {
-        let start = Instant::now();
-        for (hit, latency) in [
-            (500, Duration::from_millis(20)),
-            (1_000, Duration::from_secs(1)),
-        ] {
-            let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
-            let mut telemetry = sample(1);
-            telemetry.loss_ppm = 5_000;
-            telemetry.wasted_parity_per_mille = 950;
-            telemetry.repair_hit_per_mille = hit;
-            telemetry.repair_response_latency = latency;
-            for offset in 0..=7 {
-                telemetry.repair_completed_requests = offset;
-                tuner.observe_at(telemetry, start + Duration::from_secs(offset));
-            }
-            assert_eq!(
-                tuner.current().fec,
-                Some(FecGeometryV2 {
-                    data_cells: 16,
-                    parity_cells: 1
-                })
-            );
-        }
     }
 
     #[test]
@@ -2101,7 +2846,7 @@ pub(crate) mod tests_fixture {
     }
 
     #[test]
-    fn congestion_loss_keeps_one_sparse_parity_cell_to_avoid_train_loss_amplification() {
+    fn congestion_loss_disables_parity_to_avoid_wire_load_amplification() {
         let start = Instant::now();
         let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
         let mut telemetry = sample(1);
@@ -2114,18 +2859,12 @@ pub(crate) mod tests_fixture {
             decision = tuner.observe_at(telemetry, start + Duration::from_secs(seconds));
         }
         assert_eq!(decision.reason, TuneReasonV2::Congested);
-        assert_eq!(
-            decision.fec,
-            Some(FecGeometryV2 {
-                data_cells: 8,
-                parity_cells: 1,
-            })
-        );
-        assert!((4 * 1024 * 1024..=32 * 1024 * 1024).contains(&decision.repair_cache_bytes));
+        assert_eq!(decision.fec, None);
+        assert_eq!(decision.repair_cache_bytes, 0);
     }
 
     #[test]
-    fn severe_fec_is_reduced_immediately_when_live_evidence_proves_congestion() {
+    fn severe_fec_is_disabled_immediately_when_live_evidence_proves_congestion() {
         let start = Instant::now();
         let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
         let mut loss = sample(1);
@@ -2140,14 +2879,8 @@ pub(crate) mod tests_fixture {
         congested.min_rtt = Duration::from_millis(20);
         let disabled = tuner.observe_at(congested, start + Duration::from_secs(1));
         assert_eq!(disabled.reason, TuneReasonV2::Congested);
-        assert_eq!(
-            disabled.fec,
-            Some(FecGeometryV2 {
-                data_cells: 8,
-                parity_cells: 1,
-            })
-        );
-        assert!((4 * 1024 * 1024..=32 * 1024 * 1024).contains(&disabled.repair_cache_bytes));
+        assert_eq!(disabled.fec, None);
+        assert_eq!(disabled.repair_cache_bytes, 0);
     }
 
     #[test]
@@ -2159,7 +2892,47 @@ pub(crate) mod tests_fixture {
         telemetry.latency_queue_bytes = 0;
         let decision = tuner.observe(telemetry);
         assert_eq!(decision.reason, TuneReasonV2::Congested);
-        assert_eq!(decision.bulk_quantum_cells, 4);
+        assert_eq!(decision.bulk_quantum_cells, 8);
+    }
+
+    #[test]
+    fn native_bulk_quantum_requires_backlog_and_latency_queue_still_wins() {
+        let mut backlog = sample(1);
+        backlog.packet_train_queue_bytes = BULK_QUANTUM_BACKLOG_BYTES;
+        let decision = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1).observe(backlog);
+        assert_eq!(decision.bulk_quantum_cells, 8);
+
+        // TUN/real traffic can lead the packet-train queue snapshot and does
+        // not alone justify expanding the first userspace submission.
+        let mut active = sample(1);
+        active.packet_train_queue_bytes = 0;
+        active.delivery_rate_bytes_per_second = 100 * 1024 * 1024;
+        active.real_traffic_bytes_per_second = 100 * 1024 * 1024;
+        active.tun_ingress_bytes_per_second = 100 * 1024 * 1024;
+        active.cpu_utilization_per_mille = 1_000;
+        let decision = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1).observe(active);
+        assert_eq!(decision.bulk_quantum_cells, 2);
+
+        // A rate estimate and CPU pressure without actual outgoing activity
+        // do not justify the larger userspace submission.
+        let mut rate_only = active;
+        rate_only.real_traffic_bytes_per_second = 0;
+        rate_only.tun_ingress_bytes_per_second = 0;
+        let decision = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1).observe(rate_only);
+        assert_eq!(decision.bulk_quantum_cells, 2);
+
+        let mut idle = sample(1);
+        idle.packet_train_queue_bytes = 0;
+        idle.delivery_rate_bytes_per_second = 0;
+        idle.real_traffic_bytes_per_second = 0;
+        idle.tun_ingress_bytes_per_second = 0;
+        let decision = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1).observe(idle);
+        assert_eq!(decision.bulk_quantum_cells, 2);
+
+        let mut latency_queued = backlog;
+        latency_queued.latency_queue_bytes = 1;
+        let decision = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1).observe(latency_queued);
+        assert_eq!(decision.bulk_quantum_cells, 1);
     }
 
     #[test]
@@ -2231,6 +3004,18 @@ pub(crate) mod tests_fixture {
     }
 
     #[test]
+    fn cold_start_and_admission_floor_are_512_kib() {
+        let bounds = AutoTuneBoundsV2::default();
+        assert_eq!(bounds.minimum_socket_buffer_bytes, 512 * 1024);
+        assert_eq!(INITIAL_SEND_BUFFER_BYTES_V2, 512 * 1024);
+        assert_eq!(AutoTunerV2::new(bounds, 1).current().bulk_quantum_cells, 1);
+        assert_eq!(
+            AutoTunerV2::new(bounds, 1).current().send_buffer_bytes,
+            512 * 1024
+        );
+    }
+
+    #[test]
     fn queue_inflated_rtt_does_not_inflate_quic_admission_buffer() {
         let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
         let mut telemetry = sample(1);
@@ -2245,7 +3030,7 @@ pub(crate) mod tests_fixture {
 
         let decision = tuner.observe(telemetry);
         assert_eq!(decision.reason, TuneReasonV2::Congested);
-        assert_eq!(decision.send_buffer_bytes, 256 * 1024);
+        assert_eq!(decision.send_buffer_bytes, 512 * 1024);
 
         // Raising only the queue-inflated RTT must not feed back into the
         // native DATAGRAM admission target.

@@ -14,8 +14,8 @@
   },
   "preset_switches": 1,
   "exploring_samples": 1,
-  "mean_utility": 3.8159443097524504,
-  "mean_predicted_advantage": -0.4769930387190563,
+  "mean_utility": 3.81584159902857320e0,
+  "mean_predicted_advantage": -0.47698019987857165,
   "final_action": {
     "preset": "long-fat",
     "up_gain_milli": 1250,
@@ -31,5 +31,5 @@
     "cover_profile": "live-broadcast",
     "cover_overhead_per_mille": 0
   },
-  "trace_digest": "4b91bf7fff2ddce119299bbe14808463717d1594fa5cb93ea1119758b916d570"
+  "trace_digest": "982184534e4fcf3980f6d1ad409dc4cd8bdecf676e9773883c5f35a8631bb266"
 }

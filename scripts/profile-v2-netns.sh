@@ -33,6 +33,14 @@ A_TO_B_RATE_MBIT=${IRONET_V2_PROFILE_A_TO_B_RATE_MBIT:-0}
 B_TO_A_RATE_MBIT=${IRONET_V2_PROFILE_B_TO_A_RATE_MBIT:-0}
 A_TO_B_QUEUE_PACKETS=${IRONET_V2_PROFILE_A_TO_B_QUEUE_PACKETS:-1000}
 B_TO_A_QUEUE_PACKETS=${IRONET_V2_PROFILE_B_TO_A_QUEUE_PACKETS:-1000}
+# netem's `limit` counts every skb retained by the qdisc, including packets
+# held to emulate propagation delay and its random jitter. Reserve through the
+# upper four-sigma tail of netem's normal delay distribution so declared queue
+# packets remain available outside ordinary jitter variation. Underlay GSO/TSO
+# is disabled below and the disposable veth MTU is 1500, so one limit slot
+# models one wire packet.
+NETEM_WIRE_PACKET_BYTES=1500
+NETEM_NORMAL_JITTER_TAIL_SIGMAS=4
 PROFILE_DIRECTION=${IRONET_V2_PROFILE_DIRECTION:-forward}
 SCENARIO_NAME=${IRONET_V2_PROFILE_SCENARIO_NAME:-custom}
 CONCURRENT_PING_INTERVAL_MS=${IRONET_V2_PROFILE_CONCURRENT_PING_INTERVAL_MS:-0}
@@ -65,14 +73,20 @@ PERF_ENABLED=${IRONET_V2_PROFILE_PERF:-1}
 # increasing and smaller than IRONET_V2_PROFILE_SECONDS. Keys are
 # a_delay a_jitter a_delay_corr a_loss a_loss_corr a_rate a_queue and the b_*
 # equivalents, with the same units and ranges as the static variables. Every
-# step re-applies the full netem state for the sides it touches, captures
-# qdisc counters and peer status before/after, and is logged to timeline.tsv.
+# step re-applies the full netem state for every direction, resets that
+# stage's deterministic PRNG seeds, brackets it with qdisc counters, captures
+# peer status after the mutation, and is logged to timeline.tsv.
 TIMELINE=${IRONET_V2_PROFILE_TIMELINE:-}
 SECOND_PATH=${IRONET_V2_PROFILE_SECOND_PATH:-0}
 SECOND_PATH_DELAY_MS=${IRONET_V2_PROFILE_SECOND_PATH_DELAY_MS:-30}
 SECOND_PATH_LOSS_PERCENT=${IRONET_V2_PROFILE_SECOND_PATH_LOSS_PERCENT:-0}
 SECOND_PATH_RATE_MBIT=${IRONET_V2_PROFILE_SECOND_PATH_RATE_MBIT:-0}
 SECOND_PATH_QUEUE_PACKETS=${IRONET_V2_PROFILE_SECOND_PATH_QUEUE_PACKETS:-1000}
+# A versioned base keeps netem's random loss/jitter repeatable across runs.
+# Direction and timeline stage are mixed in below so the two wire directions
+# and secondary path do not share one random stream.
+NETEM_SEED_BASE=${IRONET_V2_PROFILE_NETEM_SEED:-20260822}
+NETEM_SEED_DERIVATION_VERSION=ironet-netem-v1
 
 expand_cpu_list() {
   local list=$1 part first last cpu
@@ -117,6 +131,9 @@ PROFILE_CPUSET=${IRONET_V2_PROFILE_CPUSET:-$DEFAULT_CPUSET}
   || { echo "IRONET_V2_PROFILE_SECOND_PATH must be 0 or 1" >&2; exit 1; }
 [[ $QUEUE_DRAIN_TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] \
   || { echo "invalid class queue drain timeout" >&2; exit 1; }
+[[ $NETEM_SEED_BASE =~ ^[1-9][0-9]*$ ]] \
+  && awk -v seed="$NETEM_SEED_BASE" 'BEGIN { exit !(seed <= 4294967295) }' \
+  || { echo "IRONET_V2_PROFILE_NETEM_SEED must be an integer between 1 and 4294967295" >&2; exit 1; }
 [[ $PREFLIGHT_ONLY == 0 || $STARTUP_CANARY_ONLY == 0 ]] \
   || { echo "preflight-only and startup-canary-only are mutually exclusive" >&2; exit 1; }
 [[ $PERF_ENABLED == 0 || $PERF_ENABLED == 1 ]] \
@@ -183,6 +200,48 @@ validate_netem_queue() {
   [[ $2 =~ ^[1-9][0-9]*$ ]] \
     || { echo "netem queue limit must be a positive packet count: $2" >&2; return 1; }
 }
+
+# Upper normal-delay envelope used to reserve netem slots. Four standard
+# deviations cover ordinary jitter without granting unbounded capacity to the
+# theoretical normal tail.
+netem_propagation_envelope_ms() {
+  awk -v delay_ms="$1" -v jitter_ms="$2" \
+    -v tail_sigmas="$NETEM_NORMAL_JITTER_TAIL_SIGMAS" \
+    'BEGIN { printf "%.9g\n", delay_ms + tail_sigmas * jitter_ms }'
+}
+
+# Packet slots consumed by the one-way propagation envelope BDP. A rate of
+# zero means the harness has not declared a bottleneck capacity, so there is
+# no finite modeled BDP to add. Round up: even a partial packet occupies one
+# netem queue slot.
+netem_propagation_packets() {
+  awk -v delay_ms="$1" -v jitter_ms="$2" -v rate_mbit="$3" \
+    -v tail_sigmas="$NETEM_NORMAL_JITTER_TAIL_SIGMAS" \
+    -v packet_bytes="$NETEM_WIRE_PACKET_BYTES" '
+    BEGIN {
+      envelope_ms = delay_ms + tail_sigmas * jitter_ms
+      if (envelope_ms == 0 || rate_mbit == 0) {
+        print 0
+        exit
+      }
+      packets = rate_mbit * 1000000 * envelope_ms / 1000 / 8 / packet_bytes
+      whole = int(packets)
+      print whole + (packets > whole ? 1 : 0)
+    }
+  '
+}
+
+netem_state_record() {
+  local delay_ms=$1 jitter_ms=$2 delay_corr=$3 loss=$4 loss_corr=$5 rate_mbit=$6
+  local queue_packets=$7 propagation_envelope_ms propagation_packets limit_packets
+  propagation_envelope_ms=$(netem_propagation_envelope_ms "$delay_ms" "$jitter_ms")
+  propagation_packets=$(netem_propagation_packets "$delay_ms" "$jitter_ms" "$rate_mbit")
+  limit_packets=$((queue_packets + propagation_packets))
+  printf 'delay=%s,jitter=%s,delay_corr=%s,loss=%s,loss_corr=%s,rate=%s,queue=%s,normal_jitter_tail_sigmas=%s,propagation_envelope_ms=%s,propagation_packets=%s,limit_packets=%s' \
+    "$delay_ms" "$jitter_ms" "$delay_corr" "$loss" "$loss_corr" "$rate_mbit" \
+    "$queue_packets" "$NETEM_NORMAL_JITTER_TAIL_SIGMAS" "$propagation_envelope_ms" \
+    "$propagation_packets" "$limit_packets"
+}
 # Validate one timeline/static key. Keys use the short catalog names.
 validate_netem_key() {
   local key=$1 value=$2
@@ -217,11 +276,27 @@ validate_netem_number second_delay "$SECOND_PATH_DELAY_MS"
 validate_netem_loss second_loss "$SECOND_PATH_LOSS_PERCENT"
 validate_netem_number second_rate "$SECOND_PATH_RATE_MBIT"
 validate_netem_queue second_queue "$SECOND_PATH_QUEUE_PACKETS"
+A_TO_B_PROPAGATION_ENVELOPE_MS=$(netem_propagation_envelope_ms \
+  "$A_TO_B_DELAY_MS" "$A_TO_B_JITTER_MS")
+B_TO_A_PROPAGATION_ENVELOPE_MS=$(netem_propagation_envelope_ms \
+  "$B_TO_A_DELAY_MS" "$B_TO_A_JITTER_MS")
+SECOND_PATH_PROPAGATION_ENVELOPE_MS=$(netem_propagation_envelope_ms \
+  "$SECOND_PATH_DELAY_MS" 0)
+A_TO_B_PROPAGATION_PACKETS=$(netem_propagation_packets \
+  "$A_TO_B_DELAY_MS" "$A_TO_B_JITTER_MS" "$A_TO_B_RATE_MBIT")
+B_TO_A_PROPAGATION_PACKETS=$(netem_propagation_packets \
+  "$B_TO_A_DELAY_MS" "$B_TO_A_JITTER_MS" "$B_TO_A_RATE_MBIT")
+SECOND_PATH_PROPAGATION_PACKETS=$(netem_propagation_packets \
+  "$SECOND_PATH_DELAY_MS" 0 "$SECOND_PATH_RATE_MBIT")
+A_TO_B_NETEM_LIMIT_PACKETS=$((A_TO_B_QUEUE_PACKETS + A_TO_B_PROPAGATION_PACKETS))
+B_TO_A_NETEM_LIMIT_PACKETS=$((B_TO_A_QUEUE_PACKETS + B_TO_A_PROPAGATION_PACKETS))
+SECOND_PATH_NETEM_LIMIT_PACKETS=$((SECOND_PATH_QUEUE_PACKETS + SECOND_PATH_PROPAGATION_PACKETS))
 
 # Parse and validate the dynamic timeline up front so a malformed step can
 # never abort a run after the namespaces and daemons exist.
 TIMELINE_OFFSETS=()
 TIMELINE_CHANGES=()
+TIMELINE_HAS_PATH_ACTION=0
 if [[ -n $TIMELINE ]]; then
   [[ $DURATION =~ ^[1-9][0-9]*$ ]] || { echo "invalid profile duration" >&2; exit 1; }
   previous_offset=0
@@ -243,6 +318,7 @@ if [[ -n $TIMELINE ]]; then
       [[ $change == *=* ]] || { echo "timeline change needs key=value: $change" >&2; exit 1; }
       validate_netem_key "${change%%=*}" "${change#*=}" || exit 1
       if [[ ${change%%=*} == primary || ${change%%=*} == secondary ]]; then
+        TIMELINE_HAS_PATH_ACTION=1
         [[ $SECOND_PATH == 1 ]] \
           || { echo "path timeline actions require IRONET_V2_PROFILE_SECOND_PATH=1" >&2; exit 1; }
       fi
@@ -290,12 +366,20 @@ printf '%s  %s\n' "$BINARY_SHA256" "$(realpath "$BIN")" >"$OUT/binary.sha256"
 printf '%s  %s\n' "$CLI_SHA256" "$(realpath "$CLI")" >>"$OUT/binary.sha256"
 printf 'cpuset=%s\nnice=%s\nperf_frequency_hz=%s\n' \
   "$PROFILE_CPUSET" "$PROFILE_NICE" "$PERF_FREQUENCY" >"$OUT/resource-isolation.txt"
-printf 'scenario=%s\ndirection=%s\n' "$SCENARIO_NAME" "$PROFILE_DIRECTION" \
+printf 'scenario=%s\ndirection=%s\nrate_model=netem_serializing_shallow_shaper\n' \
+  "$SCENARIO_NAME" "$PROFILE_DIRECTION" \
   >"$OUT/scenario.txt"
-printf '{"enabled":%s,"delay_ms":%s,"loss_percent":%s,"rate_mbit":%s,"queue_packets":%s}\n' \
+printf '{"derivation_version":"%s","base_seed":%s}\n' \
+  "$NETEM_SEED_DERIVATION_VERSION" "$NETEM_SEED_BASE" >"$OUT/netem-seed-provenance.json"
+printf 'stage\tdirection\tnamespace\tdevice\tseed\tmode\tqueue_packets\tdelay_ms\tjitter_ms\tnormal_jitter_tail_sigmas\tpropagation_envelope_ms\tpropagation_packets\tlimit_packets\n' \
+  >"$OUT/netem-seeds.tsv"
+printf '{"enabled":%s,"delay_ms":%s,"jitter_ms":0,"loss_percent":%s,"rate_mbit":%s,"rate_model":"netem_serializing_shallow_shaper","queue_packets":%s,"queue_packets_semantics":"excess_beyond_normal_delay_tail_envelope","normal_jitter_tail_sigmas":%s,"propagation_envelope_ms":%s,"propagation_packets":%s,"limit_packets":%s,"wire_packet_bytes":%s}\n' \
   "$( [[ $SECOND_PATH == 1 ]] && echo true || echo false )" \
   "$SECOND_PATH_DELAY_MS" "$SECOND_PATH_LOSS_PERCENT" "$SECOND_PATH_RATE_MBIT" \
-  "$SECOND_PATH_QUEUE_PACKETS" >"$OUT/second-path.json"
+  "$SECOND_PATH_QUEUE_PACKETS" "$NETEM_NORMAL_JITTER_TAIL_SIGMAS" \
+  "$SECOND_PATH_PROPAGATION_ENVELOPE_MS" "$SECOND_PATH_PROPAGATION_PACKETS" \
+  "$SECOND_PATH_NETEM_LIMIT_PACKETS" "$NETEM_WIRE_PACKET_BYTES" \
+  >"$OUT/second-path.json"
 if [[ -n $AUTOTUNE_FORCE ]]; then
   printf '%s\n' "$AUTOTUNE_FORCE" >"$OUT/autotune-force.json"
 fi
@@ -315,6 +399,8 @@ A_LAUNCH=
 B_LAUNCH=
 PING_PID=
 UNDERLAY_PING_PID=
+UNDERLAY_TIMELINE_PID=
+UNDERLAY_TIMELINE_RAN=0
 FAIRNESS_SERVER=
 COVER_SERVER=
 GUARD_BEFORE="$OUT/management-plane.before"
@@ -389,7 +475,7 @@ stop_profiled() {
 stop_profiled_pair() {
   # Signal both endpoints before waiting for either one. A graceful close from
   # one side otherwise makes its peer report a dataplane failure at shutdown.
-  local a_children= b_children=
+  local a_children= b_children= status=0
   # Never substitute PID 0 here: `pgrep -P 0` selects host init/kernel
   # processes and a following privileged kill would hit the management plane.
   if [[ -n ${A_PID:-} ]] && profile_pid_is_safe "$A_PID"; then
@@ -411,29 +497,47 @@ stop_profiled_pair() {
     # two sequential sudo invocations.
     sudo kill -INT -- $a_children $b_children 2>/dev/null || true
   fi
-  stop_profiled "$A_PID" "$A_LAUNCH"
-  stop_profiled "$B_PID" "$B_LAUNCH"
+  stop_profiled "$A_PID" "$A_LAUNCH" || status=1
+  stop_profiled "$B_PID" "$B_LAUNCH" || status=1
+  return "$status"
 }
 
 cleanup() {
+  local status=0 restore_errexit=0 netns_list=
+  [[ $- == *e* ]] && restore_errexit=1
   set +e
   [[ -z ${TIMELINE_PID:-} ]] || kill "$TIMELINE_PID" 2>/dev/null || true
+  [[ -z ${UNDERLAY_TIMELINE_PID:-} ]] || kill "$UNDERLAY_TIMELINE_PID" 2>/dev/null || true
   [[ -z ${PING_PID:-} ]] || sudo kill "$PING_PID" 2>/dev/null || true
   [[ -z ${UNDERLAY_PING_PID:-} ]] || sudo kill "$UNDERLAY_PING_PID" 2>/dev/null || true
   [[ -z ${FAIRNESS_SERVER:-} ]] || kill "$FAIRNESS_SERVER" 2>/dev/null || true
   [[ -z ${COVER_SERVER:-} ]] || kill "$COVER_SERVER" 2>/dev/null || true
-  stop_profiled_pair
-  sudo ip netns del "$NSA" 2>/dev/null
-  sudo ip netns del "$NSB" 2>/dev/null
-  [[ -z ${A_SOCKET:-} || ! -e ${A_SOCKET:-} ]] || sudo unlink "$A_SOCKET" 2>/dev/null || true
-  [[ -z ${B_SOCKET:-} || ! -e ${B_SOCKET:-} ]] || sudo unlink "$B_SOCKET" 2>/dev/null || true
+  stop_profiled_pair || status=1
+  netns_list=$(sudo ip netns list 2>/dev/null) || status=1
+  if awk '{print $1}' <<<"$netns_list" | grep -Fqx -- "$NSA"; then
+    sudo ip netns del "$NSA" 2>/dev/null || status=1
+  fi
+  if awk '{print $1}' <<<"$netns_list" | grep -Fqx -- "$NSB"; then
+    sudo ip netns del "$NSB" 2>/dev/null || status=1
+  fi
+  [[ -z ${A_SOCKET:-} || ! -e ${A_SOCKET:-} ]] \
+    || sudo unlink "$A_SOCKET" 2>/dev/null || status=1
+  [[ -z ${B_SOCKET:-} || ! -e ${B_SOCKET:-} ]] \
+    || sudo unlink "$B_SOCKET" 2>/dev/null || status=1
+  ((restore_errexit == 0)) || set -e
+  return "$status"
 }
 
 on_exit() {
-  local status=$?
+  local status=$? cleanup_status=0
   trap - EXIT INT TERM HUP
-  cleanup
-  verify_management_plane || status=97
+  cleanup || cleanup_status=$?
+  if ((status == 0 && cleanup_status != 0)); then
+    status=96
+  fi
+  if ! verify_management_plane; then
+    ((status != 0)) || status=97
+  fi
   exit "$status"
 }
 trap on_exit EXIT
@@ -491,10 +595,34 @@ if [[ $SECOND_PATH == 1 ]]; then
   sudo ip netns exec "$NSB" "$ETHTOOL" -k "$LINK2-b" >"$OUT/b-underlay2-features.txt"
 fi
 
+netem_direction() {
+  local namespace=$1 device=$2
+  case "$namespace:$device" in
+    "$NSA:$LINK-a") printf '%s\n' a-to-b ;;
+    "$NSB:$LINK-b") printf '%s\n' b-to-a ;;
+    "$NSA:$LINK2-a") printf '%s\n' secondary-a-to-b ;;
+    "$NSB:$LINK2-b") printf '%s\n' secondary-b-to-a ;;
+    *) echo "unknown profile netem direction: $namespace:$device" >&2; return 1 ;;
+  esac
+}
+
+# Keep a stage's random sequence independent of process IDs/output paths.
+# Underlay TCP and overlay runs intentionally receive the same direction/stage
+# seed. This aligns their PRNG starting state; differing packetization means it
+# does not claim identical packet-level loss or delay outcomes.
+netem_seed() {
+  local direction=$1 stage=$2 digest
+  digest=$(printf '%s\0%s\0%s\0%s\n' \
+    "$NETEM_SEED_DERIVATION_VERSION" "$NETEM_SEED_BASE" "$direction" "$stage" \
+    | "$SHA256SUM" | awk '{print substr($1, 1, 8)}')
+  printf '%u\n' "$(( (16#$digest % 4294967294) + 1 ))"
+}
+
 apply_netem() {
   local namespace=$1 device=$2 delay_ms=$3 jitter_ms=$4 delay_correlation=$5
   local loss_percent=$6 loss_correlation=$7 rate_mbit=$8 queue_packets=$9
-  local mode=${10:-initial}
+  local mode=${10:-initial} stage=${11:-bootstrap-0}
+  local direction seed qdisc propagation_envelope_ms propagation_packets limit_packets
   # The initial static scenario leaves a clean veth when nothing is requested.
   # A timeline step must always replace the root qdisc so that "back to
   # unimpaired" actually removes the previous delay/loss/rate; a netem with
@@ -508,6 +636,8 @@ apply_netem() {
   [[ $device == "$LINK-a" || $device == "$LINK-b" \
     || $device == "$LINK2-a" || $device == "$LINK2-b" ]] \
     || { echo "refusing netem on a non-profile interface" >&2; return 1; }
+  direction=$(netem_direction "$namespace" "$device")
+  seed=$(netem_seed "$direction" "$stage")
   local args=(netem)
   if [[ $delay_ms != 0 || $jitter_ms != 0 ]]; then
     args+=(delay "${delay_ms}ms")
@@ -537,10 +667,25 @@ apply_netem() {
   if [[ $rate_mbit != 0 ]]; then
     args+=(rate "${rate_mbit}mbit")
   fi
-  # The old fixed 100-packet limit was smaller than the BDP of fast WAN paths
-  # and silently manufactured loss. Every scenario now declares its queue.
-  args+=(limit "$queue_packets")
+  # netem's limit includes packets retained solely for delay emulation. Keep
+  # the catalog value as actual queue capacity beyond the four-sigma normal
+  # delay envelope; reserving only nominal delay lets positive jitter steal
+  # queue slots and manufacture shallow-queue loss.
+  propagation_envelope_ms=$(netem_propagation_envelope_ms "$delay_ms" "$jitter_ms")
+  propagation_packets=$(netem_propagation_packets "$delay_ms" "$jitter_ms" "$rate_mbit")
+  limit_packets=$((queue_packets + propagation_packets))
+  args+=(limit "$limit_packets" seed "$seed")
   sudo ip netns exec "$namespace" "$TC" qdisc replace dev "$device" root "${args[@]}"
+  qdisc=$(sudo ip netns exec "$namespace" "$TC" qdisc show dev "$device")
+  grep -Eq "(^|[[:space:]])seed[[:space:]]$seed([[:space:]]|$)" <<<"$qdisc" \
+    || { echo "netem seed assertion failed for $direction/$stage: expected $seed" >&2; return 1; }
+  grep -Eq "(^|[[:space:]])limit[[:space:]]$limit_packets([[:space:]]|$)" <<<"$qdisc" \
+    || { echo "netem limit assertion failed for $direction/$stage: expected $limit_packets" >&2; return 1; }
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$stage" "$direction" "$namespace" "$device" "$seed" "$mode" \
+    "$queue_packets" "$delay_ms" "$jitter_ms" "$NETEM_NORMAL_JITTER_TAIL_SIGMAS" \
+    "$propagation_envelope_ms" "$propagation_packets" "$limit_packets" \
+    >>"$OUT/netem-seeds.tsv"
 }
 
 # netem is attached to each sender's egress. These names therefore describe
@@ -560,6 +705,30 @@ if [[ $SECOND_PATH == 1 ]]; then
     "$SECOND_PATH_LOSS_PERCENT" 0 "$SECOND_PATH_RATE_MBIT" \
     "$SECOND_PATH_QUEUE_PACKETS"
 fi
+
+# Each direct-TCP or overlay saturation epoch begins from the same clean
+# stage-zero netem state. Use timeline mode even for an all-zero initial
+# state: initial mode intentionally leaves an interface alone, whereas an
+# epoch reset must replace a previous dynamic qdisc with pass-through netem.
+restore_initial_netem() {
+  local stage=${1:-stage-0}
+  apply_netem "$NSA" "$LINK-a" "$A_TO_B_DELAY_MS" "$A_TO_B_JITTER_MS" \
+    "$A_TO_B_DELAY_CORRELATION_PERCENT" "$A_TO_B_LOSS_PERCENT" \
+    "$A_TO_B_LOSS_CORRELATION_PERCENT" "$A_TO_B_RATE_MBIT" "$A_TO_B_QUEUE_PACKETS" timeline "$stage"
+  apply_netem "$NSB" "$LINK-b" "$B_TO_A_DELAY_MS" "$B_TO_A_JITTER_MS" \
+    "$B_TO_A_DELAY_CORRELATION_PERCENT" "$B_TO_A_LOSS_PERCENT" \
+    "$B_TO_A_LOSS_CORRELATION_PERCENT" "$B_TO_A_RATE_MBIT" "$B_TO_A_QUEUE_PACKETS" timeline "$stage"
+  if [[ $SECOND_PATH == 1 ]]; then
+    apply_netem "$NSA" "$LINK2-a" "$SECOND_PATH_DELAY_MS" 0 0 \
+      "$SECOND_PATH_LOSS_PERCENT" 0 "$SECOND_PATH_RATE_MBIT" \
+      "$SECOND_PATH_QUEUE_PACKETS" timeline "$stage"
+    apply_netem "$NSB" "$LINK2-b" "$SECOND_PATH_DELAY_MS" 0 0 \
+      "$SECOND_PATH_LOSS_PERCENT" 0 "$SECOND_PATH_RATE_MBIT" \
+      "$SECOND_PATH_QUEUE_PACKETS" timeline "$stage"
+    set_underlay_path_state primary up
+    set_underlay_path_state secondary up
+  fi
+}
 
 capture_qdisc_pair() {
   local label=$1
@@ -695,10 +864,12 @@ set_underlay_path_state() {
 
 # Dynamic timeline scheduler. Runs as a background subshell for the whole
 # overlay saturation phase and re-applies netem at each scheduled offset. Each
-# step is bracketed by qdisc and peer-status captures so that per-segment
-# ground truth (netem drops/bytes, daemon counters) can be derived without any
-# change to the daemon. All mutations go through apply_netem, which only
-# accepts the two lab namespaces and veths.
+# step is bracketed by qdisc captures so that per-segment netem drops/bytes can
+# be derived without any change to the daemon. Peer status is captured after
+# the mutation: querying a saturated daemon can take seconds and must not move
+# the scheduled netem application away from its requested offset. All
+# mutations go through apply_netem, which only accepts the two lab namespaces
+# and veths.
 run_timeline() {
   local started_ns=$1
   local a_delay=$A_TO_B_DELAY_MS a_jitter=$A_TO_B_JITTER_MS
@@ -709,10 +880,10 @@ run_timeline() {
   local b_delay_corr=$B_TO_A_DELAY_CORRELATION_PERCENT b_loss=$B_TO_A_LOSS_PERCENT
   local b_loss_corr=$B_TO_A_LOSS_CORRELATION_PERCENT b_rate=$B_TO_A_RATE_MBIT
   local b_queue=$B_TO_A_QUEUE_PACKETS
-  local index offset changes change key value label touched_a touched_b
+  local index offset changes change key value label stage a_seed b_seed
   local primary_state=up secondary_state=up path_changed
   local now_ns remaining_ms applied_ms
-  printf 'step\toffset_seconds\tapplied_offset_ms\tchanges\ta_to_b\tb_to_a\tprimary\tsecondary\n' \
+  printf 'step\toffset_seconds\tapplied_offset_ms\tchanges\ta_to_b\tb_to_a\ta_seed\tb_seed\tprimary\tsecondary\n' \
     >"$OUT/timeline.tsv"
   for index in "${!TIMELINE_OFFSETS[@]}"; do
     offset=${TIMELINE_OFFSETS[$index]}
@@ -725,17 +896,13 @@ run_timeline() {
     fi
     capture_qdisc_pair "$label-before"
     capture_underlay_paths "$label-before"
-    capture_status_pair "$label-before"
-    touched_a=0
-    touched_b=0
     path_changed=0
     IFS=',' read -r -a change_list <<<"$changes"
     for change in "${change_list[@]}"; do
       key=${change%%=*}
       value=${change#*=}
       case $key in
-        a_*) touched_a=1 ;;
-        b_*) touched_b=1 ;;
+        a_* | b_*) ;;
         primary | secondary)
           printf -v "${key}_state" '%s' "$value"
           path_changed=1
@@ -743,13 +910,23 @@ run_timeline() {
       esac
       printf -v "$key" '%s' "$value"
     done
-    if ((touched_a)); then
-      apply_netem "$NSA" "$LINK-a" "$a_delay" "$a_jitter" "$a_delay_corr" \
-        "$a_loss" "$a_loss_corr" "$a_rate" "$a_queue" timeline
-    fi
-    if ((touched_b)); then
-      apply_netem "$NSB" "$LINK-b" "$b_delay" "$b_jitter" "$b_delay_corr" \
-        "$b_loss" "$b_loss_corr" "$b_rate" "$b_queue" timeline
+    # A stage replacement must reset both directional PRNGs, even if the
+    # catalog change touched only one side. Otherwise the untouched direction
+    # inherits a TCP-vs-overlay-dependent random history.
+    stage="stage-$((index + 1))"
+    a_seed=$(netem_seed a-to-b "$stage")
+    b_seed=$(netem_seed b-to-a "$stage")
+    apply_netem "$NSA" "$LINK-a" "$a_delay" "$a_jitter" "$a_delay_corr" \
+      "$a_loss" "$a_loss_corr" "$a_rate" "$a_queue" timeline "$stage"
+    apply_netem "$NSB" "$LINK-b" "$b_delay" "$b_jitter" "$b_delay_corr" \
+      "$b_loss" "$b_loss_corr" "$b_rate" "$b_queue" timeline "$stage"
+    if [[ $SECOND_PATH == 1 ]]; then
+      apply_netem "$NSA" "$LINK2-a" "$SECOND_PATH_DELAY_MS" 0 0 \
+        "$SECOND_PATH_LOSS_PERCENT" 0 "$SECOND_PATH_RATE_MBIT" \
+        "$SECOND_PATH_QUEUE_PACKETS" timeline "$stage"
+      apply_netem "$NSB" "$LINK2-b" "$SECOND_PATH_DELAY_MS" 0 0 \
+        "$SECOND_PATH_LOSS_PERCENT" 0 "$SECOND_PATH_RATE_MBIT" \
+        "$SECOND_PATH_QUEUE_PACKETS" timeline "$stage"
     fi
     if ((path_changed)); then
       set_underlay_path_state primary "$primary_state"
@@ -759,13 +936,153 @@ run_timeline() {
     capture_qdisc_pair "$label-after"
     capture_underlay_paths "$label-after"
     capture_status_pair "$label-after"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$((index + 1))" "$offset" "$applied_ms" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$((index + 1))" "$offset" "$applied_ms" \
       "$changes" \
-      "delay=$a_delay,jitter=$a_jitter,delay_corr=$a_delay_corr,loss=$a_loss,loss_corr=$a_loss_corr,rate=$a_rate,queue=$a_queue" \
-      "delay=$b_delay,jitter=$b_jitter,delay_corr=$b_delay_corr,loss=$b_loss,loss_corr=$b_loss_corr,rate=$b_rate,queue=$b_queue" \
+      "$(netem_state_record "$a_delay" "$a_jitter" "$a_delay_corr" "$a_loss" "$a_loss_corr" "$a_rate" "$a_queue")" \
+      "$(netem_state_record "$b_delay" "$b_jitter" "$b_delay_corr" "$b_loss" "$b_loss_corr" "$b_rate" "$b_queue")" \
+      "$a_seed" "$b_seed" \
       "$primary_state" "$secondary_state" \
       >>"$OUT/timeline.tsv"
   done
+}
+
+# Run the same scheduled impairment states while the direct TCP underlay
+# control is measured. This deliberately has no daemon/status probes: its job
+# is to align stage timing, configuration and PRNG seeds with the later
+# overlay phase, not to claim identical packet-level outcomes.
+run_underlay_timeline() {
+  local started_ns=$1
+  local a_delay=$A_TO_B_DELAY_MS a_jitter=$A_TO_B_JITTER_MS
+  local a_delay_corr=$A_TO_B_DELAY_CORRELATION_PERCENT a_loss=$A_TO_B_LOSS_PERCENT
+  local a_loss_corr=$A_TO_B_LOSS_CORRELATION_PERCENT a_rate=$A_TO_B_RATE_MBIT
+  local a_queue=$A_TO_B_QUEUE_PACKETS
+  local b_delay=$B_TO_A_DELAY_MS b_jitter=$B_TO_A_JITTER_MS
+  local b_delay_corr=$B_TO_A_DELAY_CORRELATION_PERCENT b_loss=$B_TO_A_LOSS_PERCENT
+  local b_loss_corr=$B_TO_A_LOSS_CORRELATION_PERCENT b_rate=$B_TO_A_RATE_MBIT
+  local b_queue=$B_TO_A_QUEUE_PACKETS
+  local index offset changes change key value stage a_seed b_seed now_ns remaining_ms applied_ms
+  printf 'step\toffset_seconds\tapplied_offset_ms\tchanges\ta_to_b\tb_to_a\ta_seed\tb_seed\tprimary\tsecondary\n' \
+    >"$OUT/underlay-timeline.tsv"
+  for index in "${!TIMELINE_OFFSETS[@]}"; do
+    offset=${TIMELINE_OFFSETS[$index]}
+    changes=${TIMELINE_CHANGES[$index]}
+    now_ns=$(date +%s%N)
+    remaining_ms=$(( (offset * 1000) - (now_ns - started_ns) / 1000000 ))
+    if ((remaining_ms > 0)); then
+      sleep "$(awk -v ms="$remaining_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+    fi
+    IFS=',' read -r -a change_list <<<"$changes"
+    for change in "${change_list[@]}"; do
+      key=${change%%=*}
+      value=${change#*=}
+      case $key in
+        a_* | b_*) ;;
+        # A single direct TCP flow has no equivalent for overlay path failover.
+        # Such timelines retain the legacy baseline and are marked incomparable.
+        primary | secondary) continue ;;
+      esac
+      printf -v "$key" '%s' "$value"
+    done
+    stage="stage-$((index + 1))"
+    a_seed=$(netem_seed a-to-b "$stage")
+    b_seed=$(netem_seed b-to-a "$stage")
+    apply_netem "$NSA" "$LINK-a" "$a_delay" "$a_jitter" "$a_delay_corr" \
+      "$a_loss" "$a_loss_corr" "$a_rate" "$a_queue" timeline "$stage"
+    apply_netem "$NSB" "$LINK-b" "$b_delay" "$b_jitter" "$b_delay_corr" \
+      "$b_loss" "$b_loss_corr" "$b_rate" "$b_queue" timeline "$stage"
+    if [[ $SECOND_PATH == 1 ]]; then
+      apply_netem "$NSA" "$LINK2-a" "$SECOND_PATH_DELAY_MS" 0 0 \
+        "$SECOND_PATH_LOSS_PERCENT" 0 "$SECOND_PATH_RATE_MBIT" \
+        "$SECOND_PATH_QUEUE_PACKETS" timeline "$stage"
+      apply_netem "$NSB" "$LINK2-b" "$SECOND_PATH_DELAY_MS" 0 0 \
+        "$SECOND_PATH_LOSS_PERCENT" 0 "$SECOND_PATH_RATE_MBIT" \
+        "$SECOND_PATH_QUEUE_PACKETS" timeline "$stage"
+    fi
+    applied_ms=$(( ($(date +%s%N) - started_ns) / 1000000 ))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tup\tup\n' "$((index + 1))" "$offset" "$applied_ms" \
+      "$changes" \
+      "$(netem_state_record "$a_delay" "$a_jitter" "$a_delay_corr" "$a_loss" "$a_loss_corr" "$a_rate" "$a_queue")" \
+      "$(netem_state_record "$b_delay" "$b_jitter" "$b_delay_corr" "$b_loss" "$b_loss_corr" "$b_rate" "$b_queue")" \
+      "$a_seed" "$b_seed" \
+      >>"$OUT/underlay-timeline.tsv"
+  done
+}
+
+verify_synchronized_timeline() {
+  python3 - "$OUT/underlay-timeline.tsv" "$OUT/timeline.tsv" \
+    >"$OUT/timeline-synchronization.json" <<'PY'
+import csv
+import json
+import pathlib
+import sys
+
+underlay_path, overlay_path = map(pathlib.Path, sys.argv[1:])
+keys = (
+    "step", "offset_seconds", "changes", "a_to_b", "b_to_a",
+    "a_seed", "b_seed", "primary", "secondary",
+)
+maximum_applied_offset_delta_ms = 250
+with underlay_path.open() as handle:
+    underlay = list(csv.DictReader(handle, delimiter="\t"))
+with overlay_path.open() as handle:
+    overlay = list(csv.DictReader(handle, delimiter="\t"))
+if len(underlay) != len(overlay):
+    raise SystemExit("underlay/overlay timeline step count differs")
+for index, (left, right) in enumerate(zip(underlay, overlay), start=1):
+    for key in keys:
+        if left.get(key) != right.get(key):
+            raise SystemExit(f"timeline step {index} differs at {key}: {left.get(key)!r} != {right.get(key)!r}")
+applied_offset_deltas_ms = [
+    abs(int(left["applied_offset_ms"]) - int(right["applied_offset_ms"]))
+    for left, right in zip(underlay, overlay)
+]
+underlay_requested_offset_errors_ms = [
+    abs(int(row["applied_offset_ms"]) - int(row["offset_seconds"]) * 1000)
+    for row in underlay
+]
+overlay_requested_offset_errors_ms = [
+    abs(int(row["applied_offset_ms"]) - int(row["offset_seconds"]) * 1000)
+    for row in overlay
+]
+if any(delta > maximum_applied_offset_delta_ms for delta in applied_offset_deltas_ms):
+    raise SystemExit(
+        "underlay/overlay timeline applied-offset delta exceeds "
+        f"{maximum_applied_offset_delta_ms} ms: {applied_offset_deltas_ms}"
+    )
+if any(
+    error > maximum_applied_offset_delta_ms
+    for error in underlay_requested_offset_errors_ms
+):
+    raise SystemExit(
+        "underlay timeline applied offset misses its requested offset by more than "
+        f"{maximum_applied_offset_delta_ms} ms: {underlay_requested_offset_errors_ms}"
+    )
+if any(
+    error > maximum_applied_offset_delta_ms
+    for error in overlay_requested_offset_errors_ms
+):
+    raise SystemExit(
+        "overlay timeline applied offset misses its requested offset by more than "
+        f"{maximum_applied_offset_delta_ms} ms: {overlay_requested_offset_errors_ms}"
+    )
+print(json.dumps({
+    "mode": "synchronized_dynamic_timeline",
+    "comparable": True,
+    "steps": len(overlay),
+    "validated_fields": list(keys),
+    "applied_offset_deltas_ms": applied_offset_deltas_ms,
+    "maximum_applied_offset_delta_ms": max(applied_offset_deltas_ms, default=0),
+    "underlay_requested_offset_errors_ms": underlay_requested_offset_errors_ms,
+    "overlay_requested_offset_errors_ms": overlay_requested_offset_errors_ms,
+    "maximum_underlay_requested_offset_error_ms": max(
+        underlay_requested_offset_errors_ms, default=0
+    ),
+    "maximum_overlay_requested_offset_error_ms": max(
+        overlay_requested_offset_errors_ms, default=0
+    ),
+    "allowed_applied_offset_delta_ms": maximum_applied_offset_delta_ms,
+}, indent=2))
+PY
 }
 
 capture_and_verify_route_isolation() {
@@ -945,9 +1262,21 @@ fi
 run_iperf "$NSB" -s -1 --json >"$OUT/underlay-server.json" &
 UNDERLAY_SERVER=$!
 sleep 0.2
+# Reset only after the receiver is ready. Underlay and overlay now perform the
+# same final sequence -- reset, concurrent ping, anchor, client -- so daemon
+# setup/status work cannot consume a different prefix of the netem PRNG stream.
+restore_initial_netem stage-0
+# `tc qdisc replace` intentionally preserves the qdisc instance and its
+# cumulative counters. Snapshot immediately after the epoch restore so the
+# underlay delta excludes bootstrap/setup traffic and can be compared with an
+# independently delimited overlay epoch.
+capture_qdisc_pair netem-before-underlay
 if [[ $PREFLIGHT_ONLY == 0 && $CONCURRENT_PING_INTERVAL_MS != 0 ]]; then
   PING_INTERVAL=$(awk -v value="$CONCURRENT_PING_INTERVAL_MS" 'BEGIN { printf "%.3f", value / 1000 }')
-  UNDERLAY_PING_COUNT=$((5000 / CONCURRENT_PING_INTERVAL_MS))
+  # Both controls sample the same wall-clock window. A shorter underlay window
+  # overweights TCP startup and makes both throughput and latency incomparable.
+  UNDERLAY_PING_WINDOW_MS=$((DURATION * 1000))
+  UNDERLAY_PING_COUNT=$((UNDERLAY_PING_WINDOW_MS / CONCURRENT_PING_INTERVAL_MS))
   ((UNDERLAY_PING_COUNT > 0)) || UNDERLAY_PING_COUNT=1
   sudo ip netns exec "$NSA" "$TASKSET" -c "$PROFILE_CPUSET" "$NICE" -n "$PROFILE_NICE" \
     "$PING" -6 -n -i "$PING_INTERVAL" -c "$UNDERLAY_PING_COUNT" \
@@ -956,11 +1285,49 @@ if [[ $PREFLIGHT_ONLY == 0 && $CONCURRENT_PING_INTERVAL_MS != 0 ]]; then
 fi
 IPERF_DIRECTION_ARGS=()
 [[ $PROFILE_DIRECTION == forward ]] || IPERF_DIRECTION_ARGS=(-R)
-run_iperf "$NSA" -6 -c "$UNDERLAY_B" -t 5 -P "$PARALLEL" \
+if [[ $SECOND_PATH == 1 ]]; then
+  # One direct TCP socket uses only the primary underlay address, while the
+  # overlay is allowed to select or fail over to the secondary address. Until
+  # the harness has path-specific byte evidence or a matched secondary TCP
+  # control, an aggregate throughput ratio would compare different paths.
+  if [[ $TIMELINE_HAS_PATH_ACTION == 1 ]]; then
+    printf '%s\n' '{"mode":"unavailable_path_state_timeline","comparable":false,"reason":"direct TCP control cannot reproduce overlay path-state changes or secondary-path selection"}' \
+      >"$OUT/timeline-comparison.json"
+  else
+    printf '%s\n' '{"mode":"unavailable_secondary_path","comparable":false,"reason":"direct TCP control measures only the primary path; overlay secondary-path usage is not proven absent"}' \
+      >"$OUT/timeline-comparison.json"
+  fi
+elif ((${#TIMELINE_OFFSETS[@]} > 0)); then
+  # The direct TCP control receives the same scheduled netem configurations,
+  # stage seeds and duration as the overlay. Without this, a dynamic scenario
+  # compared an initial-link control against a later, different link schedule.
+  UNDERLAY_STARTED_NS=$(date +%s%N)
+  date -u -d "@$((UNDERLAY_STARTED_NS / 1000000000))" +%Y-%m-%dT%H:%M:%SZ \
+    >"$OUT/underlay-started-at.txt"
+  printf '%s\n' "$UNDERLAY_STARTED_NS" >>"$OUT/underlay-started-at.txt"
+  run_underlay_timeline "$UNDERLAY_STARTED_NS" &
+  UNDERLAY_TIMELINE_PID=$!
+  UNDERLAY_TIMELINE_RAN=1
+  printf '%s\n' '{"mode":"synchronized_dynamic_timeline","comparable":true}' \
+    >"$OUT/timeline-comparison.json"
+else
+  printf '%s\n' '{"mode":"static_initial","comparable":true}' \
+    >"$OUT/timeline-comparison.json"
+fi
+run_iperf "$NSA" -6 -c "$UNDERLAY_B" -t "$DURATION" -P "$PARALLEL" \
   "${IPERF_DIRECTION_ARGS[@]}" --json \
   >"$OUT/underlay.json"
 wait "$UNDERLAY_SERVER"
-capture_qdisc_pair netem-after-underlay
+if [[ -n ${UNDERLAY_TIMELINE_PID:-} ]]; then
+  wait "$UNDERLAY_TIMELINE_PID" || { echo "underlay dynamic timeline failed" >&2; exit 1; }
+  UNDERLAY_TIMELINE_PID=
+  # Preserve the final dynamic underlay counters before qdisc replace resets
+  # them for cover traffic or the overlay epoch.
+  capture_qdisc_pair netem-after-underlay
+  restore_initial_netem stage-0
+else
+  capture_qdisc_pair netem-after-underlay
+fi
 if [[ -n ${UNDERLAY_PING_PID:-} ]]; then
   wait "$UNDERLAY_PING_PID"
   UNDERLAY_PING_PID=
@@ -990,6 +1357,14 @@ capture_underlay_paths saturation-before
 run_iperf "$NSB" -s -1 --json >"$OUT/overlay-server.json" &
 OVERLAY_SERVER=$!
 sleep 0.2
+# Cover traffic, status probes and the direct baseline may consume netem's
+# PRNG. Match the underlay's final preparation order by resetting only after
+# the receiver is ready and immediately before ping/timeline/client launch.
+restore_initial_netem stage-0
+# This is the overlay phase's counter origin. Do not use netem-initial here:
+# that snapshot predates the direct underlay control and would fold its bytes
+# and drops into the overlay shallow-shaper evidence.
+capture_qdisc_pair netem-before-overlay
 if [[ $PREFLIGHT_ONLY == 0 && $CONCURRENT_PING_INTERVAL_MS != 0 ]]; then
   PING_INTERVAL=$(awk -v value="$CONCURRENT_PING_INTERVAL_MS" 'BEGIN { printf "%.3f", value / 1000 }')
   PING_COUNT=$((DURATION * 1000 / CONCURRENT_PING_INTERVAL_MS))
@@ -1020,6 +1395,12 @@ if [[ -n ${TIMELINE_PID:-} ]]; then
   # static profile under a dynamic label.
   wait "$TIMELINE_PID" || { echo "dynamic timeline failed" >&2; exit 1; }
   TIMELINE_PID=
+fi
+if [[ $UNDERLAY_TIMELINE_RAN == 1 ]]; then
+  # This is an executable harness assertion, not a name-based assumption:
+  # every scheduled configuration, seed and directional state must align
+  # before the ratio is accepted as a synchronized comparison.
+  verify_synchronized_timeline || { echo "underlay/overlay timeline mismatch" >&2; exit 1; }
 fi
 capture_qdisc_pair netem-after-overlay
 capture_underlay_paths saturation-after
@@ -1092,8 +1473,12 @@ python3 - "$OUT" "$PERF_FREQUENCY" \
   "$A_TO_B_QUEUE_PACKETS" "$B_TO_A_QUEUE_PACKETS" "$CALL_GRAPH" \
   "$BINARY_SHA256" "$CONCURRENT_PING_INTERVAL_MS" "$PROFILE_DIRECTION" \
   "$SCENARIO_NAME" "$TIMELINE" "$PERF_ENABLED" "$DURATION" \
-  "$AUTOTUNE_OBJECTIVE" <<'PY'
-import datetime, json, pathlib, re, statistics, sys
+  "$AUTOTUNE_OBJECTIVE" "$A_TO_B_PROPAGATION_PACKETS" \
+  "$A_TO_B_NETEM_LIMIT_PACKETS" "$B_TO_A_PROPAGATION_PACKETS" \
+  "$B_TO_A_NETEM_LIMIT_PACKETS" "$NETEM_WIRE_PACKET_BYTES" \
+  "$NETEM_NORMAL_JITTER_TAIL_SIGMAS" "$A_TO_B_PROPAGATION_ENVELOPE_MS" \
+  "$B_TO_A_PROPAGATION_ENVELOPE_MS" <<'PY'
+import csv, datetime, io, json, pathlib, re, statistics, sys
 out = pathlib.Path(sys.argv[1])
 # Older daemon builds coloured stderr even when redirected; parse both forms.
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -1119,22 +1504,46 @@ def saturation_started():
     lines = path.read_text().split()
     return lines[0], int(lines[1])
 saturation_started_iso, saturation_started_ns = saturation_started()
-def overlay_intervals():
-    # iperf3 reports one aggregate sample per second; offsets are relative to
-    # the saturation anchor, which is taken just before the client starts.
-    data = json.loads((out / "overlay.json").read_text())
+def iperf_intervals(name, expected_sender=None):
+    # iperf3 reports one aggregate sample per second. Both dynamic runs take
+    # their own anchor immediately before the client, so their offsets share
+    # the same timeline grammar even though they run sequentially. Preserve
+    # bytes and duration: averaging interval rates would overweight a short
+    # final sample and cannot correctly apportion an interval across a
+    # timeline boundary.
+    data = json.loads((out / name).read_text())
     series = []
     for interval in data.get("intervals", []):
         total = interval.get("sum") or {}
         if "bits_per_second" not in total:
             continue
+        sender = total.get("sender")
+        if expected_sender is not None and sender is not expected_sender:
+            raise SystemExit(
+                f"{name} contains {'sender' if sender else 'receiver'} intervals; "
+                f"expected {'sender' if expected_sender else 'receiver'} intervals"
+            )
         series.append({
             "start_seconds": float(total.get("start", 0.0)),
             "end_seconds": float(total.get("end", 0.0)),
+            "seconds": float(total.get("seconds", 0.0)),
+            "bytes": int(total.get("bytes", 0)),
             "bits_per_second": float(total["bits_per_second"]),
             "retransmits": total.get("retransmits"),
+            "sender": sender,
         })
     return series
+def receiver_interval_name(prefix):
+    return f"{prefix}-server.json" if sys.argv[20] == "forward" else f"{prefix}.json"
+def overlay_intervals():
+    # In forward mode the client intervals describe bytes accepted by the
+    # sending TCP socket, not bytes delivered through the overlay. The server
+    # JSON is the receiver record. In reverse mode the client is the receiver.
+    name = receiver_interval_name("overlay")
+    return iperf_intervals(name, expected_sender=False)
+def underlay_intervals():
+    name = receiver_interval_name("underlay")
+    return iperf_intervals(name, expected_sender=False)
 def ping_series():
     # Per-second latency buckets from the concurrent overlay ping; icmp_seq
     # starts at 1 and the interval is fixed, so arrival second is derived
@@ -1180,27 +1589,71 @@ def qdisc_delta(before, after, direction):
     last = qdisc_counters(after, direction)
     if first is None or last is None:
         return None
-    return {key: max(0, last[key] - first[key]) for key in first}
+    delta = {key: last[key] - first[key] for key in first}
+    if any(value < 0 for value in delta.values()):
+        raise SystemExit(
+            f"qdisc counters decreased across {before}->{after} ({direction}); "
+            "the phase boundary no longer refers to one cumulative qdisc instance"
+        )
+    return delta
+TIMELINE_FIELDS = (
+    "step", "offset_seconds", "applied_offset_ms", "changes", "a_to_b", "b_to_a",
+    "a_seed", "b_seed", "primary", "secondary",
+)
+def parse_timeline(handle):
+    reader = csv.DictReader(handle, delimiter="\t")
+    missing = [field for field in TIMELINE_FIELDS if field not in (reader.fieldnames or [])]
+    if missing:
+        raise SystemExit(f"timeline TSV is missing fields: {missing}")
+    steps = []
+    for row in reader:
+        steps.append({
+            "step": int(row["step"]),
+            "offset_seconds": int(row["offset_seconds"]),
+            "applied_offset_ms": int(row["applied_offset_ms"]),
+            "changes": parse_kv(row["changes"]),
+            "netem_after": {
+                "a_to_b": parse_kv(row["a_to_b"]),
+                "b_to_a": parse_kv(row["b_to_a"]),
+            },
+            "a_seed": int(row["a_seed"]),
+            "b_seed": int(row["b_seed"]),
+            "underlay_paths_after": {
+                "primary": row["primary"],
+                "secondary": row["secondary"],
+            },
+        })
+    return steps
+def verify_timeline_parser():
+    fixture = io.StringIO(
+        "\t".join(TIMELINE_FIELDS) + "\n"
+        "1\t20\t20007\ta_loss=5\tdelay=42\tdelay=42\t123\t456\tdown\tup\n"
+    )
+    parsed = parse_timeline(fixture)
+    if parsed != [{
+        "step": 1,
+        "offset_seconds": 20,
+        "applied_offset_ms": 20007,
+        "changes": {"a_loss": 5.0},
+        "netem_after": {"a_to_b": {"delay": 42.0}, "b_to_a": {"delay": 42.0}},
+        "a_seed": 123,
+        "b_seed": 456,
+        "underlay_paths_after": {"primary": "down", "secondary": "up"},
+    }]:
+        raise SystemExit(f"timeline TSV parser self-test failed: {parsed!r}")
+verify_timeline_parser()
 def timeline_steps():
     path = out / "timeline.tsv"
     if not path.exists():
         return []
-    steps = []
-    for line in path.read_text().splitlines()[1:]:
-        fields = line.split("\t")
-        index, offset, applied_ms, changes, a_state, b_state = fields[:6]
-        steps.append({
-            "step": int(index),
-            "offset_seconds": int(offset),
-            "applied_offset_ms": int(applied_ms),
-            "changes": parse_kv(changes),
-            "netem_after": {"a_to_b": parse_kv(a_state), "b_to_a": parse_kv(b_state)},
-            "underlay_paths_after": {
-                "primary": fields[6] if len(fields) > 6 else "up",
-                "secondary": fields[7] if len(fields) > 7 else None,
-            },
-        })
-    return steps
+    with path.open(newline="") as handle:
+        return parse_timeline(handle)
+def underlay_timeline_steps():
+    path = out / "underlay-timeline.tsv"
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return parse_timeline(handle)
 def settle_seconds(values, start_offset):
     # First second after which throughput stays within ±10% of the segment's
     # final level (median of its last five samples) for three consecutive
@@ -1219,39 +1672,145 @@ def settle_seconds(values, start_offset):
         else:
             streak = 0
     return None
-def segments(steps, intervals, pings):
-    boundaries = [0] + [step["offset_seconds"] for step in steps] + [duration_seconds]
-    labels = ["netem-initial"] + [f"timeline-{step['step']:02d}-after" for step in steps]
-    next_labels = [f"timeline-{step['step']:02d}-before" for step in steps] + ["netem-after-overlay"]
+def interval_window_rate(intervals, start, end):
+    """Receiver bits delivered in [start, end), divided by wall-clock width."""
+    if end <= start:
+        return None
+    delivered_bytes = 0.0
+    has_overlap = False
+    for interval in intervals or []:
+        interval_start = interval["start_seconds"]
+        interval_end = interval["end_seconds"]
+        overlap = max(0.0, min(end, interval_end) - max(start, interval_start))
+        if overlap <= 0.0:
+            continue
+        interval_seconds = interval["seconds"] or (interval_end - interval_start)
+        if interval_seconds <= 0.0:
+            continue
+        delivered_bytes += interval["bytes"] * overlap / interval_seconds
+        has_overlap = True
+    return delivered_bytes * 8.0 / (end - start) if has_overlap else None
+def verify_interval_window_rate():
+    # Exercise both sides of a timeline boundary. A simple mean would return
+    # 1,000 bps; overlap accounting yields 200 bytes in 1.5 seconds.
+    synthetic = [
+        {"start_seconds": 0.0, "end_seconds": 1.0, "seconds": 1.0, "bytes": 100},
+        {"start_seconds": 1.0, "end_seconds": 3.0, "seconds": 2.0, "bytes": 300},
+    ]
+    measured = interval_window_rate(synthetic, 0.5, 2.0)
+    if measured is None or abs(measured - (3_200.0 / 3.0)) > 1e-6:
+        raise SystemExit(f"receiver interval overlap accounting self-test failed: {measured}")
+verify_interval_window_rate()
+def applied_boundaries(steps):
+    return [0.0] + [step["applied_offset_ms"] / 1_000.0 for step in steps] + [float(duration_seconds)]
+def verify_applied_boundaries():
+    synthetic = [
+        {"applied_offset_ms": 20_125},
+        {"applied_offset_ms": 40_075},
+    ]
+    if applied_boundaries(synthetic) != [0.0, 20.125, 40.075, float(duration_seconds)]:
+        raise SystemExit("actual timeline boundary self-test failed")
+verify_applied_boundaries()
+def segment_qdisc_labels(steps):
+    return (
+        ["netem-before-overlay"]
+        + [f"timeline-{step['step']:02d}-after" for step in steps],
+        [f"timeline-{step['step']:02d}-before" for step in steps]
+        + ["netem-after-overlay"],
+    )
+def verify_segment_qdisc_labels():
+    labels, next_labels = segment_qdisc_labels([{"step": 1}])
+    if labels != ["netem-before-overlay", "timeline-01-after"] or next_labels != [
+        "timeline-01-before", "netem-after-overlay"
+    ]:
+        raise SystemExit("overlay segment qdisc phase-boundary self-test failed")
+verify_segment_qdisc_labels()
+def segments(steps, intervals, pings, baseline_intervals=None, baseline_steps=None):
+    requested_boundaries = [0] + [step["offset_seconds"] for step in steps] + [duration_seconds]
+    overlay_boundaries = applied_boundaries(steps)
+    underlay_boundaries = (
+        applied_boundaries(baseline_steps)
+        if baseline_steps else [float(value) for value in requested_boundaries]
+    )
+    if len(underlay_boundaries) != len(overlay_boundaries):
+        raise SystemExit("underlay/overlay timeline boundary count differs")
+    labels, next_labels = segment_qdisc_labels(steps)
     result = []
-    for index in range(len(boundaries) - 1):
-        start, end = boundaries[index], boundaries[index + 1]
+    for index in range(len(requested_boundaries) - 1):
+        requested_start, requested_end = requested_boundaries[index:index + 2]
+        overlay_start, overlay_end = overlay_boundaries[index:index + 2]
+        underlay_start, underlay_end = underlay_boundaries[index:index + 2]
         values = [
             (int(interval["start_seconds"]), interval["bits_per_second"])
             for interval in intervals
-            if start <= interval["start_seconds"] < end
+            if overlay_start <= interval["start_seconds"] < overlay_end
         ]
         rates = [value for _, value in values]
+        overlay_rate = interval_window_rate(intervals, overlay_start, overlay_end)
+        baseline_rates = [
+            interval["bits_per_second"] for interval in (baseline_intervals or [])
+            if underlay_start <= interval["start_seconds"] < underlay_end
+        ]
+        underlay_rate = interval_window_rate(
+            baseline_intervals, underlay_start, underlay_end
+        )
+        overlay_last5_start = max(overlay_start, overlay_end - 5)
+        underlay_last5_start = max(underlay_start, underlay_end - 5)
+        overlay_last5_rate = interval_window_rate(
+            intervals, overlay_last5_start, overlay_end
+        )
+        underlay_last5_rate = interval_window_rate(
+            baseline_intervals, underlay_last5_start, underlay_end
+        )
         ping_values = [
-            sample for sample in (pings or []) if start <= sample["second"] < end
+            sample for sample in (pings or [])
+            if overlay_start <= sample["second"] < overlay_end
         ]
         p50 = sorted(sample["p50_ms"] for sample in ping_values)
         result.append({
             "index": index,
-            "start_seconds": start,
-            "end_seconds": end,
+            "start_seconds": requested_start,
+            "end_seconds": requested_end,
+            "overlay_applied_start_seconds": overlay_start,
+            "overlay_applied_end_seconds": overlay_end,
+            "underlay_applied_start_seconds": underlay_start,
+            "underlay_applied_end_seconds": underlay_end,
             "netem_step": steps[index - 1]["changes"] if index else None,
-            "overlay_mean_bits_per_second": statistics.fmean(rates) if rates else None,
+            "overlay_mean_bits_per_second": overlay_rate,
             "overlay_median_bits_per_second": statistics.median(rates) if rates else None,
-            "overlay_last5_mean_bits_per_second":
-                statistics.fmean(rates[-5:]) if rates else None,
-            "settle_seconds": settle_seconds(values, start),
+            "overlay_last5_mean_bits_per_second": overlay_last5_rate,
+            "underlay_mean_bits_per_second": underlay_rate,
+            "underlay_median_bits_per_second":
+                statistics.median(baseline_rates) if baseline_rates else None,
+            "underlay_last5_mean_bits_per_second": underlay_last5_rate,
+            "overlay_to_underlay_ratio": (
+                overlay_rate / underlay_rate
+                if overlay_rate is not None and underlay_rate else None
+            ),
+            "settle_seconds": settle_seconds(values, overlay_start),
             "ping_seconds": len(ping_values),
             "ping_p50_of_second_p50_ms": p50[len(p50) // 2] if p50 else None,
             "ping_max_ms": max(sample["maximum_ms"] for sample in ping_values) if ping_values else None,
             "a_to_b_qdisc": qdisc_delta(labels[index], next_labels[index], "a-to-b"),
             "b_to_a_qdisc": qdisc_delta(labels[index], next_labels[index], "b-to-a"),
         })
+    return result
+def phase_qdisc_deltas():
+    phases = {
+        "underlay": ("netem-before-underlay", "netem-after-underlay"),
+        "overlay": ("netem-before-overlay", "netem-after-overlay"),
+    }
+    result = {
+        "counter_semantics": "phase_delta_after_epoch_restore",
+        "rate_model": "netem_serializing_shallow_shaper",
+    }
+    for phase, (before, after) in phases.items():
+        result[phase] = {
+            "a_to_b": qdisc_delta(before, after, "a-to-b"),
+            "b_to_a": qdisc_delta(before, after, "b-to-a"),
+        }
+        if any(value is None for value in result[phase].values()):
+            raise SystemExit(f"missing {phase} qdisc phase counter snapshot")
     return result
 TUNING_FIELDS = (
     "reason", "path_epoch", "samples", "rtt_micros", "minimum_rtt_micros",
@@ -1635,6 +2194,15 @@ def final_datagram_shape(side):
     }
 underlay = rate("underlay.json")
 overlay = rate("overlay.json")
+comparison_path = out / "timeline-comparison.json"
+comparison = json.loads(comparison_path.read_text()) if comparison_path.exists() else {
+    "mode": "unknown", "comparable": False
+}
+synchronization_path = out / "timeline-synchronization.json"
+synchronization = (
+    json.loads(synchronization_path.read_text())
+    if synchronization_path.exists() else None
+)
 underlay_ping = concurrent_ping("underlay")
 overlay_ping = concurrent_ping("overlay")
 latency_increment = None
@@ -1646,9 +2214,56 @@ if underlay_ping is not None and overlay_ping is not None:
     }
 steps = timeline_steps()
 intervals = overlay_intervals()
+baseline_intervals = underlay_intervals() if comparison.get("comparable") else None
+baseline_steps = (
+    underlay_timeline_steps()
+    if comparison.get("comparable") and steps else None
+)
 pings = ping_series()
 active_side = "a" if sys.argv[20] == "forward" else "b"
 controller_intervals = controller_interval_series(active_side, intervals)
+segment_results = segments(
+    steps, intervals, pings, baseline_intervals, baseline_steps
+)
+static_endpoint_consistency = None
+if not steps and comparison.get("comparable") and segment_results:
+    static_segment = segment_results[0]
+    endpoint_ratio = overlay / underlay if underlay else None
+    segment_ratio = static_segment["overlay_to_underlay_ratio"]
+    def relative_error(measured, expected):
+        return abs(measured / expected - 1.0) if measured is not None and expected else None
+    relative_errors = {
+        "overlay": relative_error(
+            static_segment["overlay_mean_bits_per_second"], overlay
+        ),
+        "underlay": relative_error(
+            static_segment["underlay_mean_bits_per_second"], underlay
+        ),
+        "ratio": relative_error(segment_ratio, endpoint_ratio),
+    }
+    # iperf's receiver endpoint includes its final partial interval, whose end
+    # can extend slightly beyond the requested wall-clock window on a very
+    # lossy low-rate path. Bound each endpoint independently; the ratio error
+    # can legitimately contain both endpoint errors in opposite directions.
+    endpoint_tolerance = 0.03
+    ratio_tolerance = 2 * endpoint_tolerance / (1 - endpoint_tolerance)
+    static_endpoint_consistency = {
+        "receiver_interval_window_seconds": duration_seconds,
+        "relative_tolerance": endpoint_tolerance,
+        "ratio_relative_tolerance": ratio_tolerance,
+        "relative_errors": relative_errors,
+        "consistent": (
+            all(
+                relative_errors[key] is None
+                or relative_errors[key] <= endpoint_tolerance
+                for key in ("overlay", "underlay")
+            )
+            and (
+                relative_errors["ratio"] is None
+                or relative_errors["ratio"] <= ratio_tolerance
+            )
+        ),
+    }
 summary = {
     "scenario": sys.argv[21],
     "direction": sys.argv[20],
@@ -1661,8 +2276,18 @@ summary = {
     "saturation_started_at": saturation_started_iso,
     "timeline_spec": sys.argv[22] or None,
     "timeline": steps,
-    "segments": segments(steps, intervals, pings),
+    "throughput_comparison": comparison,
+    "timeline_synchronization": synchronization,
+    "segments": segment_results,
+    "shallow_shaper_phase_counters": phase_qdisc_deltas(),
+    "receiver_interval_source": {
+        "overlay": receiver_interval_name("overlay"),
+        "underlay": receiver_interval_name("underlay")
+            if comparison.get("comparable") else None,
+    },
+    "static_endpoint_consistency": static_endpoint_consistency,
     "overlay_interval_series": intervals,
+    "underlay_interval_series": baseline_intervals,
     "controller_interval_series": controller_intervals,
     "controller_alignment": controller_alignment_summary(controller_intervals),
     "overlay_ping_series": pings,
@@ -1675,7 +2300,9 @@ summary = {
     ),
     "underlay_received_bits_per_second": underlay,
     "overlay_received_bits_per_second": overlay,
-    "overlay_to_underlay_ratio": overlay / underlay if underlay else 0,
+    "overlay_to_underlay_ratio": (
+        overlay / underlay if comparison.get("comparable") and underlay else None
+    ),
     "a_perf_lost_samples": lost_samples("a"),
     "b_perf_lost_samples": lost_samples("b"),
     "netem": {
@@ -1693,9 +2320,22 @@ summary = {
         "b_to_a_loss_model": "gilbert_elliott" if float(sys.argv[12]) else "random",
         "a_to_b_rate_mbit": float(sys.argv[13]),
         "b_to_a_rate_mbit": float(sys.argv[14]),
+        "rate_model": "netem_serializing_shallow_shaper",
         "a_to_b_queue_packets": int(sys.argv[15]),
         "b_to_a_queue_packets": int(sys.argv[16]),
+        "queue_packets_semantics": "excess_beyond_normal_delay_tail_envelope",
+        "normal_jitter_tail_sigmas": int(sys.argv[31]),
+        "a_to_b_propagation_envelope_ms": float(sys.argv[32]),
+        "a_to_b_propagation_packets": int(sys.argv[26]),
+        "a_to_b_limit_packets": int(sys.argv[27]),
+        "b_to_a_propagation_envelope_ms": float(sys.argv[33]),
+        "b_to_a_propagation_packets": int(sys.argv[28]),
+        "b_to_a_limit_packets": int(sys.argv[29]),
+        "wire_packet_bytes": int(sys.argv[30]),
     },
+    "netem_seed_provenance": json.loads(
+        (out / "netem-seed-provenance.json").read_text()
+    ),
     "second_path": json.loads((out / "second-path.json").read_text()),
     "underlay_concurrent_ping": underlay_ping,
     "overlay_concurrent_ping": overlay_ping,
@@ -1716,7 +2356,11 @@ summary = {
 print(json.dumps(summary, indent=2))
 PY
 
-cleanup
-verify_management_plane
+final_status=0
+cleanup || final_status=96
+if ! verify_management_plane; then
+  ((final_status != 0)) || final_status=97
+fi
 trap - EXIT INT TERM HUP
+((final_status == 0)) || exit "$final_status"
 echo "$OUT"

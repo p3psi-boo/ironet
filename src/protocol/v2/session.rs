@@ -592,6 +592,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn datagram_ceiling_negotiates_new_new_and_preserves_an_old_peer_floor() {
+        let local = SecretKey::from_bytes(&[1; 32]).public();
+        let remote = SecretKey::from_bytes(&[2; 32]).public();
+        let mut local_policy = policy(local, remote, "production-v2");
+        local_policy.limits.max_datagram_size = u16::MAX;
+        local_policy.limits.max_train_size = 64 * 1024;
+
+        let mut new_peer = hello();
+        new_peer.limits.max_datagram_size = u16::MAX;
+        new_peer.limits.max_train_size = 64 * 1024;
+        let negotiated = negotiate(&local_policy, &new_peer, [7; 32]);
+        assert_eq!(negotiated.limits.max_datagram_size, u16::MAX);
+
+        let mut old_peer = new_peer;
+        old_peer.limits.max_datagram_size = 1_382;
+        let negotiated = negotiate(&local_policy, &old_peer, [8; 32]);
+        assert_eq!(negotiated.limits.max_datagram_size, 1_382);
+    }
+
     async fn connections() -> (Endpoint, Endpoint, Connection, Connection) {
         let alpn = b"h3".to_vec();
         let client = Endpoint::builder(presets::N0)

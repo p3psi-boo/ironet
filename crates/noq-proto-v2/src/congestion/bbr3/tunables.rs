@@ -1,7 +1,9 @@
 //! Runtime-adjustable BBRv3 parameters.
 //!
-//! Writers update the atomics and publish a new `generation`. The controller
-//! reads and clamps them only at packet-timed round boundaries.
+//! Writers update the atomics and publish a new `generation`. Most parameters
+//! are read and clamped at packet-timed round boundaries; a newly positive
+//! live pacing cap and its quantum guard also have a packet-path fast read so
+//! an already queued burst cannot escape before the next boundary.
 
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -25,6 +27,9 @@ fn clamp_u64(value: u64, lo: u64, hi: u64, count: &mut u64) -> u64 {
 #[allow(missing_docs)]
 pub struct Bbr3Tunables {
     pub generation: AtomicU64,
+    /// Monotonic host request to discard a standby/control-derived capacity
+    /// model and enter Startup for newly observed TUN bulk demand.
+    pub capacity_probe_generation: AtomicU64,
     pub probe_bw_up_pacing_gain_milli: AtomicU32,
     pub probe_bw_down_pacing_gain_milli: AtomicU32,
     pub cruise_pacing_gain_milli: AtomicU32,
@@ -52,6 +57,7 @@ impl Default for Bbr3Tunables {
     fn default() -> Self {
         Self {
             generation: AtomicU64::new(0),
+            capacity_probe_generation: AtomicU64::new(0),
             probe_bw_up_pacing_gain_milli: AtomicU32::new(1_250),
             probe_bw_down_pacing_gain_milli: AtomicU32::new(900),
             cruise_pacing_gain_milli: AtomicU32::new(1_000),
@@ -82,6 +88,9 @@ impl Bbr3Tunables {
     pub(crate) fn copy_from(other: &Self) -> Self {
         Self {
             generation: AtomicU64::new(other.generation.load(RELAXED)),
+            capacity_probe_generation: AtomicU64::new(
+                other.capacity_probe_generation.load(RELAXED),
+            ),
             probe_bw_up_pacing_gain_milli: AtomicU32::new(
                 other.probe_bw_up_pacing_gain_milli.load(RELAXED),
             ),
@@ -133,6 +142,7 @@ impl Bbr3Tunables {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(missing_docs)]
 pub struct Bbr3Params {
+    pub capacity_probe_generation: u64,
     pub probe_bw_up_pacing_gain: f64,
     pub probe_bw_down_pacing_gain: f64,
     pub cruise_pacing_gain: f64,
@@ -262,6 +272,7 @@ impl Bbr3Params {
 
         (
             Self {
+                capacity_probe_generation: t.capacity_probe_generation.load(RELAXED),
                 probe_bw_up_pacing_gain: f64::from(up) / 1_000.0,
                 probe_bw_down_pacing_gain: f64::from(down) / 1_000.0,
                 cruise_pacing_gain: f64::from(cruise) / 1_000.0,

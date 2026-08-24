@@ -19,8 +19,8 @@
     4591870180066957722
   ],
   "sample_count": 8,
-  "trace_digest": "e8454d443479ebc0485b574936cc3e19fc540a3a7c863d60b9934cff6b9f3ae3",
-  "final_memory_digest": "2dff58b122dd523f664a39561b6711a29b4db6ba34710f1211a7e495f060f55f",
+  "trace_digest": "d5493fac6b32211cd1a5f07d0ab4340409d5e910b416037b32253616e5625d11",
+  "final_memory_digest": "cefec5b43506f96bdd1c493274f529b5a2fb1925f77a55eb6314700f77fa477c",
   "samples": [
     {
       "index": 0,
@@ -83,8 +83,8 @@
         }
       },
       "utility": {
-        "total_bits": 4615546826532998096,
-        "total_repr": "3.7145432210031473",
+        "total_bits": 4615545067314393654,
+        "total_repr": "3.713761971003147",
         "components_bits": [
           4616238089473202777,
           9223372036854775808,
@@ -93,7 +93,7 @@
           9223372036854775808,
           13813656949852899115,
           13812385648015229959,
-          13809164803838155162
+          13809277393828839424
         ],
         "goodput_bytes_per_second": 7000000
       },
@@ -108,7 +108,7 @@
           "parity_cells": 1
         },
         "repair_cache_bytes": 4200000,
-        "send_buffer_bytes": 524288,
+        "send_buffer_bytes": 786432,
         "receive_buffer_bytes": 8388608,
         "receive_batch": 64,
         "cover_profile": "live-broadcast",
@@ -156,7 +156,7 @@
           "parity_cells": 1
         },
         "repair_cache_bytes": 4200000,
-        "send_buffer_bytes": 524288,
+        "send_buffer_bytes": 786432,
         "receive_buffer_bytes": 8388608,
         "receive_batch": 64,
         "cover_profile": "live-broadcast",
@@ -182,7 +182,7 @@
           "parity_cells": 2
         },
         "repair_cache_bytes": 4200000,
-        "send_buffer_bytes": 524288,
+        "send_buffer_bytes": 786432,
         "receive_buffer_bytes": 8388608,
         "receive_batch": 64,
         "cover_profile": "live-broadcast",
@@ -315,8 +315,8 @@
         }
       },
       "utility": {
-        "total_bits": 4615611507451832236,
-        "total_repr": "3.7432673191405765",
+        "total_bits": 4615611416398525561,
+        "total_repr": "3.743226883349561",
         "components_bits": [
           4616276917455628665,
           9223372036854775808,
@@ -325,7 +325,7 @@
           13796090066927442157,
           13813656949852899115,
           13812328853852441444,
-          13809293499956199424
+          13809299327367826637
         ],
         "goodput_bytes_per_second": 7250000
       },
@@ -340,7 +340,7 @@
           "parity_cells": 1
         },
         "repair_cache_bytes": 4237500,
-        "send_buffer_bytes": 786432,
+        "send_buffer_bytes": 800000,
         "receive_buffer_bytes": 8388608,
         "receive_batch": 64,
         "cover_profile": "live-broadcast",
@@ -388,7 +388,7 @@
           "parity_cells": 1
         },
         "repair_cache_bytes": 4237500,
-        "send_buffer_bytes": 786432,
+        "send_buffer_bytes": 800000,
         "receive_buffer_bytes": 8388608,
         "receive_batch": 64,
         "cover_profile": "live-broadcast",
@@ -414,7 +414,7 @@
           "parity_cells": 2
         },
         "repair_cache_bytes": 4237500,
-        "send_buffer_bytes": 786432,
+        "send_buffer_bytes": 800000,
         "receive_buffer_bytes": 8388608,
         "receive_batch": 64,
         "cover_profile": "live-broadcast",
@@ -1821,7 +1821,7 @@
           "loss_is_congestion": false
         }
       },
-      "memory_digest": "2dff58b122dd523f664a39561b6711a29b4db6ba34710f1211a7e495f060f55f",
+      "memory_digest": "cefec5b43506f96bdd1c493274f529b5a2fb1925f77a55eb6314700f77fa477c",
       "memory": [
         {
           "key": {
@@ -1844,8 +1844,8 @@
             },
             {
               "observations": 1,
-              "mean_bits": 4615775161485751258,
-              "mean_repr": "3.8159443097524504"
+              "mean_bits": 4615774930201762368,
+              "mean_repr": "3.8158415990285732"
             },
             {
               "observations": 0,

@@ -879,7 +879,13 @@ pub(super) fn session_policy(
         expected_remote_role: Some(ConnectionRole::Data),
         capabilities: capability::KNOWN,
         limits: WireLimitsV2 {
-            max_datagram_size: 1382,
+            // This is the Cell codec/session ceiling, not a path-MTU guess.
+            // V2Tx intersects it with QUIC's live DATAGRAM maximum for every
+            // PacketTrain, so PMTU remains authoritative. Advertising the
+            // former 1,382-byte conservative estimate here permanently left
+            // usable space in every packet even after QUIC proved a larger
+            // path maximum.
+            max_datagram_size: u16::MAX,
             max_control_size: 1024 * 1024,
             max_train_size: 64 * 1024,
             max_record_size: u16::MAX as u32,
@@ -935,6 +941,18 @@ mod tests {
         assert_eq!(runtime.autotune.mode, AutotuneMode::On);
         assert_eq!(runtime.path_migration, config.path_migration);
         assert_eq!(runtime.max_egress_bytes_per_second, Some(10_000_000));
+    }
+
+    #[test]
+    fn runtime_session_policy_advertises_the_cell_codec_ceiling() {
+        let runtime = V2RuntimeConfig::from_product_config(&product_config()).unwrap();
+        let local = SecretKey::from_bytes(&[1; 32]).public();
+        let remote = SecretKey::from_bytes(&[2; 32]).public();
+        let policy = session_policy(&runtime, local, remote);
+
+        assert_eq!(policy.limits.max_datagram_size, u16::MAX);
+        assert_eq!(policy.limits.max_train_size, 64 * 1024);
+        policy.limits.validate().unwrap();
     }
 
     #[test]

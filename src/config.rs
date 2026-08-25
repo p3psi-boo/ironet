@@ -644,7 +644,7 @@ pub struct RoutingConfig {
     /// Permit packets received from one Overlay Peer to be forwarded to
     /// another Overlay Peer. Peer-to-local-node and Peer-to-LAN forwarding is
     /// independent of this setting.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub transit_enabled: bool,
     #[serde(
         default = "default_rule_priority",
@@ -746,7 +746,7 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             isolate_overlay: true,
-            transit_enabled: false,
+            transit_enabled: true,
             rule_priority: default_rule_priority(),
             table: default_routing_table(),
             allow_default_routes: false,
@@ -1447,6 +1447,11 @@ mod tests {
 
     fn id(byte: u8) -> EndpointId {
         SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    #[test]
+    fn overlay_transit_is_enabled_by_default() {
+        assert!(RoutingConfig::default().transit_enabled);
     }
 
     fn extension_state(endpoint_id: EndpointId, prefix: &str) -> crate::extensions::ExtensionState {

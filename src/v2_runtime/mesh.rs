@@ -26,7 +26,7 @@ use tun_rs::VIRTIO_NET_HDR_LEN;
 
 use super::{
     QUIC_WIRE_VERSION, ShutdownFuture, TUN_REGULAR_INPUT_BYTES, V2RuntimeConfig, V2RuntimeState,
-    autotune::{selected_direct_addresses, selected_path_cost, ticket_partition_label, tuner_loop},
+    autotune::tuner_loop,
     connection::{PeerSessionV2, establish_mesh_adjacencies},
     cpu_sampler_loop,
     dataplane::{
@@ -39,6 +39,8 @@ use super::{
         unix_secs, write_reassembled,
     },
     host_network::{configure_mesh_tunnel, local_overlay_addresses, reconcile_v2_nat},
+    link::{selected_direct_addresses, selected_path_cost, ticket_partition_label},
+    route_selection::{FlowRouteLeaseV2, RouteQualityTableV2, RouteQualityV2},
     telemetry::{RuntimeMetrics, TunIngressBatchV2, increment_sampled_counter},
 };
 use crate::{
@@ -56,6 +58,7 @@ use crate::{
         },
         reassembly::ReassemblyOutput,
         repair::{RepairControlV2, RepairResponseV2},
+        route_feedback::RouteDeliveryFeedbackV2,
         routing::{
             AdjacencyIdV2, DataplaneSnapshotStoreV2, DataplaneSnapshotV2, LabelActionV2,
             OamControlV2, OamPathMtuExceededV2, ResolvedRouteV2, RouteAdvertisementV2,
@@ -215,9 +218,36 @@ struct MeshRxMetricsV2 {
 struct MeshFlowStateV2 {
     classifier: FlowClassifier,
     last_seen: Duration,
-    lease: crate::protocol::v2::routing::FlowRouteLeaseV2,
+    lease: FlowRouteLeaseV2,
+    selected_route: ResolvedRouteV2,
     effective_route: ResolvedRouteV2,
     path_mtu_generation: u64,
+}
+
+#[derive(Clone)]
+struct MeshTunContextV2 {
+    snapshots: Arc<DataplaneSnapshotStoreV2>,
+    commands: HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
+    priority_commands: HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
+    path_mtu_constraints: Arc<RoutePmtuConstraintsV2>,
+    route_quality: Arc<RouteQualityTableV2>,
+    metrics: HashMap<AdjacencyIdV2, Arc<RuntimeMetrics>>,
+}
+
+struct MeshControlContextV2 {
+    network_id: String,
+    local_id: EndpointId,
+    secret_key: SecretKey,
+    routes: mpsc::Sender<RouteAdvertisementV2>,
+    snapshots: Arc<DataplaneSnapshotStoreV2>,
+    commands: HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
+    path_mtu_constraints: Arc<RoutePmtuConstraintsV2>,
+    route_quality: Arc<RouteQualityTableV2>,
+    allow_default_routes: bool,
+    bind: SocketAddr,
+    metrics: HashMap<AdjacencyIdV2, Arc<RuntimeMetrics>>,
+    runtime_state: Arc<V2RuntimeState>,
+    max_total_peers: usize,
 }
 
 #[derive(Debug, Default)]
@@ -322,6 +352,7 @@ pub(super) async fn run_mesh(
     let initial = DataplaneSnapshotV2::empty(1, *local_id.as_bytes())?;
     let snapshots = Arc::new(DataplaneSnapshotStoreV2::new(initial));
     let path_mtu_constraints = Arc::new(RoutePmtuConstraintsV2::default());
+    let route_quality = Arc::new(RouteQualityTableV2::default());
     let (tun_priority_sender, tun_priority_receiver) = mpsc::channel(TUN_PRIORITY_INPUT_SLOTS);
     // Merge kernel RSS queues before route/class admission. Sharding before
     // the single adjacency scheduler lets a busy hash bucket monopolize the
@@ -337,6 +368,14 @@ pub(super) async fn run_mesh(
     let mut adjacency_metrics = HashMap::<AdjacencyIdV2, Arc<RuntimeMetrics>>::default();
     let mut tasks = JoinSet::new();
     let shutting_down = Arc::new(AtomicBool::new(false));
+    let tun_context = MeshTunContextV2 {
+        snapshots: snapshots.clone(),
+        commands: commands.clone(),
+        priority_commands: priority_commands.clone(),
+        path_mtu_constraints: path_mtu_constraints.clone(),
+        route_quality: route_quality.clone(),
+        metrics: adjacency_metrics.clone(),
+    };
     spawn_named_mesh_task(
         &mut tasks,
         "process CPU sampler",
@@ -474,29 +513,13 @@ pub(super) async fn run_mesh(
         &mut tasks,
         "regular TUN dispatcher",
         shutting_down.clone(),
-        mesh_tun_loop(
-            tun_regular_receiver,
-            snapshots.clone(),
-            commands.clone(),
-            priority_commands.clone(),
-            path_mtu_constraints.clone(),
-            adjacency_metrics.clone(),
-            false,
-        ),
+        mesh_tun_loop(tun_regular_receiver, tun_context.clone(), false),
     );
     spawn_named_mesh_task(
         &mut tasks,
         "priority TUN dispatcher",
         shutting_down.clone(),
-        mesh_tun_loop(
-            tun_priority_receiver,
-            snapshots.clone(),
-            commands.clone(),
-            priority_commands,
-            path_mtu_constraints.clone(),
-            adjacency_metrics.clone(),
-            true,
-        ),
+        mesh_tun_loop(tun_priority_receiver, tun_context, true),
     );
     spawn_named_mesh_task(
         &mut tasks,
@@ -520,23 +543,26 @@ pub(super) async fn run_mesh(
         "control manager",
         shutting_down.clone(),
         mesh_control_loop(
-            config.network_id.clone(),
-            local_id,
             local_presence,
-            secret_key,
             adjacencies.clone(),
             control_record_receiver,
             path_mtu_receiver,
             repair_sender,
-            route_sender.clone(),
-            snapshots,
-            commands,
-            path_mtu_constraints,
-            config.allow_default_routes,
-            config.bind,
-            adjacency_metrics,
-            runtime_state.clone(),
-            config.mesh_peers.len().saturating_add(1),
+            MeshControlContextV2 {
+                network_id: config.network_id.clone(),
+                local_id,
+                secret_key,
+                routes: route_sender.clone(),
+                snapshots,
+                commands,
+                path_mtu_constraints,
+                route_quality,
+                allow_default_routes: config.allow_default_routes,
+                bind: config.bind,
+                metrics: adjacency_metrics,
+                runtime_state: runtime_state.clone(),
+                max_total_peers: config.mesh_peers.len().saturating_add(1),
+            },
         ),
     );
     spawn_named_mesh_task(
@@ -909,11 +935,7 @@ async fn mesh_control_reader(
 
 async fn mesh_tun_loop(
     mut input: mpsc::Receiver<TunIngressRecordV2>,
-    snapshots: Arc<DataplaneSnapshotStoreV2>,
-    commands: HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
-    priority_commands: HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
-    path_mtu_constraints: Arc<RoutePmtuConstraintsV2>,
-    metrics: HashMap<AdjacencyIdV2, Arc<RuntimeMetrics>>,
+    context: MeshTunContextV2,
     priority: bool,
 ) -> Result<()> {
     let started = Instant::now();
@@ -943,18 +965,7 @@ async fn mesh_tun_loop(
                 TX_ADMISSION_BATCH_BYTES
             },
         );
-        enqueue_mesh_tun_batch(
-            records,
-            &mut flows,
-            started.elapsed(),
-            &snapshots,
-            &commands,
-            &priority_commands,
-            &path_mtu_constraints,
-            &metrics,
-            priority,
-        )
-        .await?;
+        enqueue_mesh_tun_batch(records, &mut flows, started.elapsed(), &context, priority).await?;
         if flows.len() > MAX_CLASSIFIERS {
             let now = started.elapsed();
             flows.retain(|_, state| now.saturating_sub(state.last_seen) < CLASSIFIER_IDLE);
@@ -962,18 +973,21 @@ async fn mesh_tun_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn enqueue_mesh_tun_batch(
     batch: Vec<TunIngressRecordV2>,
     flows: &mut HashMap<FlowKey, MeshFlowStateV2>,
     now: Duration,
-    snapshots: &DataplaneSnapshotStoreV2,
-    commands: &HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
-    priority_commands: &HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
-    path_mtu_constraints: &RoutePmtuConstraintsV2,
-    metrics: &HashMap<AdjacencyIdV2, Arc<RuntimeMetrics>>,
+    context: &MeshTunContextV2,
     priority: bool,
 ) -> Result<()> {
+    let MeshTunContextV2 {
+        snapshots,
+        commands,
+        priority_commands,
+        path_mtu_constraints,
+        route_quality,
+        metrics,
+    } = context;
     #[derive(Default)]
     struct Group {
         records: Vec<(Bytes, Bytes)>,
@@ -1015,13 +1029,11 @@ async fn enqueue_mesh_tun_batch(
                 continue;
             }
             state.effective_route = path_mtu_constraints.apply(state.lease.route());
+            state.selected_route = state.lease.route();
             state.path_mtu_generation = path_mtu_constraints.generation();
         }
         if let Entry::Vacant(entry) = flows.entry(key) {
-            let lease = match crate::protocol::v2::routing::FlowRouteLeaseV2::resolve(
-                snapshot,
-                info.destination,
-            ) {
+            let lease = match FlowRouteLeaseV2::resolve(snapshot, info.destination) {
                 Ok(lease) => lease,
                 Err(error) => {
                     warn!(%error, destination = %info.destination, "dropped unroutable V2 mesh packet");
@@ -1031,6 +1043,7 @@ async fn enqueue_mesh_tun_batch(
             entry.insert(MeshFlowStateV2 {
                 classifier: FlowClassifier::new(ClassifierConfig::default(), now),
                 last_seen: now,
+                selected_route: lease.route(),
                 effective_route: path_mtu_constraints.apply(lease.route()),
                 path_mtu_generation: path_mtu_constraints.generation(),
                 lease,
@@ -1046,6 +1059,31 @@ async fn enqueue_mesh_tun_batch(
         let class = state
             .classifier
             .observe(now, packet_len, 0, info.latency_protected);
+        let selected_route = state.lease.select(now, packet_len, |route| {
+            metrics
+                .get(&route.adjacency)
+                .map_or(RouteQualityV2::default(), |metrics| {
+                    let first_hop_bps = metrics.route_capacity_bps.load(Ordering::Relaxed);
+                    RouteQualityV2 {
+                        capacity_bits_per_second: route_quality
+                            .effective_capacity_bps(route, first_hop_bps),
+                        queued_bytes: metrics
+                            .train_queue_bytes
+                            .load(Ordering::Relaxed)
+                            .saturating_add(metrics.latency_queue_bytes.load(Ordering::Relaxed)),
+                    }
+                })
+        });
+        if selected_route != state.selected_route {
+            if let Some(selected_metrics) = metrics.get(&selected_route.adjacency) {
+                selected_metrics
+                    .route_switches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            state.selected_route = selected_route;
+            state.effective_route = path_mtu_constraints.apply(selected_route);
+            state.path_mtu_generation = path_mtu_constraints.generation();
+        }
         let route = state.effective_route;
         let (metadata, data, mut gso) = match encode_train_record_observed(raw) {
             Ok(record) => record,
@@ -1143,6 +1181,8 @@ async fn mesh_datagram_loop(
     let mut feedback_tick = tokio::time::interval(Duration::from_secs(1));
     feedback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut feedback_sequence = 0_u64;
+    let mut feedback_started = Instant::now();
+    let mut route_deliveries = HashMap::<(AdjacencyIdV2, u32, u32), u64>::default();
     loop {
         tokio::select! {
             datagram = datagrams.recv() => {
@@ -1252,6 +1292,13 @@ async fn mesh_datagram_loop(
                             metrics.adjacencies[&batch.incoming].observe_receive(&output);
                             metrics.adjacencies[&batch.incoming]
                                 .observe_local_delivery(&output);
+                            observe_route_delivery(
+                                &mut route_deliveries,
+                                batch.incoming,
+                                header.session_epoch,
+                                header.route_label,
+                                &output,
+                            );
                             local.merge(output);
                         }
                         TransitDispositionV2::Forward { next_hop, cell } => {
@@ -1317,12 +1364,20 @@ async fn mesh_datagram_loop(
                 }
                 let request_id = repair.response.request_id;
                 let route_epoch = repair.response.key.session_epoch;
+                let route_label = repair.response.key.route_label;
                 match receiver.accept_repair_response_at(repair.response, Instant::now())? {
                     Some((output, observation)) => {
                         metrics.adjacencies[&repair.incoming]
                             .observe_repair_response(observation);
                         metrics.adjacencies[&repair.incoming].observe_receive(&output);
                         metrics.adjacencies[&repair.incoming].observe_local_delivery(&output);
+                        observe_route_delivery(
+                            &mut route_deliveries,
+                            repair.incoming,
+                            route_epoch,
+                            route_label,
+                            &output,
+                        );
                         write_reassembled(&mut writer, &metrics.tun, output).await?;
                     }
                     None => {
@@ -1361,6 +1416,11 @@ async fn mesh_datagram_loop(
             }
             _ = feedback_tick.tick() => {
                 feedback_sequence = feedback_sequence.wrapping_add(1).max(1);
+                let interval_micros = feedback_started
+                    .elapsed()
+                    .as_micros()
+                    .clamp(1, u128::from(u64::MAX)) as u64;
+                feedback_started = Instant::now();
                 for (&adjacency, adjacency_metrics) in &metrics.adjacencies {
                     commands[&adjacency]
                         .send(MeshTxCommandV2::Control(TxControl::Send(
@@ -1369,31 +1429,69 @@ async fn mesh_datagram_loop(
                         .await
                         .context("V2 mesh writer stopped before FEC feedback")?;
                 }
+                for ((incoming, route_epoch, route_label), delivered_payload_bytes) in
+                    std::mem::take(&mut route_deliveries)
+                {
+                    commands[&incoming]
+                        .send(MeshTxCommandV2::Control(TxControl::Send(
+                            RouteDeliveryFeedbackV2 {
+                                sequence: feedback_sequence,
+                                route_epoch,
+                                route_label: RouteLabelV2::new(route_label)?,
+                                delivered_payload_bytes,
+                                interval_micros,
+                            }
+                            .encode()?,
+                        )))
+                        .await
+                        .context("V2 mesh writer stopped before route delivery feedback")?;
+                }
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn observe_route_delivery(
+    deliveries: &mut HashMap<(AdjacencyIdV2, u32, u32), u64>,
+    incoming: AdjacencyIdV2,
+    route_epoch: u32,
+    route_label: u32,
+    output: &ReassemblyOutput,
+) {
+    let bytes = output.records.iter().fold(0_u64, |total, record| {
+        total.saturating_add(u64::try_from(record.total_len).unwrap_or(u64::MAX))
+    });
+    if bytes != 0 {
+        deliveries
+            .entry((incoming, route_epoch, route_label))
+            .and_modify(|total| *total = total.saturating_add(bytes))
+            .or_insert(bytes);
+    }
+}
+
 async fn mesh_control_loop(
-    network_id: String,
-    local_id: EndpointId,
     mut local_presence: SignedPresenceV2,
-    secret_key: SecretKey,
     adjacencies: Vec<PeerSessionV2>,
     mut records: mpsc::Receiver<MeshControlRecordV2>,
     mut path_mtu_events: mpsc::Receiver<MeshPathMtuEventV2>,
     repairs: mpsc::Sender<MeshRepairDeliveryV2>,
-    routes: mpsc::Sender<RouteAdvertisementV2>,
-    snapshots: Arc<DataplaneSnapshotStoreV2>,
-    commands: HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
-    path_mtu_constraints: Arc<RoutePmtuConstraintsV2>,
-    allow_default_routes: bool,
-    bind: SocketAddr,
-    metrics: HashMap<AdjacencyIdV2, Arc<RuntimeMetrics>>,
-    runtime_state: Arc<V2RuntimeState>,
-    max_total_peers: usize,
+    context: MeshControlContextV2,
 ) -> Result<()> {
+    let MeshControlContextV2 {
+        network_id,
+        local_id,
+        secret_key,
+        routes,
+        snapshots,
+        commands,
+        path_mtu_constraints,
+        route_quality,
+        allow_default_routes,
+        bind,
+        metrics,
+        runtime_state,
+        max_total_peers,
+    } = context;
     let mut directory = PresenceDirectoryV2::new(network_id.clone())?;
     directory.insert(local_presence.clone(), SystemTime::now())?;
     runtime_state.publish_presence_directory(&directory, max_total_peers);
@@ -1480,6 +1578,30 @@ async fn mesh_control_loop(
             .await?;
             continue;
         }
+        if RouteDeliveryFeedbackV2::is_record(&record.bytes) {
+            let feedback = RouteDeliveryFeedbackV2::decode(record.bytes)?;
+            if relay_reverse_control(
+                feedback.route_epoch,
+                feedback.route_label,
+                feedback.encode()?,
+                record.incoming,
+                &snapshots,
+                &commands,
+            )
+            .await?
+            {
+                continue;
+            }
+            let source_route = snapshots
+                .source_route(feedback.route_epoch, feedback.route_label)
+                .context("V2 route feedback did not reach its compiled source")?;
+            ensure!(
+                source_route.adjacency == record.incoming,
+                "V2 route feedback arrived from the wrong first hop"
+            );
+            route_quality.observe(feedback);
+            continue;
+        }
         if FecFeedbackV2::is_record(&record.bytes) {
             let feedback = FecFeedbackV2::decode(record.bytes)?;
             let adjacency_metrics = metrics
@@ -1500,7 +1622,7 @@ async fn mesh_control_loop(
         if OamControlV2::is_record(&record.bytes) {
             match OamControlV2::decode(record.bytes)? {
                 OamControlV2::TtlExpired(oam) => {
-                    if relay_oam_reverse(
+                    if relay_reverse_control(
                         oam.route_epoch,
                         oam.route_label,
                         oam.encode()?,
@@ -1516,7 +1638,7 @@ async fn mesh_control_loop(
                     info!(reporter = ?oam.reporter, hops = oam.traversed_hops, "V2 mesh TTL-expired OAM reached route source");
                 }
                 OamControlV2::PathMtuExceeded(oam) => {
-                    if relay_oam_reverse(
+                    if relay_reverse_control(
                         oam.route_epoch,
                         oam.route_label,
                         oam.encode()?,
@@ -1697,7 +1819,7 @@ async fn refresh_and_publish_local_presence(
     .await
 }
 
-async fn relay_oam_reverse(
+async fn relay_reverse_control(
     route_epoch: u32,
     route_label: RouteLabelV2,
     encoded: Bytes,
@@ -1950,7 +2072,7 @@ mod tests {
         let commands = HashMap::from_iter([(incoming, sender)]);
         let encoded = Bytes::from_static(b"oam");
         assert!(
-            relay_oam_reverse(
+            relay_reverse_control(
                 9,
                 route_label,
                 encoded.clone(),

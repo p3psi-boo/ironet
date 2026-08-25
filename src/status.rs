@@ -165,6 +165,7 @@ pub struct PeerTrafficStatus {
     pub control_rx_bytes: u64,
     pub protocol_datagram_errors: u64,
     pub route_gate_drops: u64,
+    pub route_switches: u64,
     pub tun_admission_drop_records: u64,
     pub tun_admission_drop_bytes: u64,
     pub reassembly_pressure_evictions: u64,
@@ -649,6 +650,12 @@ pub fn render_prometheus(status: &RuntimeStatus) -> String {
         "counter",
         "V2 Cells rejected by the route-label gate.",
         traffic.route_gate_drops
+    );
+    peer_metric!(
+        "ironet_v2_peer_route_switches_total",
+        "counter",
+        "Demand-aware flow lease switches to this first-hop peer.",
+        traffic.route_switches
     );
     peer_metric!(
         "ironet_v2_peer_tun_admission_drop_records_total",

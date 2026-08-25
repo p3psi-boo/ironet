@@ -21,6 +21,7 @@ pub mod promotion;
 pub mod reassembly;
 pub mod repair;
 pub mod replay;
+pub mod route_feedback;
 pub mod routing;
 pub mod scheduler;
 pub mod session;

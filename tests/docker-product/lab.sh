@@ -137,7 +137,7 @@ for node_spec in "product-a node-a" "product-b node-b"; do
         (.mesh.nodes | length == 2) and
         (all(.mesh.nodes[]; (.node_addresses | length) == 2)) and
         .gateway.subnet_nat_enabled == true and
-        .gateway.transit_enabled == false and
+        .gateway.transit_enabled == true and
         (.gateway.advertised_prefixes | length) == 0 and
         (.peers | length == 1) and
         (.peers[0] |

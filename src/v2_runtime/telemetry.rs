@@ -45,6 +45,10 @@ pub(super) fn path_endpoint_identity(remote: &TransportAddr) -> String {
 
 #[derive(Debug, Default)]
 pub(super) struct RuntimeMetrics {
+    /// Live directional first-hop capacity used by demand-aware route leases.
+    /// The tuner publishes the BBR delivery model in bits/s; zero means cold.
+    pub(super) route_capacity_bps: AtomicU64,
+    pub(super) route_switches: AtomicU64,
     pub(super) train_queue_bytes: AtomicU64,
     pub(super) latency_queue_bytes: AtomicU64,
     pub(super) real_tx_bytes: AtomicU64,
@@ -740,6 +744,7 @@ impl RuntimeMetrics {
             control_rx_bytes: self.control_record_rx_bytes.load(Ordering::Relaxed),
             protocol_datagram_errors: self.protocol_datagram_errors.load(Ordering::Relaxed),
             route_gate_drops: self.route_gate_drops.load(Ordering::Relaxed),
+            route_switches: self.route_switches.load(Ordering::Relaxed),
             tun_admission_drop_records: self.tun_admission_drop_records.load(Ordering::Relaxed),
             tun_admission_drop_bytes: self.tun_admission_drop_bytes.load(Ordering::Relaxed),
             reassembly_pressure_evictions: self

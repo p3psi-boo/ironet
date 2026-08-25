@@ -21,6 +21,8 @@ V2 是 Ironet 唯一的数据面协议。外层使用标准 QUIC v1 与 `h3` ALP
 
 - 签名 Presence v2 分离传播 overlay 节点 `/32`/`/128` 地址、声明子网前缀、邻接成本和 transit 能力；租约过期会同时撤销地址与前缀。
 - 每个 generation 编译成不可变 route/label snapshot；热路径只读取快照。
+- 每个目的按不同可用首跳最多编译 4 条无环完整路径；短流优先低 RTT，持续流在租约边界按流压力、队列和方向有效容量重新选择；候选须产生超过 5% 的 ETA 收益并连续胜出两个窗口，避免测量噪声触发振荡。
+- 最终目的按 route epoch/label 返回端到端交付速率，源端以首跳 BBR 容量冷启动，并用完整路径交付样本约束后续 ETA。
 - 中转节点只修改覆盖 hop limit 和 V2 label，不解码或重组完整 IP PacketTrain。
 - 声明子网支持纯路由以及默认开启的 IPv4 MASQUERADE/IPv6 NAT66。
 

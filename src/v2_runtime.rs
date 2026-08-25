@@ -7,8 +7,10 @@ mod autotune;
 mod connection;
 mod dataplane;
 mod host_network;
+mod link;
 mod mesh;
 mod path_selection;
+mod route_selection;
 mod status_projection;
 mod telemetry;
 
@@ -35,7 +37,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use autotune::{selected_direct_addresses, selected_path_cost, ticket_partition_label, tuner_loop};
+use autotune::tuner_loop;
 pub(crate) use connection::validate_cover_sni;
 use connection::{build_v2_derp_transport, establish_connection, session_policy};
 use dataplane::{
@@ -46,6 +48,7 @@ use dataplane::{
 pub(crate) use host_network::cleanup_v2_nat_all;
 use host_network::{configure_tunnel, local_overlay_addresses, reconcile_v2_nat};
 pub use host_network::{derived_overlay_address, derived_overlay_ipv4_address};
+use link::{selected_direct_addresses, selected_path_cost, ticket_partition_label};
 use mesh::run_mesh;
 use telemetry::RuntimeMetrics;
 

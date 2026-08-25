@@ -1,6 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -17,6 +18,7 @@ const HEADER_LEN: usize = 16;
 const ENTRY_LEN: usize = 20;
 pub const MAX_ADVERTISED_PREFIXES: usize = 256;
 pub const MAX_ROUTE_LABELS: usize = 65_536;
+pub const MAX_CANDIDATE_ROUTES: usize = 4;
 const MAX_RETIRED_SNAPSHOTS: usize = 2;
 
 const OAM_MAGIC: &[u8; 4] = b"OEV2";
@@ -61,6 +63,8 @@ pub struct ResolvedRouteV2 {
 pub struct PrefixRouteV2 {
     pub prefix: IpNet,
     pub route: ResolvedRouteV2,
+    /// Sum of authenticated adjacency RTT costs for this compiled path.
+    pub startup_latency: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +316,7 @@ pub struct DataplaneSnapshotV2 {
     prefixes_v6: Vec<PrefixRouteV2>,
     underlay_exclusion_prefixes: Vec<IpNet>,
     labels: HashMap<RouteLabelV2, LabelRouteV2>,
+    source_routes: HashMap<(u32, RouteLabelV2), ResolvedRouteV2>,
 }
 
 impl DataplaneSnapshotV2 {
@@ -357,8 +362,14 @@ impl DataplaneSnapshotV2 {
             );
         }
 
+        let mut unique_prefixes = prefixes
+            .iter()
+            .map(|entry| entry.prefix)
+            .collect::<Vec<_>>();
+        unique_prefixes.sort_by_key(|prefix| (family(prefix), prefix.addr(), prefix.prefix_len()));
+        unique_prefixes.dedup();
         validate_prefix_set(
-            prefixes.iter().map(|entry| &entry.prefix),
+            unique_prefixes.iter(),
             allow_default_routes,
             "overlay route",
         )?;
@@ -372,6 +383,15 @@ impl DataplaneSnapshotV2 {
             ensure!(
                 entry.route.maximum_datagram_size as usize > super::cell::HEADER_LEN,
                 "V2 route DATAGRAM ceiling is too small"
+            );
+        }
+        let mut source_routes = HashMap::default();
+        for route in prefixes.iter().map(|entry| entry.route) {
+            ensure!(
+                source_routes
+                    .insert((route.route_epoch, route.route_label), route)
+                    .is_none(),
+                "duplicate V2 source route label"
             );
         }
 
@@ -393,6 +413,7 @@ impl DataplaneSnapshotV2 {
             prefixes_v6,
             underlay_exclusion_prefixes,
             labels: label_map,
+            source_routes,
         })
     }
 
@@ -430,15 +451,22 @@ impl DataplaneSnapshotV2 {
             .map(|entry| entry.action)
     }
 
+    pub fn source_route(
+        &self,
+        route_epoch: u32,
+        route_label: RouteLabelV2,
+    ) -> Option<ResolvedRouteV2> {
+        self.source_routes.get(&(route_epoch, route_label)).copied()
+    }
+
     fn route_epochs(&self) -> HashSet<u32> {
         self.labels
             .values()
             .map(|entry| entry.route_epoch)
             .chain(
-                self.prefixes_v4
-                    .iter()
-                    .chain(&self.prefixes_v6)
-                    .map(|entry| entry.route.route_epoch),
+                self.source_routes
+                    .keys()
+                    .map(|(route_epoch, _)| *route_epoch),
             )
             .collect()
     }
@@ -464,6 +492,36 @@ impl DataplaneSnapshotV2 {
             .find(|entry| entry.prefix.contains(&destination))
             .map(|entry| entry.route)
             .ok_or(TransitDropReasonV2::NoRoute)
+    }
+
+    pub fn lookup_destination_candidates(
+        &self,
+        destination: IpAddr,
+    ) -> std::result::Result<Vec<(ResolvedRouteV2, Duration)>, TransitDropReasonV2> {
+        if self
+            .underlay_exclusion_prefixes
+            .iter()
+            .any(|prefix| prefix.contains(&destination))
+        {
+            return Err(TransitDropReasonV2::UnderlayDestination);
+        }
+        let routes = if destination.is_ipv4() {
+            &self.prefixes_v4
+        } else {
+            &self.prefixes_v6
+        };
+        let prefix_len = routes
+            .iter()
+            .find(|entry| entry.prefix.contains(&destination))
+            .map(|entry| entry.prefix.prefix_len())
+            .ok_or(TransitDropReasonV2::NoRoute)?;
+        Ok(routes
+            .iter()
+            .filter(|entry| {
+                entry.prefix.prefix_len() == prefix_len && entry.prefix.contains(&destination)
+            })
+            .map(|entry| (entry.route, entry.startup_latency))
+            .collect())
     }
 
     /// Resolve a received Cell through the O(1) label fast path. Local Cells
@@ -645,13 +703,23 @@ impl DataplaneSnapshotStoreV2 {
                     .find_map(|snapshot| snapshot.label_action(route_epoch, route_label))
             })
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct FlowRouteLeaseV2 {
-    snapshot: Arc<DataplaneSnapshotV2>,
-    destination: IpAddr,
-    route: ResolvedRouteV2,
+    pub fn source_route(
+        &self,
+        route_epoch: u32,
+        route_label: RouteLabelV2,
+    ) -> Option<ResolvedRouteV2> {
+        let generations = self.generations.load();
+        generations
+            .current
+            .source_route(route_epoch, route_label)
+            .or_else(|| {
+                generations
+                    .retired
+                    .iter()
+                    .find_map(|snapshot| snapshot.source_route(route_epoch, route_label))
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -826,69 +894,72 @@ pub fn compile_topology_v2(
             demand.prefix.prefix_len(),
         )
     });
-    ensure!(
-        demands.len() <= MAX_ROUTE_LABELS,
-        "V2 topology exceeds route-label capacity"
-    );
-
     let mut parts = node_ids
         .iter()
         .copied()
         .map(|node| (node, SnapshotPartsV2::default()))
         .collect::<HashMap<_, _>>();
-    for (index, demand) in demands.into_iter().enumerate() {
-        let Some(path) = shortest_path_v2(demand.source, demand.owner, &graph, &transit_nodes)
-        else {
-            continue;
-        };
-        debug_assert!(path.len() >= 2);
-        let route_label = RouteLabelV2::new(
-            u32::try_from(index + 1).map_err(|_| anyhow::anyhow!("V2 route label overflow"))?,
-        )?;
-        let first_hop = directed_link_v2(&graph, path[0], path[1])?;
-        let maximum_datagram_size = path
-            .windows(2)
-            .map(|hop| directed_link_v2(&graph, hop[0], hop[1]))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|link| link.maximum_datagram_size)
-            .min()
-            .context("V2 compiled path has no adjacency")?;
-        parts
-            .get_mut(&demand.source)
-            .expect("source topology parts exist")
-            .prefixes
-            .push(PrefixRouteV2 {
-                prefix: demand.prefix,
-                route: ResolvedRouteV2 {
-                    adjacency: first_hop.adjacency,
-                    route_label,
-                    route_epoch,
-                    maximum_datagram_size,
-                },
-            });
-        for hop in 1..path.len() {
-            let current = path[hop];
-            let previous = path[hop - 1];
-            let expected_ingress = directed_link_v2(&graph, current, previous)?.adjacency;
-            let action = if hop + 1 == path.len() {
-                LabelActionV2::Local { expected_ingress }
-            } else {
-                let next_hop = directed_link_v2(&graph, current, path[hop + 1])?.adjacency;
-                LabelActionV2::Forward {
-                    expected_ingress,
-                    next_hop,
-                }
-            };
+    let mut next_route_label = 1_u32;
+    for demand in demands {
+        for path in candidate_paths_v2(demand.source, demand.owner, &graph, &transit_nodes) {
+            ensure!(
+                usize::try_from(next_route_label).unwrap_or(usize::MAX) <= MAX_ROUTE_LABELS,
+                "V2 topology exceeds route-label capacity"
+            );
+            debug_assert!(path.len() >= 2);
+            let route_label = RouteLabelV2::new(next_route_label)?;
+            next_route_label = next_route_label
+                .checked_add(1)
+                .context("V2 route label overflow")?;
+            let path_links = path
+                .windows(2)
+                .map(|hop| directed_link_v2(&graph, hop[0], hop[1]))
+                .collect::<Result<Vec<_>>>()?;
+            let first_hop = path_links[0];
+            let startup_latency =
+                Duration::from_micros(path_links.iter().map(|link| u64::from(link.cost)).sum());
+            let maximum_datagram_size = path_links
+                .iter()
+                .map(|link| link.maximum_datagram_size)
+                .min()
+                .context("V2 compiled path has no adjacency")?;
             parts
-                .get_mut(&current)
-                .expect("transit topology parts exist")
-                .labels
-                .push(LabelRouteV2 {
-                    route_label,
-                    route_epoch,
-                    action,
+                .get_mut(&demand.source)
+                .expect("source topology parts exist")
+                .prefixes
+                .push(PrefixRouteV2 {
+                    prefix: demand.prefix,
+                    route: ResolvedRouteV2 {
+                        adjacency: first_hop.adjacency,
+                        route_label,
+                        route_epoch,
+                        maximum_datagram_size,
+                    },
+                    startup_latency,
                 });
+            for hop in 1..path.len() {
+                let current = path[hop];
+                let previous = path[hop - 1];
+                let expected_ingress = directed_link_v2(&graph, current, previous)?.adjacency;
+                let action = if hop + 1 == path.len() {
+                    LabelActionV2::Local { expected_ingress }
+                } else {
+                    let next_hop = directed_link_v2(&graph, current, path[hop + 1])?.adjacency;
+                    LabelActionV2::Forward {
+                        expected_ingress,
+                        next_hop,
+                    }
+                };
+                parts
+                    .get_mut(&current)
+                    .expect("transit topology parts exist")
+                    .labels
+                    .push(LabelRouteV2 {
+                        route_label,
+                        route_epoch,
+                        action,
+                    });
+            }
         }
     }
 
@@ -950,9 +1021,10 @@ fn directed_link_v2(
         .ok_or_else(|| anyhow::anyhow!("V2 compiled path references an absent healthy link"))
 }
 
-fn shortest_path_v2(
+fn shortest_path_excluding_v2(
     source: NodeIdV2,
     destination: NodeIdV2,
+    excluded: Option<NodeIdV2>,
     graph: &HashMap<NodeIdV2, Vec<DirectedLinkV2>>,
     transit_nodes: &HashSet<NodeIdV2>,
 ) -> Option<Vec<NodeIdV2>> {
@@ -963,7 +1035,7 @@ fn shortest_path_v2(
     loop {
         let current = distance
             .iter()
-            .filter(|(node, _)| !visited.contains(*node))
+            .filter(|(node, _)| Some(**node) != excluded && !visited.contains(*node))
             .min_by_key(|(node, cost)| (**cost, **node))
             .map(|(node, cost)| (*node, *cost));
         let (current, current_cost) = current?;
@@ -975,7 +1047,7 @@ fn shortest_path_v2(
             continue;
         }
         for edge in graph.get(&current).into_iter().flatten() {
-            if visited.contains(&edge.peer) {
+            if Some(edge.peer) == excluded || visited.contains(&edge.peer) {
                 continue;
             }
             let candidate = current_cost.saturating_add(u64::from(edge.cost));
@@ -1001,36 +1073,45 @@ fn shortest_path_v2(
     Some(path)
 }
 
-impl FlowRouteLeaseV2 {
-    pub fn resolve(snapshot: Arc<DataplaneSnapshotV2>, destination: IpAddr) -> Result<Self> {
-        let route = snapshot
-            .lookup_destination(destination)
-            .map_err(|reason| anyhow::anyhow!("V2 flow route lookup failed: {reason:?}"))?;
-        Ok(Self {
-            snapshot,
-            destination,
-            route,
-        })
-    }
-
-    pub fn route(&self) -> ResolvedRouteV2 {
-        self.route
-    }
-
-    pub fn snapshot_generation(&self) -> u64 {
-        self.snapshot.generation()
-    }
-
-    pub fn refresh(&mut self, snapshot: Arc<DataplaneSnapshotV2>) -> Result<bool> {
-        if snapshot.generation() == self.snapshot.generation() {
-            return Ok(false);
+/// Keep one deterministic loop-free path per usable first hop. This gives the
+/// source enough alternatives for demand-aware selection without turning the
+/// label table into an all-paths combinatorial expansion.
+fn candidate_paths_v2(
+    source: NodeIdV2,
+    destination: NodeIdV2,
+    graph: &HashMap<NodeIdV2, Vec<DirectedLinkV2>>,
+    transit_nodes: &HashSet<NodeIdV2>,
+) -> Vec<Vec<NodeIdV2>> {
+    let mut candidates = Vec::new();
+    for edge in graph.get(&source).into_iter().flatten() {
+        let path = if edge.peer == destination {
+            Some(vec![source, destination])
+        } else if transit_nodes.contains(&edge.peer) {
+            shortest_path_excluding_v2(edge.peer, destination, Some(source), graph, transit_nodes)
+                .map(|tail| {
+                    let mut path = Vec::with_capacity(tail.len() + 1);
+                    path.push(source);
+                    path.extend(tail);
+                    path
+                })
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            candidates.push(path);
         }
-        self.route = snapshot
-            .lookup_destination(self.destination)
-            .map_err(|reason| anyhow::anyhow!("V2 flow route refresh failed: {reason:?}"))?;
-        self.snapshot = snapshot;
-        Ok(true)
     }
+    candidates.sort_by_key(|path| {
+        let cost = path.windows(2).fold(0_u64, |total, hop| {
+            total.saturating_add(
+                directed_link_v2(graph, hop[0], hop[1])
+                    .map_or(u64::MAX, |link| u64::from(link.cost)),
+            )
+        });
+        (cost, path.clone())
+    });
+    candidates.truncate(MAX_CANDIDATE_ROUTES);
+    candidates
 }
 
 fn validate_prefix_set<'a>(
@@ -1259,6 +1340,7 @@ mod tests {
                         route_epoch: direct_epoch,
                         maximum_datagram_size: 1_382,
                     },
+                    startup_latency: Duration::from_millis(10),
                 },
                 PrefixRouteV2 {
                     prefix: "10.1.0.0/16".parse().unwrap(),
@@ -1268,6 +1350,7 @@ mod tests {
                         route_epoch: narrow_epoch,
                         maximum_datagram_size: 1_382,
                     },
+                    startup_latency: Duration::from_millis(20),
                 },
             ],
             vec![direct, narrow],
@@ -1475,16 +1558,24 @@ mod tests {
         let first = snapshot(1, 3);
         let store = DataplaneSnapshotStoreV2::new(first);
         let old_worker_view = store.load();
-        let mut lease =
-            FlowRouteLeaseV2::resolve(old_worker_view.clone(), "10.1.9.9".parse().unwrap())
-                .unwrap();
         let retired = store.publish(snapshot(2, 4)).unwrap();
         assert_eq!(old_worker_view.generation(), 1);
         assert_eq!(retired.generation(), 1);
-        assert_eq!(lease.route().adjacency, adjacency(3));
-        assert!(lease.refresh(store.load()).unwrap());
-        assert_eq!(lease.snapshot_generation(), 2);
-        assert_eq!(lease.route().adjacency, adjacency(4));
+        assert_eq!(
+            old_worker_view
+                .lookup_destination("10.1.9.9".parse().unwrap())
+                .unwrap()
+                .adjacency,
+            adjacency(3)
+        );
+        assert_eq!(
+            store
+                .load()
+                .lookup_destination("10.1.9.9".parse().unwrap())
+                .unwrap()
+                .adjacency,
+            adjacency(4)
+        );
         let draining = store
             .dispatch_cell(adjacency(1), encoded_cell(11, 8, 6))
             .unwrap();
@@ -1522,6 +1613,7 @@ mod tests {
                 route_epoch: 1,
                 maximum_datagram_size: 1_382,
             },
+            startup_latency: Duration::from_millis(1),
         };
         let label_route = LabelRouteV2 {
             route_label: label(1),
@@ -1564,6 +1656,7 @@ mod tests {
                         route_epoch: 2,
                         maximum_datagram_size: 1_382,
                     },
+                    startup_latency: Duration::from_millis(1),
                 }],
                 Vec::new(),
                 Vec::new(),
@@ -1603,7 +1696,7 @@ mod tests {
         assert!(matches!(at_c, TransitDispositionV2::Local { .. }));
         // B's own first packets have a prefix route, while A's already-labeled
         // Cells enter the separate O(1) label table.
-        assert_eq!(b.route_count(), 1);
+        assert_eq!(b.route_count(), 2);
         assert_eq!(b.label_count(), 1);
     }
 
@@ -1619,7 +1712,18 @@ mod tests {
             .unwrap();
         assert_eq!(direct_route.adjacency, adjacency(13));
         assert_eq!(direct_route.maximum_datagram_size, 1_300);
-        assert_eq!(direct.snapshot(NodeIdV2([2; 32])).unwrap().label_count(), 0);
+        let candidates = direct
+            .snapshot(NodeIdV2([1; 32]))
+            .unwrap()
+            .lookup_destination_candidates("11.6.1.48".parse().unwrap())
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .any(|(route, _)| route.adjacency == adjacency(12))
+        );
+        assert_eq!(direct.snapshot(NodeIdV2([2; 32])).unwrap().label_count(), 1);
 
         let transit = compile_topology_v2(2, 2, nodes, three_node_links(1, false), false).unwrap();
         let transit_route = transit

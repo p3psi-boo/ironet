@@ -5,7 +5,6 @@
 //! per-connection autotune loop and its policy/WASM/state helpers.
 
 use std::{
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
@@ -16,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     EndpointId, TransportAddr,
-    endpoint::{Bbr3Tunables, Connection, ControllerSnapshot, LocalTransportAddr},
+    endpoint::{Bbr3Tunables, Connection, ControllerSnapshot},
 };
 use ironet_policy_core::{BANDIT_POLICY_ID_V1, LearnerMemoryV1, LearnerStateV1, STATE_SCHEMA_V1};
 use tokio::sync::watch;
@@ -1826,6 +1825,15 @@ pub(super) async fn tuner_loop(
             controller_snapshot,
             controller_tunables,
         } = path;
+        let route_capacity_bytes_per_second = controller_snapshot
+            .map(|snapshot| snapshot.bw.max(snapshot.max_bw))
+            .filter(|capacity| *capacity != 0)
+            .or(controller_pacing_rate_bytes_per_second)
+            .unwrap_or(0);
+        metrics.route_capacity_bps.store(
+            route_capacity_bytes_per_second.saturating_mul(8),
+            Ordering::Relaxed,
+        );
         // PathId is a QUIC controller identity, while `path_identity` below is
         // deliberately a stable network-locator epoch. noq may recycle PathId
         // without changing the locator, so never cache its path-local BBR
@@ -2573,21 +2581,6 @@ fn selected_path_sample(connection: &Connection) -> Result<SelectedPathSampleV2>
     })
 }
 
-pub(super) fn ticket_partition_label(
-    network_id: &str,
-    cover_profile: u32,
-    quic_version: u32,
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ironet-v2/ticket-partition\0");
-    hasher.update(network_id.as_bytes());
-    let digest = hasher.finalize();
-    format!(
-        "{}:{cover_profile}:{quic_version}",
-        hex::encode(&digest.as_bytes()[..8])
-    )
-}
-
 pub(super) fn path_reliability(is_iroh_relay: bool, remote: &TransportAddr) -> PathReliability {
     if is_iroh_relay
         || matches!(
@@ -2599,34 +2592,6 @@ pub(super) fn path_reliability(is_iroh_relay: bool, remote: &TransportAddr) -> P
     } else {
         PathReliability::Datagram
     }
-}
-
-pub(super) fn selected_direct_addresses(connection: &Connection, port: u16) -> Vec<SocketAddr> {
-    if port == 0 {
-        return Vec::new();
-    }
-    connection
-        .paths()
-        .iter()
-        .filter(|path| path.is_selected())
-        .filter_map(|path| match path.local_addr() {
-            LocalTransportAddr::Ip(Some(address))
-                if !address.is_unspecified() && !address.is_multicast() =>
-            {
-                Some(SocketAddr::new(*address, port))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-pub(super) fn selected_path_cost(connection: &Connection) -> u32 {
-    connection
-        .paths()
-        .iter()
-        .find(|path| path.is_selected())
-        .map(|path| path.rtt().as_micros().clamp(1, u128::from(u32::MAX)) as u32)
-        .unwrap_or(1)
 }
 
 fn ratio_per_million(numerator: u64, denominator: u64) -> u32 {
@@ -2670,7 +2635,7 @@ fn rate_per_second(value: u64, elapsed: Duration) -> u64 {
 mod tests {
     use iroh::SecretKey;
 
-    use super::super::{QUIC_WIRE_VERSION, V2RuntimeConfig};
+    use super::super::V2RuntimeConfig;
     use super::*;
     use crate::{
         derp::DerpPublicKey,
@@ -3986,16 +3951,6 @@ mod tests {
         assert!(parse_autotune_force(r#"{"unknown":1}"#).is_err());
         assert!(parse_autotune_force(r#"{"fec":"2+2"}"#).is_err());
         assert!(parse_autotune_force(r#"{"bbr_preset":"unknown"}"#).is_err());
-    }
-
-    #[test]
-    fn ticket_partition_status_is_stable_and_hides_network_name() {
-        let first = ticket_partition_label("private-network-name", 7, QUIC_WIRE_VERSION);
-        assert_eq!(first, ticket_partition_label("private-network-name", 7, 1));
-        assert_ne!(first, ticket_partition_label("other-network", 7, 1));
-        assert_ne!(first, ticket_partition_label("private-network-name", 8, 1));
-        assert!(!first.contains("private-network-name"));
-        assert!(first.ends_with(":7:1"));
     }
 
     #[test]

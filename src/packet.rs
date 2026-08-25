@@ -19,7 +19,7 @@ pub struct PacketInfo {
 /// absent for protocols without a TCP/UDP-style header and for fragmented IP
 /// datagrams. Using the same address/protocol key for every fragment prevents
 /// the first and later fragments from selecting different route leases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FlowKey {
     pub source: IpAddr,
     pub destination: IpAddr,

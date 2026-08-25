@@ -11,8 +11,8 @@ use iroh_base::Signature;
 use rustc_hash::FxHashMap as HashMap;
 
 use super::routing::{
-    AdjacencyIdV2, CompiledTopologyV2, NodeIdV2, TopologyLinkV2, TopologyNodeV2,
-    compile_topology_v2,
+    AdjacencyIdV2, CompiledTopologyV2, DataplaneSnapshotV2, NodeIdV2, TopologyLinkV2,
+    TopologyNodeV2, compile_local_snapshot_v2, compile_topology_v2,
 };
 
 const MAGIC: &[u8; 4] = b"PRV2";
@@ -239,7 +239,7 @@ pub enum PresenceUpdateV2 {
     Stale,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PresenceDirectoryV2 {
     network_id: String,
     records: HashMap<EndpointId, SignedPresenceV2>,
@@ -321,6 +321,33 @@ impl PresenceDirectoryV2 {
         allow_default_routes: bool,
         now: SystemTime,
     ) -> Result<CompiledTopologyV2> {
+        let (nodes, links) = self.topology_input(now)?;
+        compile_topology_v2(generation, route_epoch, nodes, links, allow_default_routes)
+    }
+
+    pub fn compile_local_snapshot(
+        &mut self,
+        generation: u64,
+        route_epoch: u32,
+        allow_default_routes: bool,
+        local_node: NodeIdV2,
+        now: SystemTime,
+    ) -> Result<DataplaneSnapshotV2> {
+        let (nodes, links) = self.topology_input(now)?;
+        compile_local_snapshot_v2(
+            generation,
+            route_epoch,
+            nodes,
+            links,
+            allow_default_routes,
+            local_node,
+        )
+    }
+
+    fn topology_input(
+        &mut self,
+        now: SystemTime,
+    ) -> Result<(Vec<TopologyNodeV2>, Vec<TopologyLinkV2>)> {
         self.prune(now)?;
         ensure!(!self.records.is_empty(), "V2 Presence directory is empty");
         let mut exclusions = self
@@ -383,7 +410,7 @@ impl PresenceDirectoryV2 {
                 });
             }
         }
-        compile_topology_v2(generation, route_epoch, nodes, links, allow_default_routes)
+        Ok((nodes, links))
     }
 }
 

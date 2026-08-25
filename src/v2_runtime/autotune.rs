@@ -15,9 +15,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{
     EndpointId, TransportAddr,
-    endpoint::{Bbr3Tunables, Connection, ControllerSnapshot},
+    endpoint::{Bbr3Tunables, Connection, ConnectionStats, ControllerSnapshot},
 };
-use ironet_policy_core::{BANDIT_POLICY_ID_V1, LearnerMemoryV1, LearnerStateV1, STATE_SCHEMA_V1};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -37,7 +36,6 @@ use crate::{
     protocol::v2::{
         fec::FecGeometryV2,
         learner::{LearnerModeV2, LearnerTraceV2},
-        memory::load as load_autotune_memory,
         policy::{
             api::{BbrEffectiveV1, PolicyBackend, PolicyFaultV1},
             runtime::WasmPolicyBackend,
@@ -45,9 +43,8 @@ use crate::{
             state::PolicyStateStoreV1,
         },
         policy_tick::{
-            PolicySlotKindV1, PolicySlotV1, PolicyTickConfigV1, PolicyTickV1, ShadowEvaluationV2,
-            ShadowEvaluatorV2, builtin_core_slot, derive_policy_seed,
-            peer_hash as policy_peer_hash,
+            PolicySlotV1, PolicyTickConfigV1, PolicyTickV1, ShadowEvaluationV2, ShadowEvaluatorV2,
+            builtin_core_slot, peer_hash as policy_peer_hash,
         },
         tuning::{
             AutoTuneBoundsV2, AutoTunerV2, Bbr3PresetV2, CoverTrafficProfileV2, ForcedActionV2,
@@ -57,386 +54,12 @@ use crate::{
     },
 };
 
-const ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES: u64 = 16 * 1024;
-const ADAPTIVE_CWND_FLOOR_MAX_BYTES: u64 = 8 * 1024 * 1024;
-pub(super) const LOW_RTT_CWND_FLOOR_BYTES: u64 = 512 * 1024;
-const CAPACITY_PROBE_EDGE_INTERVAL: Duration = Duration::from_millis(50);
+mod capacity_probe;
+mod controller;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum AdaptiveCwndFloorModeV2 {
-    #[default]
-    Probe,
-    Track,
-}
-
-/// Host-owned hysteresis for the telemetry-driven BBR floor.
-///
-/// A pure one-sample rule made a saturated flow alternate between a large
-/// floor and zero: the large floor drained the producer queue or briefly
-/// raised RTT, which removed the floor on the next one-second sample. Keep a
-/// small amount of per-path state so those expected consequences of probing
-/// become a transition to measured-BDP tracking instead of an on/off switch.
-#[derive(Debug, Clone, Copy, Default)]
-struct AdaptiveCwndFloorStateV2 {
-    path_epoch: u64,
-    mode: AdaptiveCwndFloorModeV2,
-    held_bytes: u64,
-    inactive_ticks: u8,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum InitialBulkProbeV2 {
-    /// No initial Bulk service has reached either edge detector yet.
-    #[default]
-    AwaitingEdge,
-    /// The first Bulk edge was observed inside the current telemetry window.
-    /// Cross the next sample boundary without publishing from that partial
-    /// interval. A hard-safe pressure observation may be retained for the
-    /// complete interval's one-shot decision.
-    AwaitingSampleBoundary,
-    /// The edge is now aligned to a sample boundary; the following tick is
-    /// the first complete post-edge interval and may make the decision.
-    AwaitingCompleteTick,
-    /// The initial epoch's one-shot decision has been consumed.
-    Consumed,
-}
-
-/// Per-connection edge detector for serviced Bulk traffic.
-///
-/// Control and latency traffic never increment the Bulk service counter, so
-/// this cross-layer signal can request capacity discovery without asking BBR
-/// to infer application semantics from ACK timing.
-#[derive(Debug, Clone, Copy, Default)]
-struct CapacityProbeStateV2 {
-    path_epoch: u64,
-    bulk_service_counter: u64,
-    bulk_active: bool,
-    bulk_idle_ticks: u8,
-    bulk_idle_verified: bool,
-    bulk_service_since_tick: bool,
-    /// An explicit path reset, or a fast edge that could not be published,
-    /// still owes the controller one capacity-discovery request. Initial
-    /// connection traffic is deliberately not represented by this flag.
-    probe_pending: bool,
-    initial_bulk_probe: InitialBulkProbeV2,
-    /// A partial initial-Bulk interval showed clean demand above the current
-    /// controller pacing rate. It is evidence only: publication still waits
-    /// for a complete, currently safe interval.
-    initial_clean_demand_seen: bool,
-    /// Set by `update` when this tick only establishes the initial Bulk
-    /// sample boundary. Other edge detectors must ignore the same partial
-    /// telemetry window so it cannot seed a later duplicate restart.
-    initial_sample_incomplete: bool,
-    previous_pacing_cap_bytes_per_second: Option<u64>,
-    loss_episode: bool,
-    loss_signal_latched: bool,
-    consecutive_clean_loss_ticks: u8,
-}
-
-fn controller_policer_episode_active(policer_pacing_transitions: u64) -> bool {
-    // A fixed absolute ceiling can be active at a 1.0 multiplicative scale.
-    // The controller's one-way transition counter is the episode marker.
-    policer_pacing_transitions != 0
-}
-
-impl CapacityProbeStateV2 {
-    fn initialize_bulk_service_counter(&mut self, path_epoch: u64, counter: u64) {
-        self.path_epoch = path_epoch;
-        self.bulk_service_counter = counter;
-        self.initial_bulk_probe = InitialBulkProbeV2::AwaitingEdge;
-        self.initial_clean_demand_seen = false;
-        self.initial_sample_incomplete = false;
-    }
-
-    fn reset_for_path(&mut self, path_epoch: u64) {
-        let bulk_service_counter = self.bulk_service_counter;
-        *self = Self {
-            path_epoch,
-            bulk_service_counter,
-            probe_pending: true,
-            initial_bulk_probe: InitialBulkProbeV2::Consumed,
-            ..Self::default()
-        };
-    }
-
-    /// Observe the cumulative Bulk service byte counter on the lightweight
-    /// edge tick. Initial Bulk traffic only marks a one-shot decision pending:
-    /// the complete one-second telemetry sample decides whether native Startup
-    /// underestimated clean demand without racing shallow-policer
-    /// classification. A later increase requests discovery only after the
-    /// ordinary telemetry path has verified a complete idle horizon (or an
-    /// explicit path reset left a request pending).
-    fn update_bulk_service_counter(&mut self, counter: u64) -> bool {
-        let increased = counter > self.bulk_service_counter;
-        self.bulk_service_counter = counter;
-        if !increased {
-            return false;
-        }
-
-        self.bulk_service_since_tick = true;
-        if self.bulk_active {
-            // Sustained service is positive application-epoch evidence even
-            // if ingress accounting momentarily lags. It must cancel any
-            // partial idle horizon rather than allowing a false re-edge.
-            self.bulk_idle_ticks = 0;
-            self.bulk_idle_verified = false;
-            return false;
-        }
-
-        let verified_new_epoch = self.bulk_idle_verified;
-        let request_capacity_probe = verified_new_epoch || self.probe_pending;
-        if !request_capacity_probe && self.initial_bulk_probe == InitialBulkProbeV2::AwaitingEdge {
-            self.initial_bulk_probe = InitialBulkProbeV2::AwaitingSampleBoundary;
-        }
-        self.bulk_active = true;
-        self.bulk_idle_ticks = 0;
-        self.bulk_idle_verified = false;
-        self.probe_pending = false;
-        // Whether this was the initial epoch or a verified reactivation, the
-        // edge has been consumed. A later backlog observation belongs to the
-        // same epoch and must not restart Startup again.
-        request_capacity_probe
-    }
-
-    fn cancel_bulk_service_edge(&mut self) {
-        self.bulk_active = false;
-        self.bulk_idle_ticks = 0;
-        self.bulk_idle_verified = false;
-        self.bulk_service_since_tick = false;
-        // This method is called only after a requested fast publication could
-        // not find controller tunables. Preserve that explicit request for
-        // the normal telemetry path without pretending idle was verified.
-        self.probe_pending = true;
-    }
-
-    fn update(
-        &mut self,
-        telemetry: PathTelemetryV2,
-        controller_policer_episode_active: bool,
-    ) -> bool {
-        self.initial_sample_incomplete = false;
-        if self.path_epoch == 0 {
-            // The first observed path is connection initialization, not a
-            // path migration. Its native controller Startup is sufficient.
-            self.path_epoch = telemetry.path_epoch;
-        } else if self.path_epoch != telemetry.path_epoch {
-            self.reset_for_path(telemetry.path_epoch);
-        }
-
-        let tun_ingress = telemetry.tun_ingress_bytes_per_second;
-        let producer_backlogged =
-            telemetry.packet_train_queue_bytes >= TX_ADMISSION_BATCH_BYTES as u64;
-        let bulk_serviced = std::mem::take(&mut self.bulk_service_since_tick);
-        // A retained controller-internal queue keeps an established Bulk
-        // epoch active, but cannot create an application epoch by itself.
-        let bulk_activity =
-            tun_ingress > 0 || bulk_serviced || (self.bulk_active && producer_backlogged);
-        let initial_probe_state = self.initial_bulk_probe;
-        let initial_complete_tick = initial_probe_state == InitialBulkProbeV2::AwaitingCompleteTick;
-        let initial_clean_demand_seen = self.initial_clean_demand_seen;
-        if initial_probe_state == InitialBulkProbeV2::AwaitingSampleBoundary {
-            // This sample may contain almost a full second from before the
-            // fast edge. Never publish from it, but retain a hard-safe clean
-            // pressure observation so a rate fall in the next full interval
-            // does not erase evidence that native Startup under-estimated the
-            // initial demand.
-            self.initial_clean_demand_seen =
-                initial_bulk_clean_demand_is_safe(telemetry, controller_policer_episode_active);
-            self.initial_bulk_probe = InitialBulkProbeV2::AwaitingCompleteTick;
-            self.initial_sample_incomplete = true;
-        } else if initial_complete_tick {
-            // Exactly one complete telemetry interval may decide the initial
-            // epoch. A later clean sample must never resurrect a decision
-            // suppressed by Startup, loss, or a policer transition.
-            self.initial_bulk_probe = InitialBulkProbeV2::Consumed;
-            self.initial_clean_demand_seen = false;
-        }
-        let verified_new_epoch = self.bulk_idle_verified;
-        if bulk_activity && self.bulk_active {
-            // A renewed Bulk byte or retained admission backlog belongs to
-            // the current epoch; a one-tick producer lull must not rearm a
-            // second capacity probe.
-            self.bulk_idle_ticks = 0;
-            self.bulk_idle_verified = false;
-            if initial_complete_tick {
-                return initial_bulk_capacity_probe_is_safe(
-                    telemetry,
-                    controller_policer_episode_active,
-                    initial_clean_demand_seen,
-                );
-            }
-        }
-        let new_active_epoch = bulk_activity && !self.bulk_active;
-        if new_active_epoch {
-            let initial_partial_tick = initial_probe_state == InitialBulkProbeV2::AwaitingEdge;
-            if initial_partial_tick {
-                // Without a preceding fast edge this is still the first
-                // boundary at which initial Bulk is known to be active. The
-                // following interval is the first one allowed to publish.
-                self.initial_clean_demand_seen =
-                    initial_bulk_clean_demand_is_safe(telemetry, controller_policer_episode_active);
-                self.initial_bulk_probe = InitialBulkProbeV2::AwaitingCompleteTick;
-                self.initial_sample_incomplete = true;
-            }
-            let request_capacity_probe = verified_new_epoch
-                || self.probe_pending
-                || (initial_complete_tick
-                    && initial_bulk_capacity_probe_is_safe(
-                        telemetry,
-                        controller_policer_episode_active,
-                        initial_clean_demand_seen,
-                    ));
-            self.bulk_active = true;
-            self.bulk_idle_verified = false;
-            self.probe_pending = false;
-            return request_capacity_probe;
-        }
-        if !bulk_activity && self.bulk_active {
-            self.bulk_idle_ticks = self.bulk_idle_ticks.saturating_add(1);
-            let idle_horizon = if controller_policer_episode_active {
-                5
-            } else {
-                2
-            };
-            if self.bulk_idle_ticks >= idle_horizon {
-                self.bulk_active = false;
-                self.bulk_idle_ticks = 0;
-                self.bulk_idle_verified = true;
-            }
-        }
-        false
-    }
-
-    fn update_loss_episode(
-        &mut self,
-        telemetry: PathTelemetryV2,
-        controller_policer_episode_active: bool,
-    ) -> bool {
-        if telemetry.path_epoch != self.path_epoch {
-            self.reset_for_path(telemetry.path_epoch);
-            return false;
-        }
-        // A controller-confirmed shallow-policer episode is expected to turn
-        // a lossy probe into clean delivery. Treating those clean ticks as a
-        // recovery edge would restart Startup, discard the fixed ceiling and
-        // recreate the same loss. A true idle/new-Bulk epoch is still handled
-        // by `update`/the fast Bulk service edge, and a path change resets all
-        // state above.
-        if controller_policer_episode_active {
-            self.loss_episode = false;
-            self.loss_signal_latched = false;
-            self.consecutive_clean_loss_ticks = 0;
-            return false;
-        }
-        if telemetry.tun_ingress_bytes_per_second == 0 {
-            self.loss_episode = false;
-            self.loss_signal_latched = false;
-            self.consecutive_clean_loss_ticks = 0;
-            return false;
-        }
-
-        const LOSS_EPISODE_THRESHOLD_PPM: u32 = 10_000;
-        let episode_signal = telemetry.loss_ppm >= LOSS_EPISODE_THRESHOLD_PPM
-            || telemetry.residual_loss_ppm >= LOSS_EPISODE_THRESHOLD_PPM
-            || telemetry.burst_loss_cells >= 3;
-        if !episode_signal {
-            self.loss_signal_latched = false;
-        } else if !self.loss_signal_latched {
-            self.loss_signal_latched = true;
-            self.loss_episode = true;
-            self.consecutive_clean_loss_ticks = 0;
-            return false;
-        }
-        if !self.loss_episode {
-            return false;
-        }
-        if telemetry.loss_ppm != 0 || telemetry.residual_loss_ppm != 0 {
-            self.consecutive_clean_loss_ticks = 0;
-            return false;
-        }
-
-        self.consecutive_clean_loss_ticks = self.consecutive_clean_loss_ticks.saturating_add(1);
-        if self.consecutive_clean_loss_ticks < 2 {
-            return false;
-        }
-        self.loss_episode = false;
-        self.consecutive_clean_loss_ticks = 0;
-        true
-    }
-
-    fn update_loss_episode_if_complete(
-        &mut self,
-        telemetry: PathTelemetryV2,
-        controller_policer_episode_active: bool,
-    ) -> bool {
-        !self.initial_sample_incomplete
-            && self.update_loss_episode(telemetry, controller_policer_episode_active)
-    }
-
-    fn update_pacing_cap(&mut self, pacing_cap_bytes_per_second: u64, tun_active: bool) -> bool {
-        let released = tun_active
-            && self
-                .previous_pacing_cap_bytes_per_second
-                .is_some_and(|previous| previous > 0 && pacing_cap_bytes_per_second == 0);
-        self.previous_pacing_cap_bytes_per_second = Some(pacing_cap_bytes_per_second);
-        released
-    }
-
-    fn update_pacing_cap_if_complete(
-        &mut self,
-        pacing_cap_bytes_per_second: u64,
-        tun_active: bool,
-    ) -> bool {
-        if self.initial_sample_incomplete {
-            // A cap transition inside the discarded partial interval is not
-            // a capacity-discovery edge. Still advance the remembered value:
-            // otherwise a release that happened in this interval would be
-            // reported one tick late, after the complete initial-Bulk sample
-            // has already made its own one-shot decision.
-            self.previous_pacing_cap_bytes_per_second = Some(pacing_cap_bytes_per_second);
-            return false;
-        }
-        self.update_pacing_cap(pacing_cap_bytes_per_second, tun_active)
-    }
-}
-
-fn initial_bulk_capacity_probe_is_safe(
-    telemetry: PathTelemetryV2,
-    controller_policer_episode_active: bool,
-    initial_clean_demand_seen: bool,
-) -> bool {
-    initial_bulk_sample_is_safe(telemetry, controller_policer_episode_active)
-        && (initial_clean_demand_seen
-            || telemetry.tun_ingress_bytes_per_second
-                > telemetry.controller_pacing_rate_bytes_per_second)
-}
-
-fn initial_bulk_clean_demand_is_safe(
-    telemetry: PathTelemetryV2,
-    controller_policer_episode_active: bool,
-) -> bool {
-    initial_bulk_sample_is_safe(telemetry, controller_policer_episode_active)
-        && telemetry.tun_ingress_bytes_per_second
-            > telemetry.controller_pacing_rate_bytes_per_second
-}
-
-fn initial_bulk_sample_is_safe(
-    telemetry: PathTelemetryV2,
-    controller_policer_episode_active: bool,
-) -> bool {
-    !controller_policer_episode_active
-        && telemetry.controller_state != 0
-        && telemetry.loss_ppm == 0
-        && telemetry.residual_loss_ppm == 0
-        && telemetry.burst_loss_cells == 0
-}
-
-fn fast_capacity_probe_path_matches(current_identity: &str, selected_identity: &str) -> bool {
-    // Before the first complete sample there is no path-owned state to
-    // publish. During migration, let the normal tick advance the path epoch
-    // and reset the state before any edge can touch the new path's tunables.
-    !current_identity.is_empty() && current_identity == selected_identity
-}
+use capacity_probe::*;
+pub(super) use controller::LOW_RTT_CWND_FLOOR_BYTES;
+use controller::*;
 
 #[derive(Debug, Clone, Copy)]
 struct AutotuneTapSampleV2<'a> {
@@ -640,321 +263,6 @@ fn autotune_tap_record(
     })
 }
 
-fn quantize_adaptive_cwnd_floor(bytes: u64) -> u64 {
-    bytes
-        .min(ADAPTIVE_CWND_FLOOR_MAX_BYTES)
-        .div_ceil(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
-        .saturating_mul(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
-        .min(ADAPTIVE_CWND_FLOOR_MAX_BYTES)
-}
-
-fn measured_cwnd_floor(telemetry: PathTelemetryV2, effective: &BbrEffectiveV1) -> u64 {
-    let demand_rate = telemetry
-        .tun_ingress_bytes_per_second
-        .max(telemetry.delivery_rate_bytes_per_second)
-        .max(telemetry.real_traffic_bytes_per_second);
-    cwnd_floor_for_rate(demand_rate, telemetry.min_rtt, effective)
-}
-
-fn cwnd_floor_for_rate(
-    rate_bytes_per_second: u64,
-    min_rtt: Duration,
-    effective: &BbrEffectiveV1,
-) -> u64 {
-    let bdp = u128::from(rate_bytes_per_second).saturating_mul(min_rtt.as_micros()) / 1_000_000;
-    quantize_adaptive_cwnd_floor(
-        bdp.saturating_mul(u128::from(effective.default_cwnd_gain_milli))
-            .div_ceil(1_000)
-            .min(u128::from(ADAPTIVE_CWND_FLOOR_MAX_BYTES)) as u64,
-    )
-}
-
-impl AdaptiveCwndFloorStateV2 {
-    fn clear(&mut self, path_epoch: u64) -> u64 {
-        self.path_epoch = path_epoch;
-        self.mode = AdaptiveCwndFloorModeV2::Probe;
-        self.held_bytes = 0;
-        self.inactive_ticks = 0;
-        0
-    }
-
-    fn update(
-        &mut self,
-        telemetry: PathTelemetryV2,
-        effective: &BbrEffectiveV1,
-        congestion_window_bytes: u64,
-    ) -> u64 {
-        if self.path_epoch != telemetry.path_epoch {
-            self.clear(telemetry.path_epoch);
-        }
-        if telemetry.reliability != PathReliability::Datagram
-            || effective.loss_is_congestion
-            || telemetry.controller_app_limited
-            || telemetry.cpu_utilization_per_mille >= 900
-            || telemetry.min_rtt.is_zero()
-        {
-            return self.clear(telemetry.path_epoch);
-        }
-
-        let demand_rate = telemetry
-            .tun_ingress_bytes_per_second
-            .max(telemetry.delivery_rate_bytes_per_second)
-            .max(telemetry.real_traffic_bytes_per_second);
-        if demand_rate == 0 && telemetry.packet_train_queue_bytes == 0 {
-            self.inactive_ticks = self.inactive_ticks.saturating_add(1);
-            if self.inactive_ticks >= 2 {
-                return self.clear(telemetry.path_epoch);
-            }
-            return self.held_bytes;
-        }
-        self.inactive_ticks = 0;
-
-        let measured = measured_cwnd_floor(telemetry, effective);
-        let modeled = cwnd_floor_for_rate(
-            telemetry.controller_bw_bytes_per_second,
-            telemetry.min_rtt,
-            effective,
-        );
-        let queue_budget = Duration::from_millis(5).max(telemetry.min_rtt / 2);
-        let queue_inflated = telemetry.queue_delay > queue_budget;
-        let producer_queued = telemetry.packet_train_queue_bytes >= TX_ADMISSION_BATCH_BYTES as u64;
-        let cwnd_matches_model = modeled != 0
-            && u128::from(congestion_window_bytes).saturating_mul(4)
-                >= u128::from(modeled).saturating_mul(3)
-            && u128::from(congestion_window_bytes).saturating_mul(4)
-                <= u128::from(modeled).saturating_mul(5);
-        let controller_model_is_serving_demand =
-            telemetry.controller_bw_bytes_per_second >= demand_rate;
-        // Startup is itself an active capacity probe.  A model that happens
-        // to match its still-growing cwnd must not retire the host floor: the
-        // producer backlog is evidence that Startup still needs room to
-        // discover capacity.  Once Startup has exited, matching model/cwnd
-        // evidence is sufficient to switch to bounded BDP tracking.
-        let controller_has_exited_startup = telemetry.controller_state != 0;
-
-        self.held_bytes = match self.mode {
-            AdaptiveCwndFloorModeV2::Probe if queue_inflated => {
-                // The probe found the bottleneck. Retire its overshoot, but
-                // retain the measured BDP instead of dropping to zero.
-                self.mode = AdaptiveCwndFloorModeV2::Track;
-                measured
-            }
-            AdaptiveCwndFloorModeV2::Probe
-                if controller_has_exited_startup
-                    && producer_queued
-                    && cwnd_matches_model
-                    && controller_model_is_serving_demand =>
-            {
-                // BBR already has a capacity model and its current cwnd is
-                // within one bounded step of that model's BDP. Doubling here
-                // is not discovery: it is a host-created overshoot. Track the
-                // larger of live demand and the controller model directly.
-                self.mode = AdaptiveCwndFloorModeV2::Track;
-                measured.max(modeled)
-            }
-            AdaptiveCwndFloorModeV2::Probe if producer_queued => {
-                // Recovery from an underfilled model still needs an explicit
-                // upward probe; a measured-only floor can be self-limiting.
-                let probe = congestion_window_bytes
-                    .max(ADAPTIVE_CWND_FLOOR_QUANTUM_BYTES)
-                    .saturating_mul(2);
-                measured.max(quantize_adaptive_cwnd_floor(probe))
-            }
-            AdaptiveCwndFloorModeV2::Probe => {
-                // Draining one admission batch is not proof that producer
-                // demand ended. Hold the last probe until the queue returns or
-                // all traffic-rate evidence becomes idle.
-                if self.held_bytes == 0 {
-                    0
-                } else {
-                    self.held_bytes.max(measured)
-                }
-            }
-            AdaptiveCwndFloorModeV2::Track if queue_inflated => {
-                // Congestion may reduce immediately to the measured target;
-                // it must never increase a held floor.
-                self.held_bytes.min(measured)
-            }
-            AdaptiveCwndFloorModeV2::Track => {
-                // Smooth rate-estimator noise while retaining bounded upward
-                // adaptation after a real capacity increase.
-                let lower = quantize_adaptive_cwnd_floor(self.held_bytes.saturating_mul(3) / 4);
-                let upper =
-                    quantize_adaptive_cwnd_floor(self.held_bytes.saturating_mul(5).div_ceil(4));
-                measured.clamp(lower, upper)
-            }
-        };
-        self.held_bytes
-    }
-}
-
-#[cfg(test)]
-fn adaptive_cwnd_floor(
-    telemetry: PathTelemetryV2,
-    effective: &BbrEffectiveV1,
-    congestion_window_bytes: u64,
-) -> u64 {
-    AdaptiveCwndFloorStateV2::default().update(telemetry, effective, congestion_window_bytes)
-}
-
-/// Finalize the host-owned, telemetry-dependent BBR floor before publication.
-///
-/// Policy guardrails already produced every static BBR value. The host adds
-/// the live adaptive floor exactly once here, then constrains the combined
-/// value to an explicit nonzero cap. The return value remains the
-/// telemetry-only addition for the autotune tap; `effective` is the complete
-/// value subsequently written to the controller.
-#[cfg(test)]
-fn finalize_bbr3_effective(
-    telemetry: PathTelemetryV2,
-    congestion_window_bytes: u64,
-    effective: &mut BbrEffectiveV1,
-) -> u64 {
-    let adaptive_cwnd_floor = adaptive_cwnd_floor(telemetry, effective, congestion_window_bytes);
-    let combined_floor = effective.cwnd_floor_bytes.max(adaptive_cwnd_floor);
-    effective.cwnd_floor_bytes = if effective.cwnd_cap_bytes == 0 {
-        combined_floor
-    } else {
-        combined_floor.min(effective.cwnd_cap_bytes)
-    };
-    adaptive_cwnd_floor
-}
-
-fn finalize_bbr3_effective_with_state(
-    state: &mut AdaptiveCwndFloorStateV2,
-    telemetry: PathTelemetryV2,
-    congestion_window_bytes: u64,
-    effective: &mut BbrEffectiveV1,
-) -> u64 {
-    let adaptive_cwnd_floor = state.update(telemetry, effective, congestion_window_bytes);
-    let combined_floor = effective.cwnd_floor_bytes.max(adaptive_cwnd_floor);
-    effective.cwnd_floor_bytes = if effective.cwnd_cap_bytes == 0 {
-        combined_floor
-    } else {
-        combined_floor.min(effective.cwnd_cap_bytes)
-    };
-    adaptive_cwnd_floor
-}
-
-/// Write an already-finalized BBR action onto the shared controller tunables.
-/// The controller re-reads the tunables at the next packet-timed round
-/// boundary, so a partially published snapshot never takes effect mid-round.
-/// Returns whether any tunable changed (and bumps the generation then).
-fn apply_bbr3_effective(tunables: &Bbr3Tunables, effective: &BbrEffectiveV1) -> bool {
-    fn update_u32(value: &AtomicU32, next: u32) -> bool {
-        value.swap(next, Ordering::Relaxed) != next
-    }
-    fn update_u64(value: &AtomicU64, next: u64) -> bool {
-        value.swap(next, Ordering::Relaxed) != next
-    }
-    fn update_u8(value: &AtomicU8, next: u8) -> bool {
-        value.swap(next, Ordering::Relaxed) != next
-    }
-
-    let mut changed = false;
-    changed |= update_u32(
-        &tunables.probe_bw_up_pacing_gain_milli,
-        effective.probe_bw_up_pacing_gain_milli,
-    );
-    changed |= update_u32(
-        &tunables.probe_bw_down_pacing_gain_milli,
-        effective.probe_bw_down_pacing_gain_milli,
-    );
-    changed |= update_u32(
-        &tunables.cruise_pacing_gain_milli,
-        effective.cruise_pacing_gain_milli,
-    );
-    changed |= update_u32(
-        &tunables.default_cwnd_gain_milli,
-        effective.default_cwnd_gain_milli,
-    );
-    changed |= update_u32(
-        &tunables.probe_bw_up_cwnd_gain_milli,
-        effective.probe_bw_up_cwnd_gain_milli,
-    );
-    changed |= update_u32(&tunables.headroom_milli, effective.headroom_milli);
-    changed |= update_u32(&tunables.beta_milli, effective.beta_milli);
-    changed |= update_u32(&tunables.loss_thresh_milli, effective.loss_threshold_milli);
-    changed |= update_u8(
-        &tunables.loss_is_congestion,
-        u8::from(effective.loss_is_congestion),
-    );
-    changed |= update_u32(
-        &tunables.queue_delay_guard_inflation_milli,
-        effective.queue_guard_inflation_milli,
-    );
-    changed |= update_u64(
-        &tunables.queue_delay_guard_slack_micros,
-        effective.queue_guard_slack_micros,
-    );
-    changed |= update_u64(
-        &tunables.probe_rtt_interval_millis,
-        effective.probe_rtt_interval_millis,
-    );
-    changed |= update_u64(
-        &tunables.probe_rtt_duration_millis,
-        effective.probe_rtt_duration_millis,
-    );
-    changed |= update_u32(
-        &tunables.probe_rtt_cwnd_gain_milli,
-        effective.probe_rtt_cwnd_gain_milli,
-    );
-    changed |= update_u64(
-        &tunables.min_probe_wait_millis,
-        effective.min_probe_wait_millis,
-    );
-    changed |= update_u64(
-        &tunables.max_added_probe_wait_millis,
-        effective.max_added_probe_wait_millis,
-    );
-    changed |= update_u64(
-        &tunables.pacing_rate_cap_bytes_per_second,
-        effective.pacing_cap_bytes_per_second,
-    );
-    changed |= update_u64(&tunables.cwnd_floor_bytes, effective.cwnd_floor_bytes);
-    changed |= update_u64(&tunables.cwnd_cap_bytes, effective.cwnd_cap_bytes);
-    changed |= update_u64(
-        &tunables.startup_bw_hint_bytes_per_second,
-        effective.startup_bw_hint_bytes_per_second,
-    );
-    if changed {
-        tunables.generation.fetch_add(1, Ordering::Release);
-    }
-    changed
-}
-
-/// Publish one capacity-discovery edge without waiting for a full policy tick.
-fn publish_capacity_probe(tunables: &Bbr3Tunables) {
-    tunables
-        .capacity_probe_generation
-        .fetch_add(1, Ordering::Relaxed);
-    tunables.generation.fetch_add(1, Ordering::Release);
-}
-
-/// Publish policy tunables and an optional real-TUN capacity-discovery edge
-/// as one controller-visible generation. The dedicated generation is bumped
-/// before the release publication so BBR cannot observe a request half-way
-/// through the tunable update.
-fn publish_bbr3_effective(
-    tunables: &Bbr3Tunables,
-    effective: &BbrEffectiveV1,
-    request_capacity_probe: bool,
-) -> bool {
-    if request_capacity_probe {
-        tunables
-            .capacity_probe_generation
-            .fetch_add(1, Ordering::Relaxed);
-    }
-    let changed = apply_bbr3_effective(tunables, effective);
-    if request_capacity_probe && !changed {
-        // `apply_bbr3_effective` did not publish a generation for the probe.
-        // The capacity generation was already incremented above, so only the
-        // paired Release store remains here.
-        tunables.generation.fetch_add(1, Ordering::Release);
-    }
-    changed || request_capacity_probe
-}
-
 fn parse_forced_usize(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,
@@ -1132,6 +440,56 @@ struct WasmWarmupV1 {
     healthy_ticks: u64,
 }
 
+type WasmReloadResultV1 = Result<Option<(WasmPolicyBackend, [u8; 32])>>;
+type WasmReloadTaskV1 = tokio::task::JoinHandle<WasmReloadResultV1>;
+
+enum LiveReloadPhaseV1 {
+    Idle,
+    Loading(WasmReloadTaskV1),
+    Warming(Box<WasmWarmupV1>),
+}
+
+enum ShadowReloadPhaseV1 {
+    Idle,
+    Loading(WasmReloadTaskV1),
+}
+
+struct PolicyReloadStateV1 {
+    tick: u8,
+    live_seen_hash: Option<[u8; 32]>,
+    live_phase: LiveReloadPhaseV1,
+    last_live_error: Option<String>,
+    shadow_seen_hash: Option<[u8; 32]>,
+    shadow_phase: ShadowReloadPhaseV1,
+    last_shadow_error: Option<String>,
+}
+
+impl PolicyReloadStateV1 {
+    fn new(
+        live_seen_hash: Option<[u8; 32]>,
+        shadow_seen_hash: Option<[u8; 32]>,
+        last_shadow_error: Option<String>,
+    ) -> Self {
+        Self {
+            tick: 0,
+            live_seen_hash,
+            live_phase: LiveReloadPhaseV1::Idle,
+            last_live_error: None,
+            shadow_seen_hash,
+            shadow_phase: ShadowReloadPhaseV1::Idle,
+            last_shadow_error,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    fn scan_due(&self) -> bool {
+        self.tick.is_multiple_of(5)
+    }
+}
+
 /// Read and verified-load a `.wasm` policy component: read into a private
 /// buffer, parse/verify against the sealed trust store, compile (cached by
 /// package digest), instantiate and self-check. Also returns the whole-file
@@ -1148,17 +506,43 @@ fn load_wasm_backend(
     );
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let file_hash = *blake3::hash(&bytes).as_bytes();
+    Ok((
+        load_wasm_backend_from_bytes(runtime_state, &bytes)?,
+        file_hash,
+    ))
+}
+
+fn load_changed_wasm_backend(
+    runtime_state: &V2RuntimeState,
+    path: &std::path::Path,
+    seen_hash: Option<[u8; 32]>,
+) -> Result<Option<(WasmPolicyBackend, [u8; 32])>> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let file_hash = *blake3::hash(&bytes).as_bytes();
+    if seen_hash == Some(file_hash) {
+        return Ok(None);
+    }
+    Ok(Some((
+        load_wasm_backend_from_bytes(runtime_state, &bytes)?,
+        file_hash,
+    )))
+}
+
+fn load_wasm_backend_from_bytes(
+    runtime_state: &V2RuntimeState,
+    bytes: &[u8],
+) -> Result<WasmPolicyBackend> {
     let trust = TrustStoreV1::from_config(&runtime_state.autotune.wasm)?;
     let loader = runtime_state
         .policy_loader()
         .context("policy WASM engine unavailable")?;
     let backend = loader.load_from_bytes(
-        &bytes,
+        bytes,
         &runtime_state.autotune.wasm,
         &trust,
         chrono::Utc::now(),
     )?;
-    Ok((backend, file_hash))
+    Ok(backend)
 }
 
 /// Load a `.wasm` policy component into a live slot (see
@@ -1203,77 +587,67 @@ fn shadow_evaluator_for_backend(
     shadow
 }
 
-/// Restore the live slot state for `peer`: the new state file when present,
-/// otherwise a one-time warm start from the legacy `memory.rs` JSON file
-/// (only meaningful for the bandit learner's state schema, whether it ran
-/// through the native core builtin slot or an external component).
-fn restore_policy_state(
-    store: &PolicyStateStoreV1,
-    slot: &mut PolicySlotV1,
-    legacy_dir: &std::path::Path,
-    peer: &str,
-    peer_hash: [u8; 32],
-) {
-    let identity = slot.identity().clone();
-    if let Some(state) = store.load(&identity.policy_id, identity.state_schema, peer) {
-        debug!(
-            peer,
-            policy_id = %identity.policy_id,
-            state_schema = identity.state_schema,
-            state_bytes = state.len(),
-            "restored V2 policy state"
-        );
-        slot.set_state(state);
-        return;
-    }
-    if identity.state_schema != STATE_SCHEMA_V1 || identity.policy_id != BANDIT_POLICY_ID_V1 {
-        return;
-    }
-    match load_autotune_memory(legacy_dir, peer, &identity.policy_id) {
-        Ok(Some(memory)) => {
-            let seed = derive_policy_seed(
-                PolicySlotKindV1::Live,
-                &identity.policy_id,
-                identity.state_schema,
-                &peer_hash,
-                1,
-            );
-            match LearnerStateV1::from_memory(&LearnerMemoryV1::from(&memory.learner), seed, 0)
-                .encode()
-            {
-                Ok(state) => {
-                    info!(
-                        peer,
-                        policy_id = %identity.policy_id,
-                        contexts = memory.learner.contexts.len(),
-                        "warm-started V2 policy state from legacy autotune memory"
-                    );
-                    slot.set_state(state);
-                    slot.mark_dirty();
-                }
-                Err(error) => warn!(peer, %error, "ignored legacy V2 autotune memory"),
-            }
-        }
-        Ok(None) => {}
-        Err(error) => warn!(peer, %error, "ignored invalid V2 autotune memory"),
-    }
+struct PolicyPersistenceV1 {
+    store: Option<PolicyStateStoreV1>,
+    peer: String,
+    last_flush: Instant,
 }
 
-fn flush_policy_state(
-    store: &PolicyStateStoreV1,
-    slot: &mut PolicySlotV1,
-    peer: &str,
-) -> Result<()> {
-    let identity = slot.identity();
-    store.save(
-        &identity.policy_id,
-        identity.state_schema,
-        peer,
-        slot.module_digest(),
-        slot.state(),
-    )?;
-    slot.mark_flushed();
-    Ok(())
+impl PolicyPersistenceV1 {
+    fn new(store: Option<PolicyStateStoreV1>, peer: String, now: Instant) -> Self {
+        Self {
+            store,
+            peer,
+            last_flush: now,
+        }
+    }
+
+    fn restore(&self, slot: &mut PolicySlotV1) {
+        let Some(store) = &self.store else { return };
+        let identity = slot.identity().clone();
+        if let Some(state) = store.load(&identity.policy_id, identity.state_schema, &self.peer) {
+            debug!(
+                peer = %self.peer,
+                policy_id = %identity.policy_id,
+                state_schema = identity.state_schema,
+                state_bytes = state.len(),
+                "restored V2 policy state"
+            );
+            slot.set_state(state);
+        }
+    }
+
+    fn flush(&mut self, slot: &mut PolicySlotV1, now: Instant) -> Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        if !slot.is_dirty() {
+            return Ok(());
+        }
+        let identity = slot.identity();
+        store.save(
+            &identity.policy_id,
+            identity.state_schema,
+            &self.peer,
+            slot.module_digest(),
+            slot.state(),
+        )?;
+        slot.mark_flushed();
+        self.last_flush = now;
+        Ok(())
+    }
+
+    fn flush_if_due(&mut self, slot: &mut PolicySlotV1, now: Instant) -> Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        if slot.is_dirty()
+            && now.saturating_duration_since(self.last_flush) >= store.flush_interval()
+        {
+            self.flush(slot, now)?;
+        }
+        Ok(())
+    }
 }
 
 fn autotune_force_from_env() -> Result<Option<ForcedActionV2>> {
@@ -1319,6 +693,136 @@ fn constrain_learned_policy_action(
         .constrain_candidate(telemetry, &candidate, &base)
         .0
         .to_tune_decision()
+}
+
+const REMOTE_FEEDBACK_TTL: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RemoteFeedbackRatesV2 {
+    sequence: u64,
+    wasted_parity_per_mille: u16,
+    fec_recovery_per_mille: u16,
+    repair_hit_per_mille: u16,
+    repair_response_latency: Duration,
+    receiver_goodput_bytes_per_second: u64,
+    reorder_ppm: u32,
+    residual_loss_ppm: u32,
+    burst_loss_cells: u16,
+    expired_stripes_delta: u64,
+    repair_completed_requests: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RemoteFeedbackWindowV2 {
+    previous: RemoteFeedbackSnapshot,
+    rates: RemoteFeedbackRatesV2,
+    expires_at: Instant,
+}
+
+impl RemoteFeedbackWindowV2 {
+    fn capture(metrics: &RuntimeMetrics, now: Instant) -> Self {
+        let sequence = metrics.remote_feedback_sequence.load(Ordering::Acquire);
+        Self {
+            previous: RemoteFeedbackSnapshot::capture(metrics, sequence, now),
+            rates: RemoteFeedbackRatesV2 {
+                sequence,
+                ..RemoteFeedbackRatesV2::default()
+            },
+            expires_at: now,
+        }
+    }
+
+    fn sample(&mut self, metrics: &RuntimeMetrics, now: Instant) -> RemoteFeedbackRatesV2 {
+        let sequence = metrics.remote_feedback_sequence.load(Ordering::Acquire);
+        if sequence == self.previous.sequence {
+            self.rates.expired_stripes_delta = 0;
+            if now >= self.expires_at {
+                let sequence = self.rates.sequence;
+                let repair_completed_requests = self.rates.repair_completed_requests;
+                self.rates = RemoteFeedbackRatesV2 {
+                    sequence,
+                    repair_completed_requests,
+                    ..RemoteFeedbackRatesV2::default()
+                };
+            }
+            return self.rates;
+        }
+
+        let current = RemoteFeedbackSnapshot::capture(metrics, sequence, now);
+        let delta = current.counter_delta(self.previous);
+        let elapsed = now.saturating_duration_since(self.previous.at);
+        let loss_runs = delta
+            .loss_run_1
+            .saturating_add(delta.loss_run_2)
+            .saturating_add(delta.loss_run_3_4)
+            .saturating_add(delta.loss_run_5_plus);
+        let weighted_loss_cells = delta
+            .loss_run_1
+            .saturating_add(delta.loss_run_2.saturating_mul(2))
+            .saturating_add(delta.loss_run_3_4.saturating_mul(4))
+            .saturating_add(delta.loss_run_5_plus.saturating_mul(5));
+        self.rates = RemoteFeedbackRatesV2 {
+            sequence,
+            wasted_parity_per_mille: ratio_per_thousand(delta.fec_wasted, delta.fec_parity),
+            fec_recovery_per_mille: ratio_per_thousand(delta.fec_recovered, delta.fec_parity),
+            repair_hit_per_mille: ratio_per_thousand(
+                delta.repair_received,
+                delta.repair_completed_requested,
+            ),
+            repair_response_latency: Duration::from_micros(
+                delta
+                    .repair_latency_micros
+                    .checked_div(delta.repair_completed)
+                    .unwrap_or_default(),
+            ),
+            receiver_goodput_bytes_per_second: rate_per_second(delta.delivered_payload, elapsed),
+            reorder_ppm: ratio_per_million(delta.reorder_cells, delta.sent_data_cells),
+            residual_loss_ppm: ratio_per_million(delta.missing_cells, delta.sent_data_cells),
+            burst_loss_cells: weighted_loss_cells
+                .checked_div(loss_runs)
+                .unwrap_or_default()
+                .min(u64::from(u16::MAX)) as u16,
+            expired_stripes_delta: delta.expired_trains,
+            repair_completed_requests: current.repair_completed,
+        };
+        self.previous = current;
+        self.expires_at = now.checked_add(REMOTE_FEEDBACK_TTL).unwrap_or(now);
+        self.rates
+    }
+}
+
+struct PathTelemetryWindowV2 {
+    previous: ConnectionStats,
+    previous_sample_at: Instant,
+    sample_counters: SampleCounterSnapshot,
+    status_counters: StatusCounterSnapshot,
+    identity: String,
+    epoch: u64,
+    previous_guard_transitions: u64,
+    failures: u64,
+}
+
+impl PathTelemetryWindowV2 {
+    fn capture(connection: &Connection, metrics: &RuntimeMetrics, now: Instant) -> Self {
+        let previous = connection.stats();
+        let tx_bytes = TxByteSnapshotV2::load(metrics, previous.udp_tx.bytes);
+        let sample_counters = SampleCounterSnapshot::capture_with_tx(metrics, tx_bytes);
+        Self {
+            previous,
+            previous_sample_at: now,
+            sample_counters,
+            status_counters: StatusCounterSnapshot::capture_with_tx(
+                metrics,
+                tx_bytes,
+                sample_counters.real_bytes,
+                now,
+            ),
+            identity: String::new(),
+            epoch: 1,
+            previous_guard_transitions: 0,
+            failures: 0,
+        }
+    }
 }
 
 pub(super) async fn tuner_loop(
@@ -1451,16 +955,8 @@ pub(super) async fn tuner_loop(
             usize::try_from(runtime_state.autotune.wasm.maximum_state_bytes).unwrap_or(usize::MAX),
         )
     });
-    if let Some(store) = &state_store {
-        restore_policy_state(
-            store,
-            tick.live_mut(),
-            &runtime_state.autotune_state_dir,
-            &peer_name,
-            peer_hash,
-        );
-    }
-    let mut last_state_flush = Instant::now();
+    let mut persistence = PolicyPersistenceV1::new(state_store, peer_name, Instant::now());
+    persistence.restore(tick.live_mut());
     let mut last_policy_fault: Option<PolicyFaultV1> = None;
     if let Some(forced_action) = forced_action {
         info!(
@@ -1469,46 +965,20 @@ pub(super) async fn tuner_loop(
             "enabled guarded IRONET_AUTOTUNE_FORCE experiment"
         );
     }
-    let mut previous = connection.stats();
     let initial_sample_at = Instant::now();
-    let initial_tx_bytes = TxByteSnapshotV2::load(&metrics, previous.udp_tx.bytes);
-    let initial_sample_counters =
-        SampleCounterSnapshot::capture_with_tx(&metrics, initial_tx_bytes);
-    let mut sample_counters = initial_sample_counters;
-    let mut previous_sample_at = initial_sample_at;
-    let mut status_counters = StatusCounterSnapshot::capture_with_tx(
-        &metrics,
-        initial_tx_bytes,
-        initial_sample_counters.real_bytes,
-        Instant::now(),
-    );
-    let remote_feedback_sequence = metrics.remote_feedback_sequence.load(Ordering::Acquire);
-    let mut remote_feedback =
-        RemoteFeedbackSnapshot::capture(&metrics, remote_feedback_sequence, Instant::now());
-    let mut remote_wasted_parity_per_mille = 0_u16;
-    let mut remote_fec_recovery_per_mille = 0_u16;
-    let mut remote_repair_hit_per_mille = 0_u16;
-    let mut remote_repair_response_latency = Duration::ZERO;
-    let mut remote_receiver_goodput_bytes_per_second = 0_u64;
-    let mut remote_reorder_ppm = 0_u32;
-    let mut remote_residual_loss_ppm = 0_u32;
-    let mut remote_burst_loss_cells = 0_u16;
-    let mut path_identity = String::new();
-    let mut path_epoch = 1_u64;
+    let mut telemetry_window =
+        PathTelemetryWindowV2::capture(&connection, &metrics, initial_sample_at);
+    let mut remote_feedback = RemoteFeedbackWindowV2::capture(&metrics, Instant::now());
     let mut adaptive_cwnd_floor_state = AdaptiveCwndFloorStateV2::default();
     let mut capacity_probe_state = CapacityProbeStateV2::default();
     capacity_probe_state.initialize_bulk_service_counter(
-        path_epoch,
+        telemetry_window.epoch,
         metrics.bulk_service_bytes.load(Ordering::Relaxed),
     );
-    let mut minimum_rtt = Duration::MAX;
-    let mut previous_controller_guard_transitions = 0_u64;
-    let mut telemetry_failures = 0_u64;
-    let mut policy_reload_tick = 0_u8;
-    let mut wasm_pending: Option<tokio::task::JoinHandle<Result<WasmPolicyBackend>>> = None;
-    let mut wasm_warmup: Option<WasmWarmupV1> = None;
-    let mut last_wasm_reload_error: Option<String> = None;
-    let mut shadow_pending: Option<tokio::task::JoinHandle<Result<WasmPolicyBackend>>> = None;
+    capacity_probe_state
+        .initialize_bulk_admission_counter(metrics.bulk_admission_bytes.load(Ordering::Relaxed));
+    let mut reload =
+        PolicyReloadStateV1::new(wasm_seen_hash, shadow_seen_hash, last_shadow_reload_error);
     interval.tick().await;
     capacity_probe_edge_interval.tick().await;
     loop {
@@ -1519,20 +989,53 @@ pub(super) async fn tuner_loop(
         };
         if !full_policy_tick {
             let bulk_service_counter = metrics.bulk_service_bytes.load(Ordering::Relaxed);
+            let bulk_admission_counter = metrics.bulk_admission_bytes.load(Ordering::Relaxed);
             let path_sample = selected_path_sample(&connection).ok();
             let path_matches = path_sample.as_ref().is_some_and(|sample| {
-                fast_capacity_probe_path_matches(&path_identity, &sample.identity)
+                fast_capacity_probe_path_matches(&telemetry_window.identity, &sample.identity)
             });
-            if path_matches
-                && capacity_probe_state.update_bulk_service_counter(bulk_service_counter)
-            {
+            let capacity_probe_reason = path_matches.then(|| {
+                let reactivated_after_idle =
+                    capacity_probe_state.update_bulk_service_counter(bulk_service_counter);
+                capacity_probe_state.update_bulk_admission_counter(bulk_admission_counter);
+                if reactivated_after_idle {
+                    Some("bulk_service_reactivation")
+                } else {
+                    path_sample.as_ref().and_then(|sample| {
+                        let controller_state = sample
+                            .controller_snapshot
+                            .map_or(0, |snapshot| snapshot.state);
+                        let policer_episode_active = controller_policer_episode_active(
+                            sample.controller_policer_pacing_transitions,
+                        );
+                        capacity_probe_state
+                            .sustained_initial_bulk_requires_probe(
+                                controller_state,
+                                policer_episode_active,
+                            )
+                            .then_some("initial_bulk_demand")
+                    })
+                }
+            });
+            if let Some(reason) = capacity_probe_reason.flatten() {
                 let published = path_sample
-                    .and_then(|sample| sample.controller_tunables)
+                    .as_ref()
+                    .and_then(|sample| sample.controller_tunables.as_ref())
                     .is_some_and(|tunables| {
-                        publish_capacity_probe(&tunables);
+                        publish_capacity_probe(tunables);
                         true
                     });
-                if !published {
+                if published {
+                    debug!(
+                        peer = %connection.remote_id(),
+                        reason,
+                        bulk_service_edges = capacity_probe_state.initial_bulk_service_edges,
+                        bulk_service_bytes = capacity_probe_state.initial_bulk_serviced_bytes,
+                        bulk_admission_edges = capacity_probe_state.initial_bulk_admission_edges,
+                        bulk_admission_bytes = capacity_probe_state.initial_bulk_admitted_bytes,
+                        "published V2 BBR capacity probe"
+                    );
+                } else {
                     // The normal one-second telemetry path remains the
                     // fallback if a selected BBR path was transiently absent.
                     capacity_probe_state.cancel_bulk_service_edge();
@@ -1541,22 +1044,20 @@ pub(super) async fn tuner_loop(
             continue;
         }
         let sampled_at = Instant::now();
-        policy_reload_tick = policy_reload_tick.wrapping_add(1);
+        reload.advance();
         if wasm_selection {
-            // Plan section 8.3: the candidate component is read into a
-            // private buffer, verified, compiled and self-checked on a
-            // blocking worker while the active component keeps deciding. A
-            // finished candidate then enters shadow warmup: it observes the
-            // live input for `WASM_WARMUP_TICKS` fault-free ticks before it
-            // is promoted at a sample boundary. Failures only update the
-            // error state — the active (last known-good) component is never
-            // replaced by a bad file or an unhealthy candidate.
-            if let Some(handle) = wasm_pending.as_mut()
-                && handle.is_finished()
-            {
-                let handle = wasm_pending.take().expect("pending handle checked above");
+            let live_finished = matches!(
+                &reload.live_phase,
+                LiveReloadPhaseV1::Loading(handle) if handle.is_finished()
+            );
+            if live_finished {
+                let phase = std::mem::replace(&mut reload.live_phase, LiveReloadPhaseV1::Idle);
+                let LiveReloadPhaseV1::Loading(handle) = phase else {
+                    unreachable!("finished live reload must be loading");
+                };
                 match handle.await {
-                    Ok(Ok(backend)) => {
+                    Ok(Ok(Some((backend, file_hash)))) => {
+                        reload.live_seen_hash = Some(file_hash);
                         let accepts = backend.manifest().state_schema_accepts.clone();
                         let new_policy_id = backend.identity().policy_id.clone();
                         let digest = backend
@@ -1573,11 +1074,11 @@ pub(super) async fn tuner_loop(
                             digest,
                         );
                         evaluator.set_peer_hash(peer_hash);
-                        wasm_warmup = Some(WasmWarmupV1 {
+                        reload.live_phase = LiveReloadPhaseV1::Warming(Box::new(WasmWarmupV1 {
                             evaluator,
                             accepts,
                             healthy_ticks: 0,
-                        });
+                        }));
                         info!(
                             peer = %connection.remote_id(),
                             new_policy_id = %new_policy_id,
@@ -1586,97 +1087,56 @@ pub(super) async fn tuner_loop(
                             "V2 WASM autotune policy candidate entered shadow warmup"
                         );
                     }
+                    Ok(Ok(None)) => {}
                     Ok(Err(error)) => {
                         let message = format!("{error:#}");
-                        if last_wasm_reload_error.as_deref() != Some(&message) {
+                        if reload.last_live_error.as_deref() != Some(&message) {
                             warn!(
                                 peer = %connection.remote_id(),
                                 source = %runtime_state.autotune.policy,
                                 error = %message,
                                 "retained last known-good V2 WASM autotune policy"
                             );
-                            last_wasm_reload_error = Some(message);
+                            reload.last_live_error = Some(message);
                         }
                     }
                     Err(error) => {
                         let message = format!("WASM policy load task failed: {error}");
-                        if last_wasm_reload_error.as_deref() != Some(&message) {
+                        if reload.last_live_error.as_deref() != Some(&message) {
                             warn!(
                                 peer = %connection.remote_id(),
                                 source = %runtime_state.autotune.policy,
                                 error = %message,
                                 "retained last known-good V2 WASM autotune policy"
                             );
-                            last_wasm_reload_error = Some(message);
+                            reload.last_live_error = Some(message);
                         }
                     }
                 }
             }
-            if policy_reload_tick.is_multiple_of(5)
-                && wasm_pending.is_none()
-                && wasm_warmup.is_none()
-                && let Some(loader) = runtime_state.policy_loader().cloned()
-            {
+            if reload.scan_due() && matches!(reload.live_phase, LiveReloadPhaseV1::Idle) {
+                let runtime = runtime_state.clone();
                 let path = std::path::PathBuf::from(&runtime_state.autotune.policy);
-                match std::fs::read(&path) {
-                    Ok(bytes) => {
-                        let file_hash = *blake3::hash(&bytes).as_bytes();
-                        if Some(file_hash) != wasm_seen_hash {
-                            // Remember the hash before loading: a bad file is
-                            // reported once and not retried until it changes.
-                            wasm_seen_hash = Some(file_hash);
-                            match TrustStoreV1::from_config(&runtime_state.autotune.wasm) {
-                                Ok(trust) => {
-                                    let config = runtime_state.autotune.wasm.clone();
-                                    wasm_pending = Some(tokio::task::spawn_blocking(move || {
-                                        loader.load_from_bytes(
-                                            &bytes,
-                                            &config,
-                                            &trust,
-                                            chrono::Utc::now(),
-                                        )
-                                    }));
-                                }
-                                Err(error) => {
-                                    let message = format!("{error:#}");
-                                    if last_wasm_reload_error.as_deref() != Some(&message) {
-                                        warn!(
-                                            peer = %connection.remote_id(),
-                                            source = %runtime_state.autotune.policy,
-                                            error = %message,
-                                            "invalid WASM trust store; retained last known-good V2 autotune policy"
-                                        );
-                                        last_wasm_reload_error = Some(message);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let message = format!("reading {}: {error}", path.display());
-                        if last_wasm_reload_error.as_deref() != Some(&message) {
-                            warn!(
-                                peer = %connection.remote_id(),
-                                source = %runtime_state.autotune.policy,
-                                error = %message,
-                                "retained last known-good V2 WASM autotune policy"
-                            );
-                            last_wasm_reload_error = Some(message);
-                        }
-                    }
-                }
+                let seen_hash = reload.live_seen_hash;
+                reload.live_phase =
+                    LiveReloadPhaseV1::Loading(tokio::task::spawn_blocking(move || {
+                        load_changed_wasm_backend(&runtime, &path, seen_hash)
+                    }));
             }
         }
         if let Some(shadow_path) = shadow_selection {
-            // Verified background load like the live component, minus the
-            // warmup stage — a shadow is already off-wire. Failures only
-            // update the error state; the last known-good shadow stays.
-            if let Some(handle) = shadow_pending.as_mut()
-                && handle.is_finished()
-            {
-                let handle = shadow_pending.take().expect("pending handle checked above");
+            let shadow_finished = matches!(
+                &reload.shadow_phase,
+                ShadowReloadPhaseV1::Loading(handle) if handle.is_finished()
+            );
+            if shadow_finished {
+                let phase = std::mem::replace(&mut reload.shadow_phase, ShadowReloadPhaseV1::Idle);
+                let ShadowReloadPhaseV1::Loading(handle) = phase else {
+                    unreachable!("finished shadow reload must be loading");
+                };
                 match handle.await {
-                    Ok(Ok(backend)) => {
+                    Ok(Ok(Some((backend, file_hash)))) => {
+                        reload.shadow_seen_hash = Some(file_hash);
                         let shadow = shadow_evaluator_for_backend(backend, objective, peer_hash);
                         info!(
                             peer = %connection.remote_id(),
@@ -1686,117 +1146,72 @@ pub(super) async fn tuner_loop(
                         );
                         tick.set_shadow(Some(shadow));
                     }
+                    Ok(Ok(None)) => {}
                     Ok(Err(error)) => {
                         let message = format!("{error:#}");
-                        if last_shadow_reload_error.as_deref() != Some(&message) {
+                        if reload.last_shadow_error.as_deref() != Some(&message) {
                             warn!(
                                 peer = %connection.remote_id(),
                                 source = %shadow_path.display(),
                                 error = %message,
                                 "retained last known-good V2 WASM shadow autotune policy"
                             );
-                            last_shadow_reload_error = Some(message);
+                            reload.last_shadow_error = Some(message);
                         }
                     }
                     Err(error) => {
                         let message = format!("WASM shadow policy load task failed: {error}");
-                        if last_shadow_reload_error.as_deref() != Some(&message) {
+                        if reload.last_shadow_error.as_deref() != Some(&message) {
                             warn!(
                                 peer = %connection.remote_id(),
                                 source = %shadow_path.display(),
                                 error = %message,
                                 "retained last known-good V2 WASM shadow autotune policy"
                             );
-                            last_shadow_reload_error = Some(message);
+                            reload.last_shadow_error = Some(message);
                         }
                     }
                 }
             }
-            if policy_reload_tick.is_multiple_of(5)
-                && shadow_pending.is_none()
-                && let Some(loader) = runtime_state.policy_loader().cloned()
-            {
-                match std::fs::read(shadow_path) {
-                    Ok(bytes) => {
-                        let file_hash = *blake3::hash(&bytes).as_bytes();
-                        if Some(file_hash) != shadow_seen_hash {
-                            // Remember the hash before loading: a bad file is
-                            // reported once and not retried until it changes.
-                            shadow_seen_hash = Some(file_hash);
-                            match TrustStoreV1::from_config(&runtime_state.autotune.wasm) {
-                                Ok(trust) => {
-                                    let config = runtime_state.autotune.wasm.clone();
-                                    shadow_pending = Some(tokio::task::spawn_blocking(move || {
-                                        loader.load_from_bytes(
-                                            &bytes,
-                                            &config,
-                                            &trust,
-                                            chrono::Utc::now(),
-                                        )
-                                    }));
-                                }
-                                Err(error) => {
-                                    let message = format!("{error:#}");
-                                    if last_shadow_reload_error.as_deref() != Some(&message) {
-                                        warn!(
-                                            peer = %connection.remote_id(),
-                                            source = %shadow_path.display(),
-                                            error = %message,
-                                            "invalid WASM trust store; retained last known-good V2 shadow autotune policy"
-                                        );
-                                        last_shadow_reload_error = Some(message);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let message = format!("reading {}: {error}", shadow_path.display());
-                        if last_shadow_reload_error.as_deref() != Some(&message) {
-                            warn!(
-                                peer = %connection.remote_id(),
-                                source = %shadow_path.display(),
-                                error = %message,
-                                "retained last known-good V2 WASM shadow autotune policy"
-                            );
-                            last_shadow_reload_error = Some(message);
-                        }
-                    }
-                }
+            if reload.scan_due() && matches!(reload.shadow_phase, ShadowReloadPhaseV1::Idle) {
+                let runtime = runtime_state.clone();
+                let path = shadow_path.to_path_buf();
+                let seen_hash = reload.shadow_seen_hash;
+                reload.shadow_phase =
+                    ShadowReloadPhaseV1::Loading(tokio::task::spawn_blocking(move || {
+                        load_changed_wasm_backend(&runtime, &path, seen_hash)
+                    }));
             }
         }
-        let sample_elapsed = sampled_at.saturating_duration_since(previous_sample_at);
+        let sample_elapsed =
+            sampled_at.saturating_duration_since(telemetry_window.previous_sample_at);
         let current = connection.stats();
         let path = match selected_path_sample(&connection) {
             Ok(sample) => {
-                if telemetry_failures != 0 {
+                if telemetry_window.failures != 0 {
                     info!(
                         peer = %connection.remote_id(),
-                        failures = telemetry_failures,
+                        failures = telemetry_window.failures,
                         "V2 path telemetry recovered without replacing the logical session"
                     );
-                    telemetry_failures = 0;
+                    telemetry_window.failures = 0;
                 }
                 sample
             }
             Err(error) => {
-                telemetry_failures = telemetry_failures.saturating_add(1);
+                telemetry_window.failures = telemetry_window.failures.saturating_add(1);
                 let decision = tick.fallback_for_missing_telemetry();
                 metrics
                     .receive_buffer_bytes
                     .store(decision.receive_buffer_bytes as u64, Ordering::Relaxed);
                 if sender.send(Some(decision)).is_err() {
-                    if let Some(store) = &state_store
-                        && tick.live().is_dirty()
-                    {
-                        flush_policy_state(store, tick.live_mut(), &peer_name)?;
-                    }
+                    persistence.flush(tick.live_mut(), sampled_at)?;
                     return Ok(());
                 }
-                if telemetry_failures == 1 || telemetry_failures.is_multiple_of(10) {
+                if telemetry_window.failures == 1 || telemetry_window.failures.is_multiple_of(10) {
                     warn!(
                         peer = %connection.remote_id(),
-                        failures = telemetry_failures,
+                        failures = telemetry_window.failures,
                         path_epoch = decision.path_epoch,
                         reason = ?decision.reason,
                         %error,
@@ -1805,9 +1220,9 @@ pub(super) async fn tuner_loop(
                 }
                 let current_sample_counters =
                     SampleCounterSnapshot::capture(&metrics, current.udp_tx.bytes);
-                previous = current;
-                previous_sample_at = sampled_at;
-                sample_counters = current_sample_counters;
+                telemetry_window.previous = current;
+                telemetry_window.previous_sample_at = sampled_at;
+                telemetry_window.sample_counters = current_sample_counters;
                 continue;
             }
         };
@@ -1839,43 +1254,55 @@ pub(super) async fn tuner_loop(
         // without changing the locator, so never cache its path-local BBR
         // handle across samples.
         let bbr_tunables = controller_tunables;
-        if identity != path_identity {
-            let migrated = !path_identity.is_empty();
-            let previous_identity = std::mem::replace(&mut path_identity, identity);
+        if identity != telemetry_window.identity {
+            let migrated = !telemetry_window.identity.is_empty();
+            let previous_identity = std::mem::replace(&mut telemetry_window.identity, identity);
             if migrated {
-                path_epoch = path_epoch.wrapping_add(1).max(1);
+                telemetry_window.epoch = telemetry_window.epoch.wrapping_add(1).max(1);
             }
-            minimum_rtt = rtt;
-            previous_controller_guard_transitions =
+            telemetry_window.previous_guard_transitions =
                 controller_snapshot.map_or(0, |snapshot| snapshot.guard_transitions);
             if migrated {
                 info!(
-                    path_epoch,
+                    path_epoch = telemetry_window.epoch,
                     ?reliability,
                     previous_path = %previous_identity,
-                    selected_path = %path_identity,
+                    selected_path = %telemetry_window.identity,
                     "V2 QUIC path migrated without replacing the logical session"
                 );
             }
         }
-        minimum_rtt = minimum_rtt.min(rtt);
+        let minimum_rtt = controller_snapshot
+            .map(|snapshot| snapshot.min_rtt)
+            .filter(|minimum| !minimum.is_zero() && *minimum != Duration::MAX)
+            .unwrap_or(rtt);
         metrics.repair_minimum_age_micros.store(
             repair_minimum_age_for_rtt(rtt)
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
-        let sent_packets = counter_delta(current.udp_tx.datagrams, previous.udp_tx.datagrams);
-        let received_packets = counter_delta(current.udp_rx.datagrams, previous.udp_rx.datagrams);
-        let lost_packets = counter_delta(current.lost_packets, previous.lost_packets);
+        let sent_packets = counter_delta(
+            current.udp_tx.datagrams,
+            telemetry_window.previous.udp_tx.datagrams,
+        );
+        let received_packets = counter_delta(
+            current.udp_rx.datagrams,
+            telemetry_window.previous.udp_rx.datagrams,
+        );
+        let lost_packets =
+            counter_delta(current.lost_packets, telemetry_window.previous.lost_packets);
         let loss_ppm = ratio_per_million(lost_packets, sent_packets.saturating_add(lost_packets));
-        let sent_bytes = counter_delta(current.udp_tx.bytes, previous.udp_tx.bytes);
-        let received_bytes = counter_delta(current.udp_rx.bytes, previous.udp_rx.bytes);
+        let sent_bytes =
+            counter_delta(current.udp_tx.bytes, telemetry_window.previous.udp_tx.bytes);
+        let received_bytes =
+            counter_delta(current.udp_rx.bytes, telemetry_window.previous.udp_rx.bytes);
         let sent_bytes_per_second = rate_per_second(sent_bytes, sample_elapsed);
         let received_bytes_per_second = rate_per_second(received_bytes, sample_elapsed);
         let current_sample_counters =
             SampleCounterSnapshot::capture(&metrics, current.udp_tx.bytes);
-        let sample_delta = current_sample_counters.saturating_delta(sample_counters);
+        let sample_delta =
+            current_sample_counters.saturating_delta(telemetry_window.sample_counters);
         let real_bytes = current_sample_counters.real_bytes;
         let real_delta = sample_delta.real_bytes;
         let tun_ingress_records_delta = sample_delta.tun_ingress_records;
@@ -1901,60 +1328,7 @@ pub(super) async fn tuner_loop(
             .cpu_utilization_per_mille
             .load(Ordering::Relaxed)
             .min(1_000) as u16;
-        let current_remote_feedback_sequence =
-            metrics.remote_feedback_sequence.load(Ordering::Acquire);
-        let mut remote_expired_stripes_delta = 0;
-        if current_remote_feedback_sequence != remote_feedback.sequence {
-            let current_remote_feedback = RemoteFeedbackSnapshot::capture(
-                &metrics,
-                current_remote_feedback_sequence,
-                sampled_at,
-            );
-            let remote_delta = current_remote_feedback.counter_delta(remote_feedback);
-            let feedback_elapsed = sampled_at.saturating_duration_since(remote_feedback.at);
-            remote_expired_stripes_delta = remote_delta.expired_trains;
-            remote_receiver_goodput_bytes_per_second =
-                rate_per_second(remote_delta.delivered_payload, feedback_elapsed);
-            remote_reorder_ppm =
-                ratio_per_million(remote_delta.reorder_cells, remote_delta.sent_data_cells);
-            remote_residual_loss_ppm =
-                ratio_per_million(remote_delta.missing_cells, remote_delta.sent_data_cells);
-            let loss_runs = remote_delta
-                .loss_run_1
-                .saturating_add(remote_delta.loss_run_2)
-                .saturating_add(remote_delta.loss_run_3_4)
-                .saturating_add(remote_delta.loss_run_5_plus);
-            let weighted_loss_cells = remote_delta
-                .loss_run_1
-                .saturating_add(remote_delta.loss_run_2.saturating_mul(2))
-                .saturating_add(remote_delta.loss_run_3_4.saturating_mul(4))
-                .saturating_add(remote_delta.loss_run_5_plus.saturating_mul(5));
-            remote_burst_loss_cells = weighted_loss_cells
-                .checked_div(loss_runs)
-                .unwrap_or_default()
-                .min(u64::from(u16::MAX)) as u16;
-            if remote_delta.fec_parity != 0 {
-                remote_wasted_parity_per_mille =
-                    ratio_per_thousand(remote_delta.fec_wasted, remote_delta.fec_parity);
-                remote_fec_recovery_per_mille =
-                    ratio_per_thousand(remote_delta.fec_recovered, remote_delta.fec_parity);
-            }
-            if remote_delta.repair_completed_requested != 0 {
-                remote_repair_hit_per_mille = ratio_per_thousand(
-                    remote_delta.repair_received,
-                    remote_delta.repair_completed_requested,
-                );
-            }
-            if remote_delta.repair_completed != 0 {
-                remote_repair_response_latency = Duration::from_micros(
-                    remote_delta
-                        .repair_latency_micros
-                        .checked_div(remote_delta.repair_completed)
-                        .unwrap_or_default(),
-                );
-            }
-            remote_feedback = current_remote_feedback;
-        }
+        let remote = remote_feedback.sample(&metrics, sampled_at);
         let latency_sojourn_delta = sample_delta.latency_sojourn;
         let latency_sojourn_p50_micros = histogram_percentile_micros(&latency_sojourn_delta, 50);
         let latency_sojourn_p95_micros = histogram_percentile_micros(&latency_sojourn_delta, 95);
@@ -1963,9 +1337,9 @@ pub(super) async fn tuner_loop(
             latency_queue_bytes != 0 || latency_sojourn_delta.iter().any(|count| *count != 0);
         let controller_guard_transitions =
             controller_snapshot.map_or(0, |snapshot| snapshot.guard_transitions);
-        let controller_guard_transitions_delta =
-            controller_guard_transitions.saturating_sub(previous_controller_guard_transitions);
-        previous_controller_guard_transitions = controller_guard_transitions;
+        let controller_guard_transitions_delta = controller_guard_transitions
+            .saturating_sub(telemetry_window.previous_guard_transitions);
+        telemetry_window.previous_guard_transitions = controller_guard_transitions;
         let controller_tunables_generation = bbr_tunables
             .as_ref()
             .map_or(0, |tunables| tunables.generation.load(Ordering::Relaxed));
@@ -1973,16 +1347,16 @@ pub(super) async fn tuner_loop(
             tunables.clamped_writes.load(Ordering::Relaxed)
         });
         let telemetry = PathTelemetryV2 {
-            path_epoch,
+            path_epoch: telemetry_window.epoch,
             reliability,
             rtt,
             min_rtt: minimum_rtt,
             queue_delay: rtt.saturating_sub(minimum_rtt),
             loss_ppm,
-            burst_loss_cells: remote_burst_loss_cells,
-            reorder_ppm: remote_reorder_ppm,
-            receiver_goodput_bytes_per_second: remote_receiver_goodput_bytes_per_second,
-            residual_loss_ppm: remote_residual_loss_ppm,
+            burst_loss_cells: remote.burst_loss_cells,
+            reorder_ppm: remote.reorder_ppm,
+            receiver_goodput_bytes_per_second: remote.receiver_goodput_bytes_per_second,
+            residual_loss_ppm: remote.residual_loss_ppm,
             latency_sojourn_p95_micros,
             latency_sojourn_p50_micros,
             latency_sojourn_p99_micros,
@@ -2013,15 +1387,15 @@ pub(super) async fn tuner_loop(
             packet_train_queue_bytes: train_queue_bytes,
             latency_queue_bytes,
             reassembly_pressure_evictions: reassembly_pressure_evictions_delta,
-            remote_expired_stripes_delta,
+            remote_expired_stripes_delta: remote.expired_stripes_delta,
             train_build_bytes_per_second,
             bulk_preemption_delay_average_micros,
             cpu_utilization_per_mille,
-            wasted_parity_per_mille: remote_wasted_parity_per_mille,
-            fec_recovery_per_mille: remote_fec_recovery_per_mille,
-            repair_hit_per_mille: remote_repair_hit_per_mille,
-            repair_completed_requests: remote_feedback.repair_completed,
-            repair_response_latency: remote_repair_response_latency,
+            wasted_parity_per_mille: remote.wasted_parity_per_mille,
+            fec_recovery_per_mille: remote.fec_recovery_per_mille,
+            repair_hit_per_mille: remote.repair_hit_per_mille,
+            repair_completed_requests: remote.repair_completed_requests,
+            repair_response_latency: remote.repair_response_latency,
             real_traffic_bytes_per_second: rate_per_second(real_delta, sample_elapsed),
         };
         let controller_policer_episode_active =
@@ -2032,7 +1406,7 @@ pub(super) async fn tuner_loop(
             .update_loss_episode_if_complete(telemetry, controller_policer_episode_active);
         let wire_cost = current_sample_counters
             .utility_tx_bytes
-            .delta(sample_counters.utility_tx_bytes)
+            .delta(telemetry_window.sample_counters.utility_tx_bytes)
             .breakdown()
             .wire_cost();
         // Baseline -> PolicyInputV1 -> backend decide -> guardrails ->
@@ -2074,7 +1448,8 @@ pub(super) async fn tuner_loop(
         // Plan section 8.3 shadow warmup: the candidate observes this tick's
         // live input without influencing the wire; any fault aborts it and
         // `WASM_WARMUP_TICKS` consecutive healthy ticks promote it to live.
-        if let Some(warmup) = wasm_warmup.as_mut() {
+        let live_phase = std::mem::replace(&mut reload.live_phase, LiveReloadPhaseV1::Idle);
+        if let LiveReloadPhaseV1::Warming(mut warmup) = live_phase {
             let evaluation = warmup.evaluator.observe(
                 sampled_at,
                 tick.tuner(),
@@ -2090,39 +1465,29 @@ pub(super) async fn tuner_loop(
                     %fault,
                     "aborted V2 WASM policy warmup; retained last known-good"
                 );
-                wasm_warmup = None;
             } else {
                 warmup.healthy_ticks = warmup.healthy_ticks.saturating_add(1);
                 if warmup.healthy_ticks >= WASM_WARMUP_TICKS {
-                    let warmup = wasm_warmup.take().expect("warmup checked above");
                     let policy_id = warmup.evaluator.policy_id().to_owned();
-                    let (backend, probe, digest) = warmup.evaluator.into_slot().into_backend();
-                    if let Some(store) = &state_store
-                        && tick.live().is_dirty()
-                        && let Err(error) = flush_policy_state(store, tick.live_mut(), &peer_name)
-                    {
+                    let WasmWarmupV1 {
+                        evaluator,
+                        accepts,
+                        healthy_ticks: _,
+                    } = *warmup;
+                    let (backend, probe, digest) = evaluator.into_slot().into_backend();
+                    if let Err(error) = persistence.flush(tick.live_mut(), sampled_at) {
                         warn!(
                             peer = %connection.remote_id(),
                             %error,
                             "failed persisting V2 policy state before hot switch"
                         );
                     }
-                    let kept_state = tick.replace_live(
-                        backend,
-                        probe,
-                        digest,
-                        objective.weights(),
-                        &warmup.accepts,
-                    );
-                    if !kept_state && let Some(store) = &state_store {
-                        let identity = tick.live().identity().clone();
-                        if let Some(state) =
-                            store.load(&identity.policy_id, identity.state_schema, &peer_name)
-                        {
-                            tick.live_mut().set_state(state);
-                        }
+                    let kept_state =
+                        tick.replace_live(backend, probe, digest, objective.weights(), &accepts);
+                    if !kept_state {
+                        persistence.restore(tick.live_mut());
                     }
-                    last_wasm_reload_error = None;
+                    reload.last_live_error = None;
                     info!(
                         peer = %connection.remote_id(),
                         new_policy_id = %policy_id,
@@ -2131,8 +1496,12 @@ pub(super) async fn tuner_loop(
                         warmup_ticks = WASM_WARMUP_TICKS,
                         "promoted V2 WASM autotune policy after shadow warmup"
                     );
+                } else {
+                    reload.live_phase = LiveReloadPhaseV1::Warming(warmup);
                 }
             }
+        } else {
+            reload.live_phase = live_phase;
         }
         let decision = outcome.decision;
         if outcome.fault != last_policy_fault {
@@ -2201,7 +1570,7 @@ pub(super) async fn tuner_loop(
                     policy_source: &policy_source,
                     shadow_policy_id: shadow_policy_id.as_deref(),
                     shadow: shadow_evaluation,
-                    path_identity: &path_identity,
+                    path_identity: &telemetry_window.identity,
                     controller_cwnd_bytes: congestion_window_bytes,
                     adaptive_cwnd_floor_bytes,
                 },
@@ -2226,32 +1595,22 @@ pub(super) async fn tuner_loop(
             Ordering::Relaxed,
         );
         if sender.send(Some(decision)).is_err() {
-            if let Some(store) = &state_store
-                && tick.live().is_dirty()
-            {
-                flush_policy_state(store, tick.live_mut(), &peer_name)?;
-            }
+            persistence.flush(tick.live_mut(), sampled_at)?;
             return Ok(());
         }
-        if let Some(store) = &state_store
-            && tick.live().is_dirty()
-            && sampled_at.saturating_duration_since(last_state_flush) >= store.flush_interval()
-        {
-            match flush_policy_state(store, tick.live_mut(), &peer_name) {
-                Ok(()) => last_state_flush = sampled_at,
-                Err(error) => warn!(
-                    peer = %connection.remote_id(),
-                    %error,
-                    "failed persisting V2 policy state"
-                ),
-            }
+        if let Err(error) = persistence.flush_if_due(tick.live_mut(), sampled_at) {
+            warn!(
+                peer = %connection.remote_id(),
+                %error,
+                "failed persisting V2 policy state"
+            );
         }
         if decision.sample_count.is_multiple_of(10) {
             let now = Instant::now();
             let status_current =
                 StatusCounterSnapshot::capture(&metrics, current.udp_tx.bytes, real_bytes, now);
-            let status_delta = status_current.saturating_delta(status_counters);
-            let status_elapsed = now.saturating_duration_since(status_counters.at);
+            let status_delta = status_current.saturating_delta(telemetry_window.status_counters);
+            let status_elapsed = now.saturating_duration_since(telemetry_window.status_counters.at);
             let tx_bytes = status_delta.tx_bytes.breakdown();
             let repair_tx_bytes = tx_bytes
                 .repair_request_bytes
@@ -2506,24 +1865,24 @@ pub(super) async fn tuner_loop(
                 zero_rtt_policy = "disabled",
                 zero_rtt_accepted = 0_u64,
                 zero_rtt_rejected = 0_u64,
-                remote_feedback_sequence = remote_feedback.sequence,
+                remote_feedback_sequence = remote.sequence,
                 outgoing_fec_remote_wasted_parity_per_mille =
-                    remote_wasted_parity_per_mille,
-                outgoing_fec_remote_recovery_per_mille = remote_fec_recovery_per_mille,
-                outgoing_repair_remote_hit_per_mille = remote_repair_hit_per_mille,
-                outgoing_repair_remote_completed_requests = remote_feedback.repair_completed,
+                    remote.wasted_parity_per_mille,
+                outgoing_fec_remote_recovery_per_mille = remote.fec_recovery_per_mille,
+                outgoing_repair_remote_hit_per_mille = remote.repair_hit_per_mille,
+                outgoing_repair_remote_completed_requests = remote.repair_completed_requests,
                 outgoing_repair_remote_response_latency_micros =
-                    remote_repair_response_latency.as_micros(),
+                    remote.repair_response_latency.as_micros(),
                 outgoing_fec_remote_expired_stripes = metrics
                     .remote_fec_expired_stripes
                     .load(Ordering::Relaxed),
                 "V2 automatic tuning status"
             );
-            status_counters = status_current;
+            telemetry_window.status_counters = status_current;
         }
-        previous = current;
-        previous_sample_at = sampled_at;
-        sample_counters = current_sample_counters;
+        telemetry_window.previous = current;
+        telemetry_window.previous_sample_at = sampled_at;
+        telemetry_window.sample_counters = current_sample_counters;
     }
 }
 
@@ -2633,6 +1992,8 @@ fn rate_per_second(value: u64, elapsed: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use iroh::SecretKey;
 
     use super::super::V2RuntimeConfig;
@@ -2667,6 +2028,44 @@ mod tests {
         assert_eq!(status.state_schema, ironet_policy_core::STATE_SCHEMA_V1);
         assert_eq!(status.module_digest, digest);
         assert!(state.policy_loader.get().is_none());
+    }
+
+    #[test]
+    fn remote_feedback_rates_expire_as_one_window() {
+        let metrics = RuntimeMetrics::default();
+        let started = Instant::now();
+        let mut window = RemoteFeedbackWindowV2::capture(&metrics, started);
+        metrics.remote_fec_parity_rx.store(10, Ordering::Relaxed);
+        metrics
+            .remote_fec_recovered_cells
+            .store(5, Ordering::Relaxed);
+        metrics
+            .remote_delivered_payload_bytes
+            .store(8_000, Ordering::Relaxed);
+        metrics.data_cell_tx_datagrams.store(100, Ordering::Relaxed);
+        metrics.remote_missing_cells.store(1, Ordering::Relaxed);
+        metrics.remote_loss_run_1.store(1, Ordering::Relaxed);
+        metrics
+            .remote_repair_completed_requests
+            .store(7, Ordering::Relaxed);
+        metrics.remote_feedback_sequence.store(1, Ordering::Release);
+
+        let fresh = window.sample(&metrics, started + Duration::from_secs(1));
+        assert_eq!(fresh.sequence, 1);
+        assert_eq!(fresh.fec_recovery_per_mille, 500);
+        assert_eq!(fresh.receiver_goodput_bytes_per_second, 8_000);
+        assert!(fresh.residual_loss_ppm > 0);
+        assert_eq!(fresh.repair_completed_requests, 7);
+
+        let stale = window.sample(
+            &metrics,
+            started + Duration::from_secs(1) + REMOTE_FEEDBACK_TTL,
+        );
+        assert_eq!(stale.sequence, 1);
+        assert_eq!(stale.fec_recovery_per_mille, 0);
+        assert_eq!(stale.receiver_goodput_bytes_per_second, 0);
+        assert_eq!(stale.residual_loss_ppm, 0);
+        assert_eq!(stale.repair_completed_requests, 7);
     }
 
     #[test]
@@ -2909,6 +2308,11 @@ mod tests {
         telemetry
     }
 
+    fn observe_bulk_admission(state: &mut CapacityProbeStateV2, bytes: u64) {
+        let next = state.bulk_admission_counter.saturating_add(bytes);
+        state.update_bulk_admission_counter(next);
+    }
+
     #[test]
     fn finalized_bbr_effective_is_tunable_authority_and_idempotent() {
         let proposal = Bbr3ProposalV2::for_preset(Bbr3PresetV2::LossyRadio, 0);
@@ -2935,6 +2339,7 @@ mod tests {
         let mut state = CapacityProbeStateV2::default();
         let mut telemetry = queued_adaptive_floor_telemetry();
         telemetry.tun_ingress_bytes_per_second = 1;
+        observe_bulk_admission(&mut state, 1);
 
         assert!(!state.update(telemetry, false));
         assert!(!state.update(telemetry, false));
@@ -2949,6 +2354,7 @@ mod tests {
         // epoch, so it cannot ask BBR to reprobe a second time.
         telemetry.tun_ingress_bytes_per_second = 1;
         telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        observe_bulk_admission(&mut state, 1);
         assert!(!state.update(telemetry, false));
         assert_eq!(state.bulk_idle_ticks, 0);
 
@@ -2961,6 +2367,7 @@ mod tests {
 
         telemetry.tun_ingress_bytes_per_second = 1;
         telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
+        observe_bulk_admission(&mut state, 1);
         assert!(state.update(telemetry, false));
     }
 
@@ -3079,6 +2486,79 @@ mod tests {
     }
 
     #[test]
+    fn sustained_initial_bulk_reprobes_before_a_lossy_telemetry_boundary() {
+        let mut state = CapacityProbeStateV2::default();
+        state.initialize_bulk_service_counter(1, 0);
+
+        // The first two 50 ms service edges prove that a real Bulk epoch has
+        // started. This direct cross-layer evidence arrives before the next
+        // one-second interval, where an asymmetric upload may already show
+        // random loss and otherwise consume the old delayed decision.
+        assert!(!state.update_bulk_service_counter(8 * 1024));
+        assert!(!state.sustained_initial_bulk_requires_probe(3, false));
+        assert!(!state.update_bulk_service_counter(16 * 1024));
+        assert!(state.sustained_initial_bulk_requires_probe(3, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+
+        // It is a one-shot semantic epoch boundary, not a timer-driven
+        // restart while the transfer continues.
+        assert!(!state.update_bulk_service_counter(24 * 1024));
+        assert!(!state.sustained_initial_bulk_requires_probe(3, false));
+    }
+
+    #[test]
+    fn classified_bulk_admission_reprobes_before_the_first_service_byte() {
+        let mut state = CapacityProbeStateV2::default();
+        state.initialize_bulk_service_counter(1, 0);
+        state.initialize_bulk_admission_counter(0);
+
+        // A loss-reduced controller can have queued Bulk work long before it
+        // receives permission to send its first cell. The classifier boundary
+        // preserves that demand signal without promoting latency traffic.
+        state.update_bulk_admission_counter(8 * 1024);
+        assert!(!state.sustained_initial_bulk_requires_probe(3, false));
+        assert!(!state.update_bulk_service_counter(0));
+
+        state.update_bulk_admission_counter(16 * 1024);
+        assert!(state.sustained_initial_bulk_requires_probe(3, false));
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+        assert!(!state.update_bulk_service_counter(0));
+        assert!(!state.sustained_initial_bulk_requires_probe(3, false));
+    }
+
+    #[test]
+    fn unclassified_tun_ingress_cannot_consume_the_bulk_probe_epoch() {
+        let mut state = CapacityProbeStateV2::default();
+        let mut telemetry = queued_adaptive_floor_telemetry();
+        telemetry.controller_state = 3;
+        telemetry.tun_ingress_bytes_per_second = 8 * 1024 * 1024;
+
+        // ICMP, control, and latency TUN records share the aggregate ingress
+        // counter. They must not consume the one semantic Bulk discovery
+        // edge before the classifier observes the actual transfer.
+        assert!(!state.update(telemetry, false));
+        assert!(!state.bulk_active);
+        assert_eq!(state.initial_bulk_probe, InitialBulkProbeV2::AwaitingEdge);
+
+        state.initialize_bulk_admission_counter(0);
+        state.update_bulk_admission_counter(8 * 1024);
+        state.update_bulk_admission_counter(16 * 1024);
+        assert!(state.sustained_initial_bulk_requires_probe(3, false));
+    }
+
+    #[test]
+    fn fast_initial_bulk_probe_leaves_native_startup_and_policer_episodes_owned() {
+        let mut state = CapacityProbeStateV2::default();
+        state.initialize_bulk_service_counter(1, 0);
+        assert!(!state.update_bulk_service_counter(8 * 1024));
+        assert!(!state.update_bulk_service_counter(16 * 1024));
+
+        assert!(!state.sustained_initial_bulk_requires_probe(0, false));
+        assert!(!state.sustained_initial_bulk_requires_probe(3, true));
+        assert_ne!(state.initial_bulk_probe, InitialBulkProbeV2::Consumed);
+    }
+
+    #[test]
     fn p2_like_partial_without_pressure_and_lossy_complete_is_suppressed() {
         let mut state = CapacityProbeStateV2::default();
         let mut partial = queued_adaptive_floor_telemetry();
@@ -3192,6 +2672,7 @@ mod tests {
         telemetry.loss_ppm = 0;
         telemetry.residual_loss_ppm = 0;
         telemetry.burst_loss_cells = 0;
+        observe_bulk_admission(&mut state, 8 * 1024 * 1024);
 
         // The normal path may observe initial Bulk first, but that first
         // sample is still a partial window. Only the following complete tick
@@ -3208,7 +2689,7 @@ mod tests {
     }
 
     #[test]
-    fn lossy_initial_bulk_tick_is_permanently_suppressed() {
+    fn lossy_initial_bulk_tick_is_suppressed_when_the_fast_edge_was_missed() {
         let mut state = CapacityProbeStateV2::default();
         let mut telemetry = queued_adaptive_floor_telemetry();
         state.initialize_bulk_service_counter(telemetry.path_epoch, 100);
@@ -3217,6 +2698,10 @@ mod tests {
         telemetry.tun_ingress_bytes_per_second = 12_000_000;
         telemetry.loss_ppm = 20_000;
 
+        // This exercises the telemetry-only fallback. The runtime's 50 ms
+        // edge path can publish sustained service before this lossy boundary;
+        // if that path was unavailable, this one-shot fallback remains
+        // intentionally conservative.
         assert!(!state.update_bulk_service_counter(101));
         let mut partial = telemetry;
         partial.loss_ppm = 0;
@@ -3299,6 +2784,7 @@ mod tests {
         let mut telemetry = queued_adaptive_floor_telemetry();
         telemetry.tun_ingress_bytes_per_second = 1;
         telemetry.packet_train_queue_bytes = 0;
+        observe_bulk_admission(&mut state, 1);
         assert!(!state.update(telemetry, true));
 
         telemetry.tun_ingress_bytes_per_second = 0;
@@ -3314,6 +2800,7 @@ mod tests {
         assert!(state.bulk_idle_verified);
 
         telemetry.tun_ingress_bytes_per_second = 1;
+        observe_bulk_admission(&mut state, 1);
         assert!(state.update(telemetry, true));
         assert!(state.bulk_active);
         assert!(!state.bulk_idle_verified);
@@ -3325,6 +2812,7 @@ mod tests {
         let mut telemetry = queued_adaptive_floor_telemetry();
         telemetry.tun_ingress_bytes_per_second = 1;
         telemetry.packet_train_queue_bytes = 0;
+        observe_bulk_admission(&mut state, 1);
         assert!(!state.update(telemetry, false));
 
         telemetry.tun_ingress_bytes_per_second = 0;
@@ -3337,6 +2825,7 @@ mod tests {
         assert!(state.bulk_idle_verified);
 
         telemetry.tun_ingress_bytes_per_second = 1;
+        observe_bulk_admission(&mut state, 1);
         assert!(state.update(telemetry, false));
         assert!(!state.bulk_idle_verified);
     }
@@ -3377,6 +2866,7 @@ mod tests {
         let mut telemetry = queued_adaptive_floor_telemetry();
         telemetry.tun_ingress_bytes_per_second = 1;
         telemetry.packet_train_queue_bytes = 0;
+        observe_bulk_admission(&mut state, 1);
         assert!(!state.update(telemetry, true));
         telemetry.tun_ingress_bytes_per_second = 0;
         for _ in 0..5 {
@@ -3447,6 +2937,7 @@ mod tests {
         let mut telemetry = queued_adaptive_floor_telemetry();
         telemetry.tun_ingress_bytes_per_second = 1;
         telemetry.packet_train_queue_bytes = 0;
+        observe_bulk_admission(&mut state, 1);
         assert!(!state.update(telemetry, false));
         telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
         assert!(!state.update(telemetry, false));
@@ -3465,12 +2956,15 @@ mod tests {
         assert!(!state.bulk_active);
 
         telemetry.tun_ingress_bytes_per_second = 1;
+        observe_bulk_admission(&mut state, 1);
         assert!(state.update(telemetry, false));
         telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
         assert!(!state.update(telemetry, false));
 
         telemetry.path_epoch += 1;
         telemetry.packet_train_queue_bytes = 0;
+        assert!(!state.update(telemetry, false));
+        observe_bulk_admission(&mut state, 1);
         assert!(state.update(telemetry, false));
         assert_eq!(state.bulk_idle_ticks, 0);
         telemetry.packet_train_queue_bytes = TX_ADMISSION_BATCH_BYTES as u64;
@@ -3547,6 +3041,7 @@ mod tests {
     fn confirmed_controller_policer_episode_suppresses_clean_recovery_probe() {
         let mut state = CapacityProbeStateV2::default();
         let mut telemetry = queued_adaptive_floor_telemetry();
+        observe_bulk_admission(&mut state, 1);
         assert!(!state.update(telemetry, false));
 
         telemetry.loss_ppm = 10_000;
@@ -3569,6 +3064,7 @@ mod tests {
         assert!(!state.update(telemetry, false));
         assert!(!state.update(telemetry, false));
         telemetry.tun_ingress_bytes_per_second = 1;
+        observe_bulk_admission(&mut state, 1);
         assert!(state.update(telemetry, false));
     }
 
@@ -3625,6 +3121,8 @@ mod tests {
 
         telemetry.path_epoch += 1;
         telemetry.loss_ppm = 0;
+        assert!(!state.update(telemetry, false));
+        observe_bulk_admission(&mut state, 1);
         assert!(state.update(telemetry, false));
         assert!(!state.update_loss_episode(telemetry, false));
         assert!(!state.update_loss_episode(telemetry, false));

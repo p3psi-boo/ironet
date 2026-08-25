@@ -215,7 +215,11 @@ impl V2RuntimeState {
             ),
             routes_ready: AtomicBool::new(false),
             cpu_utilization_per_mille: AtomicU64::new(0),
-            autotune_state_dir: crate::protocol::v2::memory::state_dir(&config.identity_file),
+            autotune_state_dir: config
+                .identity_file
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("autotune"),
             autotune: config.autotune.clone(),
             policy_loader: std::sync::OnceLock::new(),
             max_egress_bytes_per_second: config.max_egress_bytes_per_second,

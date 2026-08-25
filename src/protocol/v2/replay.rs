@@ -1,33 +1,21 @@
 //! Deterministic offline replay for autotune tap records.
 
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
-use ironet_policy_core::PolicySpecV1;
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::{
     fec::FecGeometryV2,
-    learner::{
-        BanditLearnerV2, ContextKeyV2, LearnerMemoryV2, LearnerModeV2, materialize_policy_action,
-        policy_utility_weights,
-    },
-    policy::{api::CandidateActionV1, api::ClampReportV1, canonical_spec_digest},
+    learner::LearnerModeV2,
+    policy::{api::CandidateActionV1, api::ClampReportV1},
     policy_tick::{PolicySlotV1, PolicyTickConfigV1, PolicyTickV1},
     tuning::{
         AutoTuneBoundsV2, AutoTunerV2, Bbr3PresetV2, CoverTrafficProfileV2, PathReliability,
         PathTelemetryV2, TuneDecisionV2, TuneReasonV2,
     },
-    utility::{Objective, UtilityEstimator, UtilitySample, UtilityWeights, WireCostV2},
+    utility::{Objective, UtilityWeights, WireCostV2},
 };
-
-pub const REPLAY_REPORT_SCHEMA_V2: u32 = 1;
-/// Schema of the per-sample golden trace emitted by [`replay_with_golden`].
-pub const REPLAY_GOLDEN_SCHEMA_V2: u32 = 1;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplayTapSampleV2 {
@@ -166,46 +154,6 @@ pub struct ReplayUtilityV2 {
     pub goodput_bytes_per_second: u64,
 }
 
-impl ReplayUtilityV2 {
-    fn reweight(self, source: UtilityWeights, target: UtilityWeights) -> Result<UtilitySample> {
-        ensure!(
-            self.total.is_finite() && self.components.iter().all(|value| value.is_finite()),
-            "replay utility contains a non-finite value"
-        );
-        let source = weights_array(source);
-        let target = weights_array(target);
-        let mut components = [0.0; 8];
-        for index in 0..components.len() {
-            if source[index] == 0.0 {
-                ensure!(
-                    target[index] == 0.0,
-                    "cannot reweight utility component {index} from a zero source weight"
-                );
-            } else {
-                components[index] = self.components[index] * target[index] / source[index];
-            }
-        }
-        Ok(UtilitySample {
-            total: components.iter().sum(),
-            components,
-            goodput_bytes_per_second: self.goodput_bytes_per_second,
-        })
-    }
-}
-
-fn weights_array(weights: UtilityWeights) -> [f64; 8] {
-    [
-        weights.throughput,
-        weights.queue_delay,
-        weights.latency_sojourn,
-        weights.residual_loss,
-        weights.jitter,
-        weights.cpu,
-        weights.wire_overhead,
-        weights.memory,
-    ]
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplayWireCostV2 {
@@ -228,133 +176,13 @@ impl From<ReplayWireCostV2> for WireCostV2 {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ReplayReportV2 {
-    pub schema_version: u32,
-    pub policy_id: String,
-    pub policy_digest: String,
-    pub objective: String,
-    pub seed: u64,
-    pub samples: usize,
-    pub contexts: BTreeMap<String, u64>,
-    pub proposed_presets: BTreeMap<String, u64>,
-    pub preset_switches: u64,
-    pub exploring_samples: u64,
-    pub mean_utility: f64,
-    pub mean_predicted_advantage: f64,
-    pub final_action: Option<ReplayActionV2>,
-    pub trace_digest: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ReplayActionV2 {
-    pub preset: Bbr3PresetV2,
-    pub up_gain_milli: u32,
-    pub headroom_milli: u32,
-    pub cwnd_gain_milli: u32,
-    pub pacing_cap_bytes_per_second: u64,
-    pub train_target_bytes: usize,
-    pub bulk_quantum_cells: usize,
-    pub fec: Option<ReplayFecV2>,
-    pub cover_profile: String,
-    pub cover_overhead_per_mille: u16,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayFecV2 {
     pub data_cells: usize,
     pub parity_cells: usize,
 }
 
-/// Per-sample golden trace of the full slow-path policy chain
-/// (`AutoTunerV2` propose -> utility -> `BanditLearnerV2::step` ->
-/// materialized candidate). Every floating point value is stored as its IEEE
-/// bit pattern so the file compares bit-exactly across platforms; the
-/// `*_repr` strings exist only for human readers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplayGoldenV2 {
-    pub schema_version: u32,
-    /// Command line that (re)generates this file.
-    pub generated_by: String,
-    /// Fixture the golden was recorded from.
-    pub fixture: String,
-    pub policy_id: String,
-    pub policy_digest: String,
-    pub source_policy_digest: String,
-    pub objective: String,
-    pub seed: u64,
-    pub learner_mode: String,
-    /// Utility weights actually used by the estimator, as f64 bits in
-    /// formula order (throughput, queue delay, latency sojourn, residual
-    /// loss, jitter, CPU, wire overhead, memory).
-    pub utility_weights_bits: [u64; 8],
-    pub sample_count: usize,
-    /// Equal to `ReplayReportV2::trace_digest` for the same run.
-    pub trace_digest: String,
-    /// BLAKE3 of the serialized learner memory after the last sample.
-    pub final_memory_digest: String,
-    pub samples: Vec<ReplaySampleTraceV2>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplaySampleTraceV2 {
-    pub index: usize,
-    pub tap_schema_version: u32,
-    pub sampled_unix_micros: u64,
-    pub offset_micros: u64,
-    pub input: ReplayGoldenInputV2,
-    pub utility: ReplayGoldenUtilityV2,
-    /// `AutoTunerV2::observe_at` output: the deterministic native proposal
-    /// that the learner receives as its baseline.
-    pub baseline: ReplayDecisionV2,
-    pub learner: ReplayGoldenLearnerV2,
-    /// `BanditLearnerV2::step` output: what the runtime would publish in the
-    /// replayed learner mode (equals the baseline BBR arm in shadow mode).
-    pub effective: ReplayDecisionV2,
-    /// `materialize_policy_action` output for the proposed preset: the
-    /// guarded counterfactual candidate action.
-    pub candidate: ReplayDecisionV2,
-    /// BLAKE3 of the serialized learner memory after this step.
-    pub memory_digest: String,
-    pub memory: Vec<ReplayGoldenContextMemoryV2>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplayGoldenInputV2 {
-    pub telemetry: ReplayTelemetryV2,
-    /// `wire-cost` when the utility was estimated from the sample's wire
-    /// cost, `recorded` when a recorded utility was reweighted.
-    pub utility_source: String,
-    pub wire_cost: Option<ReplayWireCostV2>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplayGoldenUtilityV2 {
-    pub total_bits: u64,
-    pub total_repr: String,
-    pub components_bits: [u64; 8],
-    pub goodput_bytes_per_second: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplayGoldenLearnerV2 {
-    pub mode: String,
-    pub context: ContextKeyV2,
-    pub context_name: String,
-    pub baseline_preset: Bbr3PresetV2,
-    pub proposed_preset: Bbr3PresetV2,
-    pub applied_preset: Bbr3PresetV2,
-    pub predicted_advantage_bits: u64,
-    pub predicted_advantage_repr: String,
-    pub exploring: bool,
-    pub rollback: bool,
-    pub rollbacks: u64,
-    pub fine_up_gain_delta_milli: i16,
-    pub fine_headroom_delta_milli: i16,
-    pub fine_cwnd_gain_delta_milli: i16,
-}
-
-/// Complete `TuneDecisionV2` in golden form (enums as strings).
+/// Complete `TuneDecisionV2` in the production replay report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayDecisionV2 {
     pub reason: String,
@@ -381,48 +209,6 @@ pub struct ReplayBbrProposalV2 {
     pub cwnd_gain_milli: u32,
     pub pacing_cap_bytes_per_second: u64,
     pub loss_is_congestion: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplayGoldenContextMemoryV2 {
-    pub key: ContextKeyV2,
-    pub arms: Vec<ReplayGoldenArmV2>,
-    pub active: Bbr3PresetV2,
-    pub max_bw_bytes_per_second: u64,
-    pub min_rtt_micros: u64,
-    pub fine_up_gain_delta_milli: i16,
-    pub fine_headroom_delta_milli: i16,
-    pub fine_cwnd_gain_delta_milli: i16,
-    pub fine_direction: i8,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplayGoldenArmV2 {
-    pub observations: u32,
-    pub mean_bits: u64,
-    pub mean_repr: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DigestStepV2 {
-    offset_micros: u64,
-    context: String,
-    proposed: Bbr3PresetV2,
-    action: ReplayActionV2,
-    utility_bits: u64,
-    advantage_bits: u64,
-    exploring: bool,
-}
-
-pub fn replay(
-    samples: &[ReplayTapSampleV2],
-    source_policy: &PolicySpecV1,
-    candidate_policy: PolicySpecV1,
-    objective: Objective,
-    seed: u64,
-) -> Result<ReplayReportV2> {
-    replay_with_golden(samples, source_policy, candidate_policy, objective, seed)
-        .map(|(report, _)| report)
 }
 
 /// Schema of the [`replay_ticks`] report.
@@ -552,201 +338,6 @@ pub fn replay_ticks(
     })
 }
 
-/// Replay and additionally record the per-sample golden trace. The returned
-/// golden leaves `generated_by` and `fixture` empty; callers that persist the
-/// golden fill them in.
-pub fn replay_with_golden(
-    samples: &[ReplayTapSampleV2],
-    source_policy: &PolicySpecV1,
-    candidate_policy: PolicySpecV1,
-    objective: Objective,
-    seed: u64,
-) -> Result<(ReplayReportV2, ReplayGoldenV2)> {
-    ensure!(!samples.is_empty(), "autotune replay input has no samples");
-    source_policy
-        .validate()
-        .context("validating source policy")?;
-    candidate_policy
-        .validate()
-        .context("validating candidate policy")?;
-    let source_policy_digest = canonical_spec_digest(source_policy)?;
-    let candidate_policy_digest = canonical_spec_digest(&candidate_policy)?;
-    let first_micros = samples[0].sampled_unix_micros;
-    let start = Instant::now();
-    let mut previous_micros = first_micros;
-    let mut tuner = AutoTunerV2::new(AutoTuneBoundsV2::default(), 1);
-    let learner_mode = LearnerModeV2::Shadow;
-    let mut learner =
-        BanditLearnerV2::with_policy(learner_mode, seed, Arc::new(candidate_policy.clone()));
-    let utility_weights = policy_utility_weights(&candidate_policy, objective);
-    let mut estimator = UtilityEstimator::with_weights(utility_weights);
-    let mut golden_samples = Vec::with_capacity(samples.len());
-    let mut contexts = BTreeMap::new();
-    let mut proposed_presets = BTreeMap::new();
-    let mut steps = Vec::with_capacity(samples.len());
-    let mut previous_preset = None;
-    let mut preset_switches = 0_u64;
-    let mut exploring_samples = 0_u64;
-    let mut utility_sum = 0.0;
-    let mut advantage_sum = 0.0;
-    let mut final_action = None;
-
-    for (index, sample) in samples.iter().enumerate() {
-        ensure!(
-            matches!(sample.schema_version, 3..=5),
-            "sample {index} uses unsupported tap schema {}",
-            sample.schema_version
-        );
-        ensure!(
-            sample.sampled_unix_micros >= previous_micros,
-            "sample {index} timestamp moves backwards"
-        );
-        previous_micros = sample.sampled_unix_micros;
-        let offset_micros = sample.sampled_unix_micros - first_micros;
-        let now = start + Duration::from_micros(offset_micros);
-        let telemetry = sample.telemetry.into_runtime();
-        ensure!(
-            telemetry.path_epoch != 0,
-            "sample {index} has zero path epoch"
-        );
-        let baseline = tuner.observe_at(telemetry, now);
-        let (utility, utility_source) = if let Some(wire) = sample.wire_cost {
-            (
-                estimator.observe(&telemetry, &baseline, &wire.into()),
-                "wire-cost",
-            )
-        } else if let Some(recorded) = sample.utility {
-            (
-                recorded.reweight(
-                    policy_utility_weights(source_policy, objective),
-                    utility_weights,
-                )?,
-                "recorded",
-            )
-        } else {
-            bail!("sample {index} has neither wire_cost nor recorded utility");
-        };
-        let (effective, trace) = learner.step(now, &telemetry, &utility, baseline);
-        let decision = materialize_policy_action(
-            &candidate_policy,
-            &tuner,
-            telemetry,
-            baseline,
-            trace.proposed_preset,
-        );
-        let context = context_name(trace.context);
-        *contexts.entry(context.clone()).or_default() += 1;
-        *proposed_presets
-            .entry(preset_name(trace.proposed_preset).to_owned())
-            .or_default() += 1;
-        if previous_preset.is_some_and(|previous| previous != trace.proposed_preset) {
-            preset_switches = preset_switches.saturating_add(1);
-        }
-        previous_preset = Some(trace.proposed_preset);
-        exploring_samples = exploring_samples.saturating_add(u64::from(trace.exploring));
-        utility_sum += utility.total;
-        advantage_sum += trace.predicted_advantage;
-        let action = action_from_decision(decision);
-        final_action = Some(action.clone());
-        let memory = learner.export_memory();
-        let memory_digest = blake3::hash(&serde_json::to_vec(&memory)?)
-            .to_hex()
-            .to_string();
-        golden_samples.push(ReplaySampleTraceV2 {
-            index,
-            tap_schema_version: sample.schema_version,
-            sampled_unix_micros: sample.sampled_unix_micros,
-            offset_micros,
-            input: ReplayGoldenInputV2 {
-                telemetry: sample.telemetry,
-                utility_source: utility_source.to_owned(),
-                wire_cost: sample.wire_cost,
-            },
-            utility: ReplayGoldenUtilityV2 {
-                total_bits: utility.total.to_bits(),
-                total_repr: f64_repr(utility.total),
-                components_bits: utility.components.map(f64::to_bits),
-                goodput_bytes_per_second: utility.goodput_bytes_per_second,
-            },
-            baseline: decision_golden(baseline),
-            learner: ReplayGoldenLearnerV2 {
-                mode: learner_mode_name(trace.mode).to_owned(),
-                context: trace.context,
-                context_name: context.clone(),
-                baseline_preset: trace.baseline_preset,
-                proposed_preset: trace.proposed_preset,
-                applied_preset: trace.applied_preset,
-                predicted_advantage_bits: trace.predicted_advantage.to_bits(),
-                predicted_advantage_repr: f64_repr(trace.predicted_advantage),
-                exploring: trace.exploring,
-                rollback: trace.rollback,
-                rollbacks: trace.rollbacks,
-                fine_up_gain_delta_milli: trace.fine_up_gain_delta_milli,
-                fine_headroom_delta_milli: trace.fine_headroom_delta_milli,
-                fine_cwnd_gain_delta_milli: trace.fine_cwnd_gain_delta_milli,
-            },
-            effective: decision_golden(effective),
-            candidate: decision_golden(decision),
-            memory_digest,
-            memory: memory_golden(&memory),
-        });
-        steps.push(DigestStepV2 {
-            offset_micros,
-            context,
-            proposed: trace.proposed_preset,
-            action,
-            utility_bits: utility.total.to_bits(),
-            advantage_bits: trace.predicted_advantage.to_bits(),
-            exploring: trace.exploring,
-        });
-    }
-    let trace_digest = blake3::hash(&serde_json::to_vec(&steps)?)
-        .to_hex()
-        .to_string();
-    let final_memory_digest = golden_samples
-        .last()
-        .map(|sample| sample.memory_digest.clone())
-        .unwrap_or_default();
-    let golden = ReplayGoldenV2 {
-        schema_version: REPLAY_GOLDEN_SCHEMA_V2,
-        generated_by: String::new(),
-        fixture: String::new(),
-        policy_id: candidate_policy.id.clone(),
-        policy_digest: candidate_policy_digest.clone(),
-        source_policy_digest,
-        objective: objective_name(objective).to_owned(),
-        seed,
-        learner_mode: learner_mode_name(learner_mode).to_owned(),
-        utility_weights_bits: weights_array(utility_weights).map(f64::to_bits),
-        sample_count: samples.len(),
-        trace_digest: trace_digest.clone(),
-        final_memory_digest,
-        samples: golden_samples,
-    };
-    let denominator = samples.len() as f64;
-    let report = ReplayReportV2 {
-        schema_version: REPLAY_REPORT_SCHEMA_V2,
-        policy_id: candidate_policy.id,
-        policy_digest: candidate_policy_digest,
-        objective: objective_name(objective).to_owned(),
-        seed,
-        samples: samples.len(),
-        contexts,
-        proposed_presets,
-        preset_switches,
-        exploring_samples,
-        mean_utility: utility_sum / denominator,
-        mean_predicted_advantage: advantage_sum / denominator,
-        final_action,
-        trace_digest,
-    };
-    Ok((report, golden))
-}
-
-fn f64_repr(value: f64) -> String {
-    format!("{value:?}")
-}
-
 fn learner_mode_name(mode: LearnerModeV2) -> &'static str {
     match mode {
         LearnerModeV2::Off => "off",
@@ -807,46 +398,6 @@ pub(crate) fn decision_golden(decision: TuneDecisionV2) -> ReplayDecisionV2 {
     }
 }
 
-pub(crate) fn memory_golden(memory: &LearnerMemoryV2) -> Vec<ReplayGoldenContextMemoryV2> {
-    memory
-        .contexts
-        .iter()
-        .map(|context| ReplayGoldenContextMemoryV2 {
-            key: context.key,
-            arms: context
-                .arms
-                .iter()
-                .map(|arm| ReplayGoldenArmV2 {
-                    observations: arm.observations,
-                    mean_bits: arm.mean.to_bits(),
-                    mean_repr: f64_repr(arm.mean),
-                })
-                .collect(),
-            active: context.active,
-            max_bw_bytes_per_second: context.max_bw_bytes_per_second,
-            min_rtt_micros: context.min_rtt_micros,
-            fine_up_gain_delta_milli: context.fine.up_gain_delta_milli,
-            fine_headroom_delta_milli: context.fine.headroom_delta_milli,
-            fine_cwnd_gain_delta_milli: context.fine.cwnd_gain_delta_milli,
-            fine_direction: context.fine.direction,
-        })
-        .collect()
-}
-
-fn context_name(context: ContextKeyV2) -> String {
-    format!(
-        "r{}-b{}-l{}-{}",
-        context.rtt_class,
-        context.rate_class,
-        context.loss_class,
-        if context.reliable {
-            "reliable"
-        } else {
-            "datagram"
-        }
-    )
-}
-
 fn objective_name(objective: Objective) -> &'static str {
     match objective {
         Objective::Balanced => "balanced",
@@ -855,142 +406,22 @@ fn objective_name(objective: Objective) -> &'static str {
     }
 }
 
-fn preset_name(preset: Bbr3PresetV2) -> &'static str {
-    match preset {
-        Bbr3PresetV2::SharedConservative => "shared-conservative",
-        Bbr3PresetV2::PrivateAggressive => "private-aggressive",
-        Bbr3PresetV2::LossyRadio => "lossy-radio",
-        Bbr3PresetV2::Policer => "policer",
-        Bbr3PresetV2::LongFat => "long-fat",
-        Bbr3PresetV2::RelayReliable => "relay-reliable",
-        Bbr3PresetV2::LowRttHost => "low-rtt-host",
-    }
-}
-
-fn action_from_decision(decision: TuneDecisionV2) -> ReplayActionV2 {
-    ReplayActionV2 {
-        preset: decision.bbr.preset,
-        up_gain_milli: decision.bbr.up_gain_milli,
-        headroom_milli: decision.bbr.headroom_milli,
-        cwnd_gain_milli: decision.bbr.cwnd_gain_milli,
-        pacing_cap_bytes_per_second: decision.bbr.pacing_cap_bytes_per_second,
-        train_target_bytes: decision.train_target_bytes,
-        bulk_quantum_cells: decision.bulk_quantum_cells,
-        fec: decision.fec.map(|geometry: FecGeometryV2| ReplayFecV2 {
-            data_cells: geometry.data_cells,
-            parity_cells: geometry.parity_cells,
-        }),
-        cover_profile: cover_profile_name(decision.cover_profile).to_owned(),
-        cover_overhead_per_mille: decision.cover_overhead_per_mille,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::v2::{learner::policy_utility_weights, policy::canonical_spec_digest};
+    use crate::protocol::v2::learner::policy_utility_weights;
     use ironet_policy_core::PolicySpecV1;
-
-    #[test]
-    fn replay_is_deterministic_and_rejects_time_travel() {
-        let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
-        let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = PolicySpecV1::builtin();
-        let first = replay(&samples, &policy, policy.clone(), Objective::Balanced, 7).unwrap();
-        let second = replay(&samples, &policy, policy.clone(), Objective::Balanced, 7).unwrap();
-        assert_eq!(first.trace_digest, second.trace_digest);
-        let expected: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/autotune-replay-v1.expected.json"
-        ))
-        .unwrap();
-        assert_eq!(serde_json::to_value(&first).unwrap(), expected);
-
-        let mut reversed = samples;
-        reversed[1].sampled_unix_micros = reversed[0].sampled_unix_micros - 1;
-        assert!(replay(&reversed, &policy, policy.clone(), Objective::Balanced, 7).is_err());
-    }
-
-    #[test]
-    fn golden_trace_is_deterministic_and_consistent_with_report() {
-        let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
-        let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = PolicySpecV1::builtin();
-        let (first_report, first) =
-            replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 1).unwrap();
-        let (second_report, second) =
-            replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 1).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.samples.len(), samples.len());
-        assert_eq!(first.sample_count, samples.len());
-        assert_eq!(first.trace_digest, first_report.trace_digest);
-        assert_eq!(second.trace_digest, second_report.trace_digest);
-        assert_eq!(
-            first.final_memory_digest,
-            first.samples.last().unwrap().memory_digest
-        );
-        for (index, sample) in first.samples.iter().enumerate() {
-            assert_eq!(sample.index, index);
-            assert_eq!(
-                sample.learner.context_name,
-                context_name(sample.learner.context)
-            );
-        }
-        // The golden round-trips through JSON without loss.
-        let encoded = serde_json::to_string(&first).unwrap();
-        let decoded: ReplayGoldenV2 = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, first);
-
-        // A different seed or objective must not silently alias the same golden.
-        let (_, other_seed) =
-            replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 2).unwrap();
-        assert_eq!(other_seed.seed, 2);
-        assert_ne!(other_seed, first);
-    }
-
-    #[test]
-    fn golden_matches_checked_in_fixture() {
-        let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
-        let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
-        let policy = PolicySpecV1::builtin();
-        let expected: ReplayGoldenV2 = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/autotune-golden-v1.json"
-        ))
-        .unwrap();
-        assert_eq!(expected.schema_version, REPLAY_GOLDEN_SCHEMA_V2);
-        assert_eq!(
-            expected.policy_digest,
-            canonical_spec_digest(&policy).unwrap()
-        );
-        assert_eq!(expected.objective, "balanced");
-        assert_eq!(expected.seed, 1);
-        let (_, mut actual) =
-            replay_with_golden(&samples, &policy, policy.clone(), Objective::Balanced, 1).unwrap();
-        actual.generated_by = expected.generated_by.clone();
-        actual.fixture = expected.fixture.clone();
-        assert_eq!(actual.samples.len(), expected.samples.len());
-        for (actual, expected) in actual.samples.iter().zip(&expected.samples) {
-            assert_eq!(
-                actual, expected,
-                "golden sample {} diverged",
-                expected.index
-            );
-        }
-        assert_eq!(actual, expected);
-    }
 
     fn builtin_tick_slot(policy: &PolicySpecV1, mode: LearnerModeV2) -> PolicySlotV1 {
         crate::protocol::v2::policy_tick::core_slot_from_spec(policy, mode)
     }
 
-    /// The tick-pipeline replay of the builtin policy reproduces the checked-in
-    /// golden's baseline/effective/utility sample by sample (the live slot in
-    /// shadow mode is exactly what the golden recorded as `effective`).
     #[test]
     fn tick_replay_matches_the_checked_in_golden() {
         let input = include_str!("../../../tests/fixtures/autotune-replay-v1.json");
         let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(input).unwrap();
         let policy = PolicySpecV1::builtin();
-        let golden: ReplayGoldenV2 = serde_json::from_str(include_str!(
+        let golden: TickReplayReportV2 = serde_json::from_str(include_str!(
             "../../../tests/fixtures/autotune-golden-v1.json"
         ))
         .unwrap();
@@ -1003,25 +434,7 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!(report.samples, golden.samples.len());
-        assert_eq!(report.policy_id, golden.policy_id);
-        assert_eq!(report.faults, 0);
-        for (sample, expected) in report.trace.iter().zip(&golden.samples) {
-            assert_eq!(sample.offset_micros, expected.offset_micros);
-            assert_eq!(sample.utility_total_bits, expected.utility.total_bits);
-            assert_eq!(
-                sample.baseline, expected.baseline,
-                "sample {}",
-                sample.index
-            );
-            assert_eq!(
-                sample.effective, expected.effective,
-                "sample {}",
-                sample.index
-            );
-            assert!(sample.candidate.is_some());
-            assert_eq!(sample.fault, None);
-        }
+        assert_eq!(report, golden);
     }
 
     #[test]

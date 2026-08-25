@@ -12,7 +12,6 @@ pub mod fec;
 pub mod feedback;
 pub mod gso;
 pub mod learner;
-pub mod memory;
 pub mod policy;
 pub mod policy_tick;
 pub mod policy_train;

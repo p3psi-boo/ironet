@@ -1,102 +1,22 @@
 {
   "schema_version": 1,
-  "generated_by": "historical canonical builtin trace; verified by tests/autotune_golden.rs through the production replay_ticks golden gate (not a regenerating CLI command)",
-  "fixture": "tests/fixtures/autotune-replay-v1.json",
   "policy_id": "bandit-vivace@1",
-  "policy_digest": "5815f7e50fe161a94643b56cd4067e288cd7aa4e120c836844279bd6e410a036",
-  "source_policy_digest": "5815f7e50fe161a94643b56cd4067e288cd7aa4e120c836844279bd6e410a036",
+  "state_schema": 1,
+  "module_digest": "5815f7e50fe161a94643b56cd4067e288cd7aa4e120c836844279bd6e410a036",
+  "backend": "native",
   "objective": "balanced",
+  "mode": "shadow",
   "seed": 1,
-  "learner_mode": "shadow",
-  "utility_weights_bits": [
-    4607182418800017408,
-    4605380978949069210,
-    4605380978949069210,
-    4607182418800017408,
-    4599075939470750515,
-    4599075939470750515,
-    4600877379321698714,
-    4591870180066957722
-  ],
-  "sample_count": 8,
-  "trace_digest": "d5493fac6b32211cd1a5f07d0ab4340409d5e910b416037b32253616e5625d11",
-  "final_memory_digest": "cefec5b43506f96bdd1c493274f529b5a2fb1925f77a55eb6314700f77fa477c",
-  "samples": [
+  "samples": 8,
+  "faults": 0,
+  "clamped_fields_total": 0,
+  "mean_utility_bits": 4615774930201762368,
+  "trace_digest": "e5f0812d8722868af28f38526e6f9599ded7a394819cb70e9d42b8c138606930",
+  "trace": [
     {
       "index": 0,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000000000000,
       "offset_micros": 0,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 42000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 7000000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 0,
-          "controller_params_generation": 0,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 0,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 7000000,
-          "parity_bytes": 875000,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615545067314393654,
-        "total_repr": "3.713761971003147",
-        "components_bits": [
-          4616238089473202777,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          9223372036854775808,
-          13813656949852899115,
-          13812385648015229959,
-          13809277393828839424
-        ],
-        "goodput_bytes_per_second": 7000000
-      },
+      "utility_total_bits": 4615545067314393654,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -122,28 +42,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -172,163 +70,61 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 1,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4200000,
-        "send_buffer_bytes": 786432,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "d35c65d5b4ecfa75be02b9a54f827b9de29475a38b6ff83a66ece513167fdb8e",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     },
     {
       "index": 1,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000002000000,
       "offset_micros": 2000000,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 43000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 7250000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 1,
-          "controller_params_generation": 1,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 1,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 7250000,
-          "parity_bytes": 906250,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615611416398525561,
-        "total_repr": "3.743226883349561",
-        "components_bits": [
-          4616276917455628665,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          13796090066927442157,
-          13813656949852899115,
-          13812328853852441444,
-          13809299327367826637
-        ],
-        "goodput_bytes_per_second": 7250000
-      },
+      "utility_total_bits": 4615611416398525561,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -354,28 +150,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -404,163 +178,61 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 2,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4237500,
-        "send_buffer_bytes": 800000,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "d35c65d5b4ecfa75be02b9a54f827b9de29475a38b6ff83a66ece513167fdb8e",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     },
     {
       "index": 2,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000004000000,
       "offset_micros": 4000000,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 44000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 7500000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 2,
-          "controller_params_generation": 2,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 2,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 7500000,
-          "parity_bytes": 937500,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615679734612712211,
-        "total_repr": "3.7735662651060777",
-        "components_bits": [
-          4616314450928102413,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          13799394743807844110,
-          13813656949852899115,
-          13812275845967172164,
-          13809325483718659277
-        ],
-        "goodput_bytes_per_second": 7500000
-      },
+      "utility_total_bits": 4615679734612712211,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -586,28 +258,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -636,163 +286,61 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 3,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4298400,
-        "send_buffer_bytes": 800000,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "d35c65d5b4ecfa75be02b9a54f827b9de29475a38b6ff83a66ece513167fdb8e",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     },
     {
       "index": 3,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000006000000,
       "offset_micros": 6000000,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 42000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 7750000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 3,
-          "controller_params_generation": 3,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 3,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 7750000,
-          "parity_bytes": 968750,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615746819327515555,
-        "total_repr": "3.8033578630961116",
-        "components_bits": [
-          4616350773429868571,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          13801079923526563773,
-          13813656949852899115,
-          13812226257945468644,
-          13809309635289337037
-        ],
-        "goodput_bytes_per_second": 7750000
-      },
+      "utility_total_bits": 4615746819327515555,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -818,28 +366,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -868,163 +394,61 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 4,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4261500,
-        "send_buffer_bytes": 800000,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "d35c65d5b4ecfa75be02b9a54f827b9de29475a38b6ff83a66ece513167fdb8e",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     },
     {
       "index": 4,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000008000000,
       "offset_micros": 8000000,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 43000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 8000000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 4,
-          "controller_params_generation": 4,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 4,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 8000000,
-          "parity_bytes": 1000000,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615811580888294603,
-        "total_repr": "3.832117773451136",
-        "components_bits": [
-          4616385960665688437,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          13802678044776662236,
-          13813656949852899115,
-          13812179769175121592,
-          13809315820042243277
-        ],
-        "goodput_bytes_per_second": 8000000
-      },
+      "utility_total_bits": 4615811580888294603,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -1050,28 +474,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -1100,163 +502,61 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 5,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4275900,
-        "send_buffer_bytes": 800000,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "d35c65d5b4ecfa75be02b9a54f827b9de29475a38b6ff83a66ece513167fdb8e",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     },
     {
       "index": 5,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000010000000,
       "offset_micros": 10000000,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 44000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 8250000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 5,
-          "controller_params_generation": 5,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 5,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 8250000,
-          "parity_bytes": 1031250,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615874211670718210,
-        "total_repr": "3.8599314281299266",
-        "components_bits": [
-          4616420081455862061,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          13803871032810217130,
-          13813656949852899115,
-          13812136097906007696,
-          13809335791640169677
-        ],
-        "goodput_bytes_per_second": 8250000
-      },
+      "utility_total_bits": 4615874211670718210,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -1282,28 +582,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -1332,163 +610,61 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 6,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4322400,
-        "send_buffer_bytes": 800000,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "d35c65d5b4ecfa75be02b9a54f827b9de29475a38b6ff83a66ece513167fdb8e",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     },
     {
       "index": 6,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000012000000,
       "offset_micros": 12000000,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 42000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 8500000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 6,
-          "controller_params_generation": 6,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 6,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 8500000,
-          "parity_bytes": 1062500,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615935639247625268,
-        "total_repr": "3.887210752221586",
-        "components_bits": [
-          4616453198546475707,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          13804607910704845777,
-          13813656949852899115,
-          13812094995535076972,
-          13809316077740281037
-        ],
-        "goodput_bytes_per_second": 8500000
-      },
+      "utility_total_bits": 4615935639247625268,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -1514,28 +690,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -1564,163 +718,61 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 7,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4276500,
-        "send_buffer_bytes": 800000,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "d35c65d5b4ecfa75be02b9a54f827b9de29475a38b6ff83a66ece513167fdb8e",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     },
     {
       "index": 7,
-      "tap_schema_version": 4,
-      "sampled_unix_micros": 1800000014000000,
       "offset_micros": 14000000,
-      "input": {
-        "telemetry": {
-          "path_epoch": 1,
-          "reliability": "Datagram",
-          "rtt_micros": 43000,
-          "min_rtt_micros": 40000,
-          "queue_delay_micros": 2000,
-          "loss_ppm": 18000,
-          "burst_loss_cells": 1,
-          "reorder_ppm": 2000,
-          "receiver_goodput_bytes_per_second": 8750000,
-          "residual_loss_ppm": 1500,
-          "latency_sojourn_p95_micros": 0,
-          "latency_sojourn_p50_micros": 0,
-          "latency_sojourn_p99_micros": 0,
-          "latency_queue_recently_nonempty": false,
-          "delivery_rate_bytes_per_second": 10000000,
-          "controller_pacing_rate_bytes_per_second": 11000000,
-          "controller_send_quantum_bytes": 1452,
-          "controller_state": 3,
-          "controller_bw_bytes_per_second": 10500000,
-          "controller_inflight_longterm_bytes": 420000,
-          "controller_guard_transitions_delta": 0,
-          "controller_app_limited": false,
-          "controller_tunables_generation": 7,
-          "controller_params_generation": 7,
-          "controller_clamped_writes": 0,
-          "receive_rate_bytes_per_second": 180000,
-          "packets_per_second": 7500,
-          "tun_ingress_bytes_per_second": 8500000,
-          "average_record_bytes": 1350,
-          "gso_ingress_ratio_ppm": 0,
-          "packet_train_queue_bytes": 0,
-          "latency_queue_bytes": 0,
-          "reassembly_pressure_evictions": 0,
-          "remote_expired_stripes_delta": 0,
-          "train_build_bytes_per_second": 8300000,
-          "bulk_preemption_delay_average_micros": 0,
-          "cpu_utilization_per_mille": 260,
-          "wasted_parity_per_mille": 120,
-          "fec_recovery_per_mille": 700,
-          "repair_hit_per_mille": 800,
-          "repair_completed_requests": 7,
-          "repair_response_latency_micros": 45000,
-          "real_traffic_bytes_per_second": 8500000
-        },
-        "utility_source": "wire-cost",
-        "wire_cost": {
-          "payload_bytes": 8750000,
-          "parity_bytes": 1093750,
-          "repair_bytes": 20000,
-          "cover_bytes": 0,
-          "cell_envelope_bytes": 180000
-        }
-      },
-      "utility": {
-        "total_bits": 4615994972154313890,
-        "total_repr": "3.9135598558710436",
-        "components_bits": [
-          4616485369303848649,
-          9223372036854775808,
-          9223372036854775808,
-          13817944376698155827,
-          13805318960721775047,
-          13813656949852899115,
-          13812056241871056573,
-          13809319857311501517
-        ],
-        "goodput_bytes_per_second": 8750000
-      },
+      "utility_total_bits": 4615994972154313890,
       "baseline": {
         "reason": "random-loss",
         "path_epoch": 1,
@@ -1746,28 +798,6 @@
           "pacing_cap_bytes_per_second": 0,
           "loss_is_congestion": false
         }
-      },
-      "learner": {
-        "mode": "shadow",
-        "context": {
-          "rtt_class": 2,
-          "rate_class": 1,
-          "loss_class": 2,
-          "reliable": false,
-          "host_rtt": false
-        },
-        "context_name": "r2-b1-l2-datagram",
-        "baseline_preset": "lossy-radio",
-        "proposed_preset": "lossy-radio",
-        "applied_preset": "lossy-radio",
-        "predicted_advantage_bits": 0,
-        "predicted_advantage_repr": "0.0",
-        "exploring": false,
-        "rollback": false,
-        "rollbacks": 0,
-        "fine_up_gain_delta_milli": 0,
-        "fine_headroom_delta_milli": 0,
-        "fine_cwnd_gain_delta_milli": 0
       },
       "effective": {
         "reason": "random-loss",
@@ -1796,87 +826,56 @@
         }
       },
       "candidate": {
-        "reason": "random-loss",
-        "path_epoch": 1,
-        "sample_count": 8,
-        "train_target_bytes": 32768,
-        "bulk_quantum_cells": 2,
-        "fec": {
-          "data_cells": 8,
-          "parity_cells": 2
-        },
-        "repair_cache_bytes": 4285300,
-        "send_buffer_bytes": 800000,
-        "receive_buffer_bytes": 8388608,
-        "receive_batch": 64,
-        "cover_profile": "live-broadcast",
-        "cover_overhead_per_mille": 0,
-        "cover_padding_bytes_per_second": 0,
         "bbr": {
           "preset": "lossy-radio",
-          "up_gain_milli": 1250,
+          "probe_bw_up_pacing_gain_milli": 1250,
+          "probe_bw_down_pacing_gain_milli": 900,
+          "cruise_pacing_gain_milli": 1000,
+          "default_cwnd_gain_milli": 2500,
+          "probe_bw_up_cwnd_gain_milli": 2500,
           "headroom_milli": 150,
-          "cwnd_gain_milli": 2500,
+          "beta_milli": 700,
+          "loss_threshold_milli": 20,
+          "loss_is_congestion": false,
+          "queue_guard_inflation_milli": 800,
+          "queue_guard_slack_micros": 5000,
+          "probe_rtt_interval_millis": 10000,
+          "probe_rtt_duration_millis": 200,
+          "probe_rtt_cwnd_gain_milli": 500,
+          "min_probe_wait_millis": 2000,
+          "max_added_probe_wait_millis": 1000,
           "pacing_cap_bytes_per_second": 0,
-          "loss_is_congestion": false
-        }
+          "cwnd_floor_bytes": 0,
+          "cwnd_cap_bytes": 0,
+          "startup_bw_hint_bytes_per_second": 0
+        },
+        "scheduler": {
+          "train_target_bytes": 32768,
+          "bulk_quantum_cells": 2,
+          "bulk_admission_window_bytes": null,
+          "preset_hint": null
+        },
+        "fec": {
+          "enabled": true,
+          "data_cells": 8,
+          "parity_cells": 2,
+          "preset_family": null
+        },
+        "repair": null,
+        "tx": null,
+        "rx": null,
+        "cover": {
+          "profile": null,
+          "overhead_per_mille": 0,
+          "padding_bytes_per_second": null
+        },
+        "egress_request": null,
+        "extensions": []
       },
-      "memory_digest": "cefec5b43506f96bdd1c493274f529b5a2fb1925f77a55eb6314700f77fa477c",
-      "memory": [
-        {
-          "key": {
-            "rtt_class": 2,
-            "rate_class": 1,
-            "loss_class": 2,
-            "reliable": false,
-            "host_rtt": false
-          },
-          "arms": [
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 1,
-              "mean_bits": 4615774930201762368,
-              "mean_repr": "3.8158415990285732"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            },
-            {
-              "observations": 0,
-              "mean_bits": 0,
-              "mean_repr": "0.0"
-            }
-          ],
-          "active": "lossy-radio",
-          "max_bw_bytes_per_second": 10500000,
-          "min_rtt_micros": 40000,
-          "fine_up_gain_delta_milli": 0,
-          "fine_headroom_delta_milli": 0,
-          "fine_cwnd_gain_delta_milli": 0,
-          "fine_direction": 1
-        }
-      ]
+      "clamps": {
+        "entries": []
+      },
+      "fault": null
     }
   ]
 }

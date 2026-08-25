@@ -1,7 +1,7 @@
 //! V2 mesh dataplane orchestration, authenticated presence, and OAM handling.
 
 use std::{
-    collections::{VecDeque, hash_map::Entry},
+    collections::VecDeque,
     future::Future,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -30,7 +30,7 @@ use super::{
     connection::{PeerSessionV2, establish_mesh_adjacencies},
     cpu_sampler_loop,
     dataplane::{
-        CLASSIFIER_IDLE, CoverShaperV2, IngressReadyOrderV2, MAX_CLASSIFIERS,
+        BoundedFlowTableV2, CLASSIFIER_IDLE, CoverShaperV2, IngressReadyOrderV2, MAX_CLASSIFIERS,
         PrioritySendArbiterV2, TUN_INPUT_SLOTS, TUN_PRIORITY_INPUT_SLOTS, TX_ADMISSION_BATCH_BYTES,
         TX_LATENCY_ADMISSION_HIGH_WATER_BYTES, TunIngressRecordV2, TxControl,
         adaptive_repair_minimum_age, admission_saturated, apply_receive_buffer_target,
@@ -217,9 +217,7 @@ struct MeshRxMetricsV2 {
 #[derive(Debug)]
 struct MeshFlowStateV2 {
     classifier: FlowClassifier,
-    last_seen: Duration,
     lease: FlowRouteLeaseV2,
-    selected_route: ResolvedRouteV2,
     effective_route: ResolvedRouteV2,
     path_mtu_generation: u64,
 }
@@ -250,31 +248,107 @@ struct MeshControlContextV2 {
     max_total_peers: usize,
 }
 
+#[derive(Clone)]
+struct TopologyCompileRequestV2 {
+    directory: PresenceDirectoryV2,
+    generation: u64,
+    route_epoch: u32,
+    allow_default_routes: bool,
+    local_id: EndpointId,
+    learned_prefixes: Vec<IpNet>,
+    owner: EndpointId,
+    update: PresenceUpdateV2,
+}
+
+struct TopologyCompileOutputV2 {
+    snapshot: DataplaneSnapshotV2,
+    generation: u64,
+    route_epoch: u32,
+    learned_prefixes: Vec<IpNet>,
+    owner: EndpointId,
+    update: PresenceUpdateV2,
+}
+
+async fn topology_compiler_loop(
+    mut requests: watch::Receiver<Option<TopologyCompileRequestV2>>,
+    results: mpsc::Sender<Result<TopologyCompileOutputV2>>,
+) {
+    while requests.changed().await.is_ok() {
+        let Some(request) = requests.borrow_and_update().clone() else {
+            continue;
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let mut directory = request.directory;
+            let local_node = crate::protocol::v2::routing::NodeIdV2(*request.local_id.as_bytes());
+            let snapshot = directory.compile_local_snapshot(
+                request.generation,
+                request.route_epoch,
+                request.allow_default_routes,
+                local_node,
+                SystemTime::now(),
+            )?;
+            Ok(TopologyCompileOutputV2 {
+                snapshot,
+                generation: request.generation,
+                route_epoch: request.route_epoch,
+                learned_prefixes: request.learned_prefixes,
+                owner: request.owner,
+                update: request.update,
+            })
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("V2 topology compiler task failed: {error}"))
+        .and_then(|result: Result<TopologyCompileOutputV2>| result);
+        if requests.has_changed().unwrap_or(false) {
+            continue;
+        }
+        if results.send(result).await.is_err() {
+            return;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RoutePmtuSnapshotV2 {
+    active_epoch: u32,
+    values: HashMap<u32, u16>,
+}
+
 #[derive(Debug, Default)]
 struct RoutePmtuConstraintsV2 {
-    values: ArcSwap<HashMap<(u32, u32), u16>>,
+    state: ArcSwap<RoutePmtuSnapshotV2>,
     generation: AtomicU64,
 }
 
 impl RoutePmtuConstraintsV2 {
     fn constrain(&self, route_epoch: u32, route_label: RouteLabelV2, maximum: u16) {
-        let current = self.values.load_full();
-        let key = (route_epoch, route_label.0);
-        if current
-            .get(&key)
-            .is_some_and(|existing| *existing <= maximum)
+        let current = self.state.load_full();
+        if route_epoch < current.active_epoch {
+            return;
+        }
+        let key = route_label.0;
+        if route_epoch == current.active_epoch
+            && current
+                .values
+                .get(&key)
+                .is_some_and(|existing| *existing <= maximum)
         {
             return;
         }
-        let mut next = if current.len() >= MAX_PATH_MTU_CONSTRAINTS {
+        let mut next = if route_epoch != current.active_epoch
+            || current.values.len() >= MAX_PATH_MTU_CONSTRAINTS
+        {
             HashMap::default()
         } else {
-            (*current).clone()
+            current.values.clone()
         };
         next.entry(key)
             .and_modify(|existing| *existing = (*existing).min(maximum))
             .or_insert(maximum);
-        self.values.store(Arc::new(next));
+        self.state.store(Arc::new(RoutePmtuSnapshotV2 {
+            active_epoch: route_epoch,
+            values: next,
+        }));
         self.generation.fetch_add(1, Ordering::Release);
     }
 
@@ -283,10 +357,9 @@ impl RoutePmtuConstraintsV2 {
     }
 
     fn apply(&self, mut route: ResolvedRouteV2) -> ResolvedRouteV2 {
-        if let Some(maximum) = self
-            .values
-            .load()
-            .get(&(route.route_epoch, route.route_label.0))
+        let state = self.state.load();
+        if state.active_epoch == route.route_epoch
+            && let Some(maximum) = state.values.get(&route.route_label.0)
         {
             route.maximum_datagram_size = route.maximum_datagram_size.min(*maximum);
         }
@@ -368,14 +441,6 @@ pub(super) async fn run_mesh(
     let mut adjacency_metrics = HashMap::<AdjacencyIdV2, Arc<RuntimeMetrics>>::default();
     let mut tasks = JoinSet::new();
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let tun_context = MeshTunContextV2 {
-        snapshots: snapshots.clone(),
-        commands: commands.clone(),
-        priority_commands: priority_commands.clone(),
-        path_mtu_constraints: path_mtu_constraints.clone(),
-        route_quality: route_quality.clone(),
-        metrics: adjacency_metrics.clone(),
-    };
     spawn_named_mesh_task(
         &mut tasks,
         "process CPU sampler",
@@ -464,6 +529,18 @@ pub(super) async fn run_mesh(
     drop(datagram_sender);
     drop(control_record_sender);
     drop(path_mtu_sender);
+
+    // Build the immutable dispatcher view only after every adjacency channel
+    // and metrics handle has been installed. Cloning these maps before the
+    // loop leaves the TUN dispatcher with a permanently empty writer table.
+    let tun_context = MeshTunContextV2 {
+        snapshots: snapshots.clone(),
+        commands: commands.clone(),
+        priority_commands: priority_commands.clone(),
+        path_mtu_constraints: path_mtu_constraints.clone(),
+        route_quality: route_quality.clone(),
+        metrics: adjacency_metrics.clone(),
+    };
 
     let mut direct_addresses = adjacencies
         .iter()
@@ -939,7 +1016,7 @@ async fn mesh_tun_loop(
     priority: bool,
 ) -> Result<()> {
     let started = Instant::now();
-    let mut flows = HashMap::<FlowKey, MeshFlowStateV2>::default();
+    let mut flows = BoundedFlowTableV2::<MeshFlowStateV2>::new(MAX_CLASSIFIERS, CLASSIFIER_IDLE);
     let mut pending = VecDeque::<TunIngressRecordV2>::new();
     loop {
         if pending.is_empty() {
@@ -966,16 +1043,12 @@ async fn mesh_tun_loop(
             },
         );
         enqueue_mesh_tun_batch(records, &mut flows, started.elapsed(), &context, priority).await?;
-        if flows.len() > MAX_CLASSIFIERS {
-            let now = started.elapsed();
-            flows.retain(|_, state| now.saturating_sub(state.last_seen) < CLASSIFIER_IDLE);
-        }
     }
 }
 
 async fn enqueue_mesh_tun_batch(
     batch: Vec<TunIngressRecordV2>,
-    flows: &mut HashMap<FlowKey, MeshFlowStateV2>,
+    flows: &mut BoundedFlowTableV2<MeshFlowStateV2>,
     now: Duration,
     context: &MeshTunContextV2,
     priority: bool,
@@ -1020,7 +1093,7 @@ async fn enqueue_mesh_tun_batch(
             continue;
         }
         let snapshot = snapshots.load();
-        if let Some(state) = flows.get_mut(&key)
+        if let Some(state) = flows.get_mut(&key, now)
             && state.lease.snapshot_generation() != snapshot.generation()
         {
             if let Err(error) = state.lease.refresh(snapshot.clone()) {
@@ -1029,10 +1102,9 @@ async fn enqueue_mesh_tun_batch(
                 continue;
             }
             state.effective_route = path_mtu_constraints.apply(state.lease.route());
-            state.selected_route = state.lease.route();
             state.path_mtu_generation = path_mtu_constraints.generation();
         }
-        if let Entry::Vacant(entry) = flows.entry(key) {
+        if !flows.contains_key(&key) {
             let lease = match FlowRouteLeaseV2::resolve(snapshot, info.destination) {
                 Ok(lease) => lease,
                 Err(error) => {
@@ -1040,25 +1112,27 @@ async fn enqueue_mesh_tun_batch(
                     continue;
                 }
             };
-            entry.insert(MeshFlowStateV2 {
-                classifier: FlowClassifier::new(ClassifierConfig::default(), now),
-                last_seen: now,
-                selected_route: lease.route(),
-                effective_route: path_mtu_constraints.apply(lease.route()),
-                path_mtu_generation: path_mtu_constraints.generation(),
-                lease,
-            });
+            flows.insert(
+                key,
+                now,
+                MeshFlowStateV2 {
+                    classifier: FlowClassifier::new(ClassifierConfig::default(), now),
+                    effective_route: path_mtu_constraints.apply(lease.route()),
+                    path_mtu_generation: path_mtu_constraints.generation(),
+                    lease,
+                },
+            );
         }
-        let state = flows.get_mut(&key).expect("V2 mesh flow was inserted");
+        let state = flows.get_mut(&key, now).expect("V2 mesh flow was inserted");
         let path_mtu_generation = path_mtu_constraints.generation();
         if state.path_mtu_generation != path_mtu_generation {
             state.effective_route = path_mtu_constraints.apply(state.lease.route());
             state.path_mtu_generation = path_mtu_generation;
         }
-        state.last_seen = now;
         let class = state
             .classifier
             .observe(now, packet_len, 0, info.latency_protected);
+        let previous_route = state.lease.route();
         let selected_route = state.lease.select(now, packet_len, |route| {
             metrics
                 .get(&route.adjacency)
@@ -1067,20 +1141,18 @@ async fn enqueue_mesh_tun_batch(
                     RouteQualityV2 {
                         capacity_bits_per_second: route_quality
                             .effective_capacity_bps(route, first_hop_bps),
-                        queued_bytes: metrics
-                            .train_queue_bytes
-                            .load(Ordering::Relaxed)
-                            .saturating_add(metrics.latency_queue_bytes.load(Ordering::Relaxed)),
+                        // `train_queue_bytes` is the total scheduler depth and
+                        // already includes the latency lane.
+                        queued_bytes: metrics.train_queue_bytes.load(Ordering::Relaxed),
                     }
                 })
         });
-        if selected_route != state.selected_route {
+        if selected_route != previous_route {
             if let Some(selected_metrics) = metrics.get(&selected_route.adjacency) {
                 selected_metrics
                     .route_switches
                     .fetch_add(1, Ordering::Relaxed);
             }
-            state.selected_route = selected_route;
             state.effective_route = path_mtu_constraints.apply(selected_route);
             state.path_mtu_generation = path_mtu_constraints.generation();
         }
@@ -1118,6 +1190,15 @@ async fn enqueue_mesh_tun_batch(
         }
     }
     for ((route, flow_id, class, overlay_hop_limit), group) in grouped {
+        // This is the classifier-confirmed application boundary for the
+        // selected adjacency. Record it before the writer can service the
+        // train so a cold/loss-reduced BBR model still receives one timely
+        // capacity-discovery signal.
+        let classified_payload_bytes = group
+            .records
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>();
         let records = group
             .records
             .into_iter()
@@ -1149,6 +1230,9 @@ async fn enqueue_mesh_tun_batch(
             })
             .await
             .context("V2 mesh adjacency writer stopped")?;
+        if class == TrafficClass::Bulk {
+            metrics[&route.adjacency].observe_bulk_admission(classified_payload_bytes);
+        }
     }
     for (adjacency, observation) in ingress {
         metrics[&adjacency].observe_tun_ingress_batch(observation);
@@ -1493,6 +1577,12 @@ async fn mesh_control_loop(
         max_total_peers,
     } = context;
     let mut directory = PresenceDirectoryV2::new(network_id.clone())?;
+    let (topology_requests, topology_request_receiver) = watch::channel(None);
+    let (topology_result_sender, mut topology_results) = mpsc::channel(1);
+    tokio::spawn(topology_compiler_loop(
+        topology_request_receiver,
+        topology_result_sender,
+    ));
     directory.insert(local_presence.clone(), SystemTime::now())?;
     runtime_state.publish_presence_directory(&directory, max_total_peers);
     let encoded_local = local_presence.encode()?;
@@ -1505,6 +1595,7 @@ async fn mesh_control_loop(
             .context("V2 mesh writer stopped before local Presence")?;
     }
     let mut generation = 1_u64;
+    let mut deferred_record = None;
     let mut refresh = tokio::time::interval(Duration::from_secs(60));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     refresh.tick().await;
@@ -1512,17 +1603,25 @@ async fn mesh_control_loop(
         enum Event {
             Record(MeshControlRecordV2),
             PathMtu(MeshPathMtuEventV2),
+            Topology(Box<Result<TopologyCompileOutputV2>>),
             Refresh,
         }
-        let event = tokio::select! {
-            record = records.recv() => {
-                Event::Record(record.context("all V2 mesh control readers stopped")?)
-            }
-            event = path_mtu_events.recv() => {
-                Event::PathMtu(event.context("all V2 mesh adjacency writers stopped")?)
-            }
-            _ = refresh.tick() => {
-                Event::Refresh
+        let event = if let Some(record) = deferred_record.take() {
+            Event::Record(record)
+        } else {
+            tokio::select! {
+                record = records.recv() => {
+                    Event::Record(record.context("all V2 mesh control readers stopped")?)
+                }
+                event = path_mtu_events.recv() => {
+                    Event::PathMtu(event.context("all V2 mesh adjacency writers stopped")?)
+                }
+                result = topology_results.recv() => {
+                    Event::Topology(Box::new(result.context("V2 topology compiler stopped")?))
+                }
+                _ = refresh.tick() => {
+                    Event::Refresh
+                }
             }
         };
         let record = match event {
@@ -1536,6 +1635,10 @@ async fn mesh_control_loop(
                     .context("V2 mesh local path-MTU OAM writer stopped")?;
                 continue;
             }
+            Event::Topology(result) => {
+                publish_compiled_topology((*result)?, &routes, &snapshots).await?;
+                continue;
+            }
             Event::Refresh => {
                 refresh_local_presence_paths(&mut local_presence.body, &adjacencies, bind);
                 refresh_and_publish_local_presence(
@@ -1545,8 +1648,7 @@ async fn mesh_control_loop(
                     &secret_key,
                     &mut directory,
                     &mut generation,
-                    &routes,
-                    &snapshots,
+                    &topology_requests,
                     &commands,
                     allow_default_routes,
                     &runtime_state,
@@ -1561,15 +1663,33 @@ async fn mesh_control_loop(
             .context("V2 control record has no adjacency metrics")?
             .observe_control_rx(&record.bytes);
         if SignedPresenceV2::is_record(&record.bytes) {
-            let presence = SignedPresenceV2::decode(record.bytes)?;
-            apply_mesh_presence(
-                &mut directory,
-                presence,
+            let mut updates = vec![(
+                SignedPresenceV2::decode(record.bytes)?,
                 Some(record.incoming),
+            )];
+            // Presence floods commonly arrive as a burst. Preserve control
+            // record ordering, but fold the consecutive Presence prefix into
+            // one topology compilation and one snapshot publication.
+            while let Ok(record) = records.try_recv() {
+                if !SignedPresenceV2::is_record(&record.bytes) {
+                    deferred_record = Some(record);
+                    break;
+                }
+                metrics
+                    .get(&record.incoming)
+                    .context("V2 control record has no adjacency metrics")?
+                    .observe_control_rx(&record.bytes);
+                updates.push((
+                    SignedPresenceV2::decode(record.bytes)?,
+                    Some(record.incoming),
+                ));
+            }
+            apply_mesh_presences(
+                &mut directory,
+                updates,
                 &mut generation,
                 local_id,
-                &routes,
-                &snapshots,
+                &topology_requests,
                 &commands,
                 allow_default_routes,
                 &runtime_state,
@@ -1787,8 +1907,7 @@ async fn refresh_and_publish_local_presence(
     secret_key: &SecretKey,
     directory: &mut PresenceDirectoryV2,
     generation: &mut u64,
-    routes: &mpsc::Sender<RouteAdvertisementV2>,
-    snapshots: &DataplaneSnapshotStoreV2,
+    topology_requests: &watch::Sender<Option<TopologyCompileRequestV2>>,
     commands: &HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
     allow_default_routes: bool,
     runtime_state: &V2RuntimeState,
@@ -1803,14 +1922,12 @@ async fn refresh_and_publish_local_presence(
     local_presence.body.issued_unix_secs = now;
     local_presence.body.expires_unix_secs = now.saturating_add(180);
     *local_presence = SignedPresenceV2::sign(local_presence.body.clone(), secret_key, network_id)?;
-    apply_mesh_presence(
+    apply_mesh_presences(
         directory,
-        local_presence.clone(),
-        None,
+        vec![(local_presence.clone(), None)],
         generation,
         local_id,
-        routes,
-        snapshots,
+        topology_requests,
         commands,
         allow_default_routes,
         runtime_state,
@@ -1845,58 +1962,51 @@ async fn relay_reverse_control(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn apply_mesh_presence(
+async fn apply_mesh_presences(
     directory: &mut PresenceDirectoryV2,
-    presence: SignedPresenceV2,
-    incoming: Option<AdjacencyIdV2>,
+    presences: Vec<(SignedPresenceV2, Option<AdjacencyIdV2>)>,
     generation: &mut u64,
     local_id: EndpointId,
-    routes: &mpsc::Sender<RouteAdvertisementV2>,
-    snapshots: &DataplaneSnapshotStoreV2,
+    topology_requests: &watch::Sender<Option<TopologyCompileRequestV2>>,
     commands: &HashMap<AdjacencyIdV2, mpsc::Sender<MeshTxCommandV2>>,
     allow_default_routes: bool,
     runtime_state: &V2RuntimeState,
     max_total_peers: usize,
 ) -> Result<()> {
-    let encoded = presence.encode()?;
-    let owner = presence.body.owner;
-    let update = directory.insert(presence, SystemTime::now())?;
-    if matches!(
-        update,
-        PresenceUpdateV2::Duplicate | PresenceUpdateV2::Stale
-    ) {
-        return Ok(());
-    }
-    for (&adjacency, sender) in commands {
-        if incoming != Some(adjacency) {
-            sender
-                .send(MeshTxCommandV2::Control(TxControl::Send(encoded.clone())))
-                .await
-                .context("V2 mesh Presence gossip writer stopped")?;
+    let mut structural_update = None;
+    for (presence, incoming) in presences {
+        let encoded = presence.encode()?;
+        let owner = presence.body.owner;
+        let update = directory.insert(presence, SystemTime::now())?;
+        if matches!(
+            update,
+            PresenceUpdateV2::Duplicate | PresenceUpdateV2::Stale
+        ) {
+            continue;
+        }
+        for (&adjacency, sender) in commands {
+            if incoming != Some(adjacency) {
+                sender
+                    .send(MeshTxCommandV2::Control(TxControl::Send(encoded.clone())))
+                    .await
+                    .context("V2 mesh Presence gossip writer stopped")?;
+            }
+        }
+        if update == PresenceUpdateV2::Renewed {
+            debug!(%owner, "accepted V2 Presence lease renewal without route epoch churn");
+        } else {
+            structural_update = Some((owner, update));
         }
     }
-    if update == PresenceUpdateV2::Renewed {
+    let Some((owner, update)) = structural_update else {
         runtime_state.publish_presence_directory(directory, max_total_peers);
-        debug!(%owner, "accepted V2 Presence lease renewal without route epoch churn");
         return Ok(());
-    }
+    };
     *generation = generation
         .checked_add(1)
         .context("V2 mesh generation overflow")?;
     let route_epoch = u32::try_from(*generation).context("V2 mesh route epoch space exhausted")?;
-    let topology = directory.compile_topology(
-        *generation,
-        route_epoch,
-        allow_default_routes,
-        SystemTime::now(),
-    )?;
-    let local = topology
-        .snapshot(crate::protocol::v2::routing::NodeIdV2(*local_id.as_bytes()))
-        .context("compiled V2 mesh topology omitted local node")?
-        .clone();
-    let route_count = local.route_count();
-    let label_count = local.label_count();
-    snapshots.publish(local)?;
+    directory.prune(SystemTime::now())?;
     let mut learned_prefixes = directory
         .records()
         .filter(|presence| presence.body.owner != local_id)
@@ -1912,19 +2022,40 @@ async fn apply_mesh_presence(
     learned_prefixes
         .sort_by_key(|prefix| (prefix.addr().is_ipv6(), prefix.addr(), prefix.prefix_len()));
     learned_prefixes.dedup();
+    topology_requests.send_replace(Some(TopologyCompileRequestV2 {
+        directory: directory.clone(),
+        generation: *generation,
+        route_epoch,
+        allow_default_routes,
+        local_id,
+        learned_prefixes,
+        owner,
+        update,
+    }));
+    runtime_state.publish_presence_directory(directory, max_total_peers);
+    Ok(())
+}
+
+async fn publish_compiled_topology(
+    output: TopologyCompileOutputV2,
+    routes: &mpsc::Sender<RouteAdvertisementV2>,
+    snapshots: &DataplaneSnapshotStoreV2,
+) -> Result<()> {
+    let route_count = output.snapshot.route_count();
+    let label_count = output.snapshot.label_count();
+    snapshots.publish(output.snapshot)?;
     routes
         .send(RouteAdvertisementV2 {
-            generation: *generation,
-            prefixes: learned_prefixes,
+            generation: output.generation,
+            prefixes: output.learned_prefixes,
         })
         .await
         .context("V2 mesh route manager stopped")?;
-    runtime_state.publish_presence_directory(directory, max_total_peers);
     info!(
-        %owner,
-        ?update,
-        generation = *generation,
-        route_epoch,
+        owner = %output.owner,
+        update = ?output.update,
+        generation = output.generation,
+        route_epoch = output.route_epoch,
         route_count,
         label_count,
         "published authenticated V2 mesh snapshot"
@@ -2044,6 +2175,13 @@ mod tests {
         let mut next_epoch = route;
         next_epoch.route_epoch = 10;
         assert_eq!(constraints.apply(next_epoch).maximum_datagram_size, 1_382);
+
+        constraints.constrain(10, next_epoch.route_label, 1_250);
+        assert_eq!(constraints.apply(next_epoch).maximum_datagram_size, 1_250);
+        assert_eq!(constraints.apply(route).maximum_datagram_size, 1_382);
+
+        constraints.constrain(9, route.route_label, 1_100);
+        assert_eq!(constraints.apply(next_epoch).maximum_datagram_size, 1_250);
     }
 
     #[tokio::test]

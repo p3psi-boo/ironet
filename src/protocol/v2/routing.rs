@@ -1,4 +1,6 @@
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
     time::Duration,
@@ -65,6 +67,117 @@ pub struct PrefixRouteV2 {
     pub route: ResolvedRouteV2,
     /// Sum of authenticated adjacency RTT costs for this compiled path.
     pub startup_latency: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct PrefixRouteIndexV2 {
+    routes: HashMap<(u8, IpAddr), Vec<PrefixRouteV2>>,
+    v4_lengths: Vec<u8>,
+    v6_lengths: Vec<u8>,
+    route_count: usize,
+}
+
+impl PrefixRouteIndexV2 {
+    fn compile(routes: Vec<PrefixRouteV2>) -> Self {
+        let route_count = routes.len();
+        let mut index = Self {
+            routes: HashMap::default(),
+            v4_lengths: Vec::new(),
+            v6_lengths: Vec::new(),
+            route_count,
+        };
+        for route in routes {
+            let length = route.prefix.prefix_len();
+            let lengths = if route.prefix.addr().is_ipv4() {
+                &mut index.v4_lengths
+            } else {
+                &mut index.v6_lengths
+            };
+            lengths.push(length);
+            index
+                .routes
+                .entry((length, route.prefix.network()))
+                .or_default()
+                .push(route);
+        }
+        prepare_prefix_lengths(&mut index.v4_lengths);
+        prepare_prefix_lengths(&mut index.v6_lengths);
+        index
+    }
+
+    fn lookup(&self, destination: IpAddr) -> Option<&[PrefixRouteV2]> {
+        let lengths = if destination.is_ipv4() {
+            &self.v4_lengths
+        } else {
+            &self.v6_lengths
+        };
+        for &prefix_len in lengths {
+            let network = masked_address(destination, prefix_len);
+            if let Some(routes) = self.routes.get(&(prefix_len, network)) {
+                return Some(routes);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PrefixSetV2 {
+    prefixes: HashSet<(u8, IpAddr)>,
+    v4_lengths: Vec<u8>,
+    v6_lengths: Vec<u8>,
+}
+
+impl PrefixSetV2 {
+    fn compile(prefixes: Vec<IpNet>) -> Self {
+        let mut set = Self::default();
+        for prefix in prefixes {
+            let length = prefix.prefix_len();
+            if prefix.addr().is_ipv4() {
+                set.v4_lengths.push(length);
+            } else {
+                set.v6_lengths.push(length);
+            }
+            set.prefixes.insert((length, prefix.network()));
+        }
+        prepare_prefix_lengths(&mut set.v4_lengths);
+        prepare_prefix_lengths(&mut set.v6_lengths);
+        set
+    }
+
+    fn contains(&self, address: IpAddr) -> bool {
+        let lengths = if address.is_ipv4() {
+            &self.v4_lengths
+        } else {
+            &self.v6_lengths
+        };
+        lengths.iter().any(|&length| {
+            self.prefixes
+                .contains(&(length, masked_address(address, length)))
+        })
+    }
+}
+
+fn prepare_prefix_lengths(lengths: &mut Vec<u8>) {
+    lengths.sort_unstable_by(|left, right| right.cmp(left));
+    lengths.dedup();
+}
+
+fn masked_address(address: IpAddr, prefix_len: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(prefix_len))
+                .unwrap_or(0);
+            IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask))
+        }
+        IpAddr::V6(address) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(prefix_len))
+                .unwrap_or(0);
+            IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,9 +425,8 @@ impl OamControlV2 {
 pub struct DataplaneSnapshotV2 {
     generation: u64,
     local_node: [u8; 32],
-    prefixes_v4: Vec<PrefixRouteV2>,
-    prefixes_v6: Vec<PrefixRouteV2>,
-    underlay_exclusion_prefixes: Vec<IpNet>,
+    prefixes: PrefixRouteIndexV2,
+    underlay_exclusions: PrefixSetV2,
     labels: HashMap<RouteLabelV2, LabelRouteV2>,
     source_routes: HashMap<(u32, RouteLabelV2), ResolvedRouteV2>,
 }
@@ -387,31 +499,20 @@ impl DataplaneSnapshotV2 {
         }
         let mut source_routes = HashMap::default();
         for route in prefixes.iter().map(|entry| entry.route) {
-            ensure!(
-                source_routes
-                    .insert((route.route_epoch, route.route_label), route)
-                    .is_none(),
-                "duplicate V2 source route label"
-            );
+            let key = (route.route_epoch, route.route_label);
+            if let Some(existing) = source_routes.insert(key, route) {
+                ensure!(
+                    existing == route,
+                    "V2 source route label resolves to multiple paths"
+                );
+            }
         }
 
-        let mut prefixes_v4 = prefixes
-            .iter()
-            .filter(|entry| entry.prefix.addr().is_ipv4())
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut prefixes_v6 = prefixes
-            .into_iter()
-            .filter(|entry| entry.prefix.addr().is_ipv6())
-            .collect::<Vec<_>>();
-        sort_longest_prefix_first(&mut prefixes_v4);
-        sort_longest_prefix_first(&mut prefixes_v6);
         Ok(Self {
             generation,
             local_node,
-            prefixes_v4,
-            prefixes_v6,
-            underlay_exclusion_prefixes,
+            prefixes: PrefixRouteIndexV2::compile(prefixes),
+            underlay_exclusions: PrefixSetV2::compile(underlay_exclusion_prefixes),
             labels: label_map,
             source_routes,
         })
@@ -433,7 +534,7 @@ impl DataplaneSnapshotV2 {
     }
 
     pub fn route_count(&self) -> usize {
-        self.prefixes_v4.len() + self.prefixes_v6.len()
+        self.prefixes.route_count
     }
 
     pub fn label_count(&self) -> usize {
@@ -475,21 +576,12 @@ impl DataplaneSnapshotV2 {
         &self,
         destination: IpAddr,
     ) -> std::result::Result<ResolvedRouteV2, TransitDropReasonV2> {
-        if self
-            .underlay_exclusion_prefixes
-            .iter()
-            .any(|prefix| prefix.contains(&destination))
-        {
+        if self.underlay_exclusions.contains(destination) {
             return Err(TransitDropReasonV2::UnderlayDestination);
         }
-        let routes = if destination.is_ipv4() {
-            &self.prefixes_v4
-        } else {
-            &self.prefixes_v6
-        };
-        routes
-            .iter()
-            .find(|entry| entry.prefix.contains(&destination))
+        self.prefixes
+            .lookup(destination)
+            .and_then(|routes| routes.first())
             .map(|entry| entry.route)
             .ok_or(TransitDropReasonV2::NoRoute)
     }
@@ -498,28 +590,15 @@ impl DataplaneSnapshotV2 {
         &self,
         destination: IpAddr,
     ) -> std::result::Result<Vec<(ResolvedRouteV2, Duration)>, TransitDropReasonV2> {
-        if self
-            .underlay_exclusion_prefixes
-            .iter()
-            .any(|prefix| prefix.contains(&destination))
-        {
+        if self.underlay_exclusions.contains(destination) {
             return Err(TransitDropReasonV2::UnderlayDestination);
         }
-        let routes = if destination.is_ipv4() {
-            &self.prefixes_v4
-        } else {
-            &self.prefixes_v6
-        };
-        let prefix_len = routes
-            .iter()
-            .find(|entry| entry.prefix.contains(&destination))
-            .map(|entry| entry.prefix.prefix_len())
+        let routes = self
+            .prefixes
+            .lookup(destination)
             .ok_or(TransitDropReasonV2::NoRoute)?;
         Ok(routes
             .iter()
-            .filter(|entry| {
-                entry.prefix.prefix_len() == prefix_len && entry.prefix.contains(&destination)
-            })
             .map(|entry| (entry.route, entry.startup_latency))
             .collect())
     }
@@ -769,13 +848,6 @@ struct DirectedLinkV2 {
     maximum_datagram_size: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RouteDemandV2 {
-    source: NodeIdV2,
-    owner: NodeIdV2,
-    prefix: IpNet,
-}
-
 #[derive(Debug, Default)]
 struct SnapshotPartsV2 {
     prefixes: Vec<PrefixRouteV2>,
@@ -784,14 +856,57 @@ struct SnapshotPartsV2 {
 
 /// Compile the same authenticated Presence/link generation into every node's
 /// immutable view. A globally deterministic label is allocated per
-/// `(source, owner, prefix)` path, so converging routes retain one expected
-/// ingress at every hop and cannot reflect into a different source tree.
+/// `(source, owner, candidate path)`, so every prefix owned by the same node
+/// shares its path labels. Converging routes retain one expected ingress at
+/// every hop and cannot reflect into a different source tree.
 pub fn compile_topology_v2(
     generation: u64,
     route_epoch: u32,
     nodes: Vec<TopologyNodeV2>,
     links: Vec<TopologyLinkV2>,
     allow_default_routes: bool,
+) -> Result<CompiledTopologyV2> {
+    compile_topology_selected_v2(
+        generation,
+        route_epoch,
+        nodes,
+        links,
+        allow_default_routes,
+        None,
+    )
+}
+
+/// Compile only the immutable view consumed by `local_node`. Global label
+/// allocation still walks every source/owner path so labels remain identical
+/// to a full compile, but no other node's prefix and label tables are built.
+pub fn compile_local_snapshot_v2(
+    generation: u64,
+    route_epoch: u32,
+    nodes: Vec<TopologyNodeV2>,
+    links: Vec<TopologyLinkV2>,
+    allow_default_routes: bool,
+    local_node: NodeIdV2,
+) -> Result<DataplaneSnapshotV2> {
+    compile_topology_selected_v2(
+        generation,
+        route_epoch,
+        nodes,
+        links,
+        allow_default_routes,
+        Some(local_node),
+    )?
+    .snapshots
+    .remove(&local_node)
+    .context("compiled V2 mesh topology omitted local node")
+}
+
+fn compile_topology_selected_v2(
+    generation: u64,
+    route_epoch: u32,
+    nodes: Vec<TopologyNodeV2>,
+    links: Vec<TopologyLinkV2>,
+    allow_default_routes: bool,
+    selected_node: Option<NodeIdV2>,
 ) -> Result<CompiledTopologyV2> {
     ensure!(generation != 0, "V2 topology generation zero is reserved");
     ensure!(route_epoch != 0, "V2 route epoch zero is reserved");
@@ -865,106 +980,101 @@ pub fn compile_topology_v2(
 
     let mut node_ids = node_map.keys().copied().collect::<Vec<_>>();
     node_ids.sort_unstable();
+    if let Some(selected_node) = selected_node {
+        ensure!(
+            node_map.contains_key(&selected_node),
+            "selected V2 topology node is absent"
+        );
+    }
     let transit_nodes = node_map
         .values()
         .filter(|node| node.transit_enabled)
         .map(|node| node.node_id)
         .collect::<HashSet<_>>();
-    let mut demands = Vec::new();
-    for source in &node_ids {
-        for owner in &node_ids {
-            if source == owner {
-                continue;
-            }
-            for prefix in &node_map[owner].advertised_prefixes {
-                demands.push(RouteDemandV2 {
-                    source: *source,
-                    owner: *owner,
-                    prefix: *prefix,
-                });
-            }
-        }
-    }
-    demands.sort_by_key(|demand| {
-        (
-            demand.source,
-            demand.owner,
-            family(&demand.prefix),
-            demand.prefix.addr(),
-            demand.prefix.prefix_len(),
-        )
-    });
     let mut parts = node_ids
         .iter()
         .copied()
+        .filter(|node| selected_node.is_none_or(|selected| selected == *node))
         .map(|node| (node, SnapshotPartsV2::default()))
         .collect::<HashMap<_, _>>();
     let mut next_route_label = 1_u32;
-    for demand in demands {
-        for path in candidate_paths_v2(demand.source, demand.owner, &graph, &transit_nodes) {
-            ensure!(
-                usize::try_from(next_route_label).unwrap_or(usize::MAX) <= MAX_ROUTE_LABELS,
-                "V2 topology exceeds route-label capacity"
-            );
-            debug_assert!(path.len() >= 2);
-            let route_label = RouteLabelV2::new(next_route_label)?;
-            next_route_label = next_route_label
-                .checked_add(1)
-                .context("V2 route label overflow")?;
-            let path_links = path
-                .windows(2)
-                .map(|hop| directed_link_v2(&graph, hop[0], hop[1]))
-                .collect::<Result<Vec<_>>>()?;
-            let first_hop = path_links[0];
-            let startup_latency =
-                Duration::from_micros(path_links.iter().map(|link| u64::from(link.cost)).sum());
-            let maximum_datagram_size = path_links
-                .iter()
-                .map(|link| link.maximum_datagram_size)
-                .min()
-                .context("V2 compiled path has no adjacency")?;
-            parts
-                .get_mut(&demand.source)
-                .expect("source topology parts exist")
-                .prefixes
-                .push(PrefixRouteV2 {
-                    prefix: demand.prefix,
-                    route: ResolvedRouteV2 {
-                        adjacency: first_hop.adjacency,
-                        route_label,
-                        route_epoch,
-                        maximum_datagram_size,
-                    },
-                    startup_latency,
-                });
-            for hop in 1..path.len() {
-                let current = path[hop];
-                let previous = path[hop - 1];
-                let expected_ingress = directed_link_v2(&graph, current, previous)?.adjacency;
-                let action = if hop + 1 == path.len() {
-                    LabelActionV2::Local { expected_ingress }
-                } else {
-                    let next_hop = directed_link_v2(&graph, current, path[hop + 1])?.adjacency;
-                    LabelActionV2::Forward {
-                        expected_ingress,
-                        next_hop,
+    for &source in &node_ids {
+        for &owner in &node_ids {
+            if source == owner {
+                continue;
+            }
+            let mut prefixes = node_map[&owner].advertised_prefixes.clone();
+            if prefixes.is_empty() {
+                continue;
+            }
+            prefixes.sort_by_key(|prefix| (family(prefix), prefix.addr(), prefix.prefix_len()));
+            let paths = candidate_paths_v2(source, owner, &graph, &transit_nodes);
+            for path in paths {
+                ensure!(
+                    usize::try_from(next_route_label).unwrap_or(usize::MAX) <= MAX_ROUTE_LABELS,
+                    "V2 topology exceeds route-label capacity"
+                );
+                debug_assert!(path.len() >= 2);
+                let route_label = RouteLabelV2::new(next_route_label)?;
+                next_route_label = next_route_label
+                    .checked_add(1)
+                    .context("V2 route label overflow")?;
+                let path_links = path
+                    .windows(2)
+                    .map(|hop| directed_link_v2(&graph, hop[0], hop[1]))
+                    .collect::<Result<Vec<_>>>()?;
+                let first_hop = path_links[0];
+                let startup_latency =
+                    Duration::from_micros(path_links.iter().map(|link| u64::from(link.cost)).sum());
+                let maximum_datagram_size = path_links
+                    .iter()
+                    .map(|link| link.maximum_datagram_size)
+                    .min()
+                    .context("V2 compiled path has no adjacency")?;
+                if let Some(source_parts) = parts.get_mut(&source) {
+                    source_parts
+                        .prefixes
+                        .extend(prefixes.iter().copied().map(|prefix| PrefixRouteV2 {
+                            prefix,
+                            route: ResolvedRouteV2 {
+                                adjacency: first_hop.adjacency,
+                                route_label,
+                                route_epoch,
+                                maximum_datagram_size,
+                            },
+                            startup_latency,
+                        }));
+                }
+                for hop in 1..path.len() {
+                    let current = path[hop];
+                    let previous = path[hop - 1];
+                    let expected_ingress = directed_link_v2(&graph, current, previous)?.adjacency;
+                    let action = if hop + 1 == path.len() {
+                        LabelActionV2::Local { expected_ingress }
+                    } else {
+                        let next_hop = directed_link_v2(&graph, current, path[hop + 1])?.adjacency;
+                        LabelActionV2::Forward {
+                            expected_ingress,
+                            next_hop,
+                        }
+                    };
+                    if let Some(current_parts) = parts.get_mut(&current) {
+                        current_parts.labels.push(LabelRouteV2 {
+                            route_label,
+                            route_epoch,
+                            action,
+                        });
                     }
-                };
-                parts
-                    .get_mut(&current)
-                    .expect("transit topology parts exist")
-                    .labels
-                    .push(LabelRouteV2 {
-                        route_label,
-                        route_epoch,
-                        action,
-                    });
+                }
             }
         }
     }
 
     let mut snapshots = HashMap::default();
-    for node_id in node_ids {
+    for node_id in node_ids
+        .into_iter()
+        .filter(|node| selected_node.is_none_or(|selected| selected == *node))
+    {
         let node = &node_map[&node_id];
         let part = parts.remove(&node_id).expect("topology parts exist");
         let snapshot = DataplaneSnapshotV2::compile(
@@ -1031,18 +1141,19 @@ fn shortest_path_excluding_v2(
     let mut distance = HashMap::<NodeIdV2, u64>::default();
     let mut previous = HashMap::<NodeIdV2, NodeIdV2>::default();
     let mut visited = HashSet::default();
+    let mut pending = BinaryHeap::new();
     distance.insert(source, 0);
-    loop {
-        let current = distance
-            .iter()
-            .filter(|(node, _)| Some(**node) != excluded && !visited.contains(*node))
-            .min_by_key(|(node, cost)| (**cost, **node))
-            .map(|(node, cost)| (*node, *cost));
-        let (current, current_cost) = current?;
+    pending.push(Reverse((0_u64, source)));
+    while let Some(Reverse((current_cost, current))) = pending.pop() {
+        if Some(current) == excluded || distance.get(&current).copied() != Some(current_cost) {
+            continue;
+        }
+        if !visited.insert(current) {
+            continue;
+        }
         if current == destination {
             break;
         }
-        visited.insert(current);
         if current != source && !transit_nodes.contains(&current) {
             continue;
         }
@@ -1062,8 +1173,12 @@ fn shortest_path_excluding_v2(
             if replace {
                 distance.insert(edge.peer, candidate);
                 previous.insert(edge.peer, current);
+                pending.push(Reverse((candidate, edge.peer)));
             }
         }
+    }
+    if !distance.contains_key(&destination) {
+        return None;
     }
     let mut path = vec![destination];
     while *path.last()? != source {
@@ -1135,16 +1250,6 @@ fn validate_prefix_set<'a>(
     canonical.dedup();
     ensure!(canonical.len() == count, "duplicate V2 {kind} prefix");
     Ok(())
-}
-
-fn sort_longest_prefix_first(routes: &mut [PrefixRouteV2]) {
-    routes.sort_by(|left, right| {
-        right
-            .prefix
-            .prefix_len()
-            .cmp(&left.prefix.prefix_len())
-            .then_with(|| left.prefix.addr().cmp(&right.prefix.addr()))
-    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1803,6 +1908,44 @@ mod tests {
                 false,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn owner_prefixes_share_path_labels_and_local_compile_matches_full_view() {
+        let source = NodeIdV2([1; 32]);
+        let owner = NodeIdV2([2; 32]);
+        let nodes = vec![node(1, &[]), node(2, &["10.20.0.0/16", "10.30.0.0/16"])];
+        let links = vec![TopologyLinkV2 {
+            left: source,
+            right: owner,
+            left_adjacency: adjacency(1),
+            right_adjacency: adjacency(2),
+            cost: 10,
+            healthy: true,
+            maximum_datagram_size: 1_300,
+        }];
+        let full = compile_topology_v2(4, 11, nodes.clone(), links.clone(), false).unwrap();
+        let full_source = full.snapshot(source).unwrap();
+        let first = full_source
+            .lookup_destination("10.20.1.1".parse().unwrap())
+            .unwrap();
+        let second = full_source
+            .lookup_destination("10.30.1.1".parse().unwrap())
+            .unwrap();
+        assert_eq!(first.route_label, second.route_label);
+        assert_eq!(full.snapshot(owner).unwrap().label_count(), 1);
+
+        let local = compile_local_snapshot_v2(4, 11, nodes, links, false, source).unwrap();
+        assert_eq!(local.route_count(), full_source.route_count());
+        assert_eq!(local.label_count(), full_source.label_count());
+        assert_eq!(
+            local.lookup_destination("10.20.1.1".parse().unwrap()),
+            Ok(first)
+        );
+        assert_eq!(
+            local.lookup_destination("10.30.1.1".parse().unwrap()),
+            Ok(second)
         );
     }
 }

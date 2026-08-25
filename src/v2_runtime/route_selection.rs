@@ -1,26 +1,50 @@
 use std::{
+    collections::VecDeque,
     net::IpAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, ensure};
 use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
 
 use crate::protocol::v2::{
     route_feedback::RouteDeliveryFeedbackV2,
     routing::{DataplaneSnapshotV2, MAX_ROUTE_LABELS, ResolvedRouteV2},
 };
 
-const ROUTE_LEASE: Duration = Duration::from_secs(1);
-const ROUTE_IDLE_RESET: Duration = Duration::from_secs(2);
-const ROUTE_SWITCH_PENALTY: Duration = Duration::from_millis(25);
-const ROUTE_SWITCH_GAIN_DIVISOR: u32 = 20;
-const ROUTE_SWITCH_CONFIRMATIONS: u8 = 2;
-const PRESSURE_DRAIN_BYTES_PER_SECOND: u64 = 256 * 1024;
-const PACKET_ALLOWANCE_BYTES: usize = 256;
-const MAX_PRESSURE_BYTES: u64 = 64 * 1024 * 1024;
-const UNKNOWN_ROUTE_CAPACITY_BPS: u64 = 10_000_000;
+const ROUTE_CAPACITY_WINDOW: Duration = Duration::from_secs(30);
+const MAX_ROUTE_CAPACITY_SAMPLES: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+struct RouteSelectionPolicyV2 {
+    lease: Duration,
+    idle_reset: Duration,
+    switch_penalty: Duration,
+    switch_gain_divisor: u32,
+    switch_confirmations: u8,
+    pressure_drain_bytes_per_second: u64,
+    packet_allowance_bytes: usize,
+    maximum_pressure_bytes: u64,
+    unknown_capacity_bps: u64,
+}
+
+impl Default for RouteSelectionPolicyV2 {
+    fn default() -> Self {
+        Self {
+            lease: Duration::from_secs(1),
+            idle_reset: Duration::from_secs(2),
+            switch_penalty: Duration::from_millis(25),
+            switch_gain_divisor: 20,
+            switch_confirmations: 2,
+            pressure_drain_bytes_per_second: 256 * 1024,
+            packet_allowance_bytes: 256,
+            maximum_pressure_bytes: 64 * 1024 * 1024,
+            unknown_capacity_bps: 10_000_000,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct RouteQualityV2 {
@@ -30,9 +54,10 @@ pub(super) struct RouteQualityV2 {
 
 #[derive(Debug, Clone)]
 pub(super) struct FlowRouteLeaseV2 {
-    snapshot: Arc<DataplaneSnapshotV2>,
+    policy: RouteSelectionPolicyV2,
+    snapshot_generation: u64,
     destination: IpAddr,
-    candidates: Vec<(ResolvedRouteV2, Duration)>,
+    candidates: SmallVec<[(ResolvedRouteV2, Duration); 4]>,
     selected: usize,
     pending_selection: Option<usize>,
     pending_confirmations: u8,
@@ -43,12 +68,15 @@ pub(super) struct FlowRouteLeaseV2 {
 
 impl FlowRouteLeaseV2 {
     pub fn resolve(snapshot: Arc<DataplaneSnapshotV2>, destination: IpAddr) -> Result<Self> {
-        let candidates = snapshot
+        let candidates: SmallVec<[(ResolvedRouteV2, Duration); 4]> = snapshot
             .lookup_destination_candidates(destination)
-            .map_err(|reason| anyhow::anyhow!("V2 flow route lookup failed: {reason:?}"))?;
+            .map_err(|reason| anyhow::anyhow!("V2 flow route lookup failed: {reason:?}"))?
+            .into_iter()
+            .collect();
         ensure!(!candidates.is_empty(), "V2 flow route has no candidates");
         Ok(Self {
-            snapshot,
+            policy: RouteSelectionPolicyV2::default(),
+            snapshot_generation: snapshot.generation(),
             destination,
             candidates,
             selected: 0,
@@ -78,18 +106,19 @@ impl FlowRouteLeaseV2 {
         let elapsed = self
             .updated_at
             .map_or(Duration::ZERO, |updated| now.saturating_sub(updated));
-        if elapsed >= ROUTE_IDLE_RESET {
+        if elapsed >= self.policy.idle_reset {
             self.pressure_bytes = 0;
             self.lease_until = Duration::ZERO;
         } else {
-            self.pressure_bytes = self
-                .pressure_bytes
-                .saturating_sub(bytes_for_duration(PRESSURE_DRAIN_BYTES_PER_SECOND, elapsed));
+            self.pressure_bytes = self.pressure_bytes.saturating_sub(bytes_for_duration(
+                self.policy.pressure_drain_bytes_per_second,
+                elapsed,
+            ));
         }
         self.pressure_bytes = self
             .pressure_bytes
-            .saturating_add(packet_len.saturating_sub(PACKET_ALLOWANCE_BYTES) as u64)
-            .min(MAX_PRESSURE_BYTES);
+            .saturating_add(packet_len.saturating_sub(self.policy.packet_allowance_bytes) as u64)
+            .min(self.policy.maximum_pressure_bytes);
         self.updated_at = Some(now);
 
         if now < self.lease_until {
@@ -100,14 +129,14 @@ impl FlowRouteLeaseV2 {
         let score = |route: ResolvedRouteV2, startup_latency: Duration| {
             let quality = quality(route);
             let capacity = if quality.capacity_bits_per_second == 0 {
-                UNKNOWN_ROUTE_CAPACITY_BPS
+                self.policy.unknown_capacity_bps
             } else {
                 quality.capacity_bits_per_second
             };
             let switch_penalty = if route == previous {
                 Duration::ZERO
             } else {
-                ROUTE_SWITCH_PENALTY
+                self.policy.switch_penalty
             };
             startup_latency
                 .saturating_add(transfer_time(
@@ -128,7 +157,7 @@ impl FlowRouteLeaseV2 {
             self.candidates[self.selected].1,
         );
         let best_score = score(self.candidates[best].0, self.candidates[best].1);
-        let minimum_gain = current_score / ROUTE_SWITCH_GAIN_DIVISOR;
+        let minimum_gain = current_score / self.policy.switch_gain_divisor;
         let has_material_gain =
             best != self.selected && current_score.saturating_sub(best_score) > minimum_gain;
 
@@ -139,28 +168,30 @@ impl FlowRouteLeaseV2 {
                 self.pending_selection = Some(best);
                 self.pending_confirmations = 1;
             }
-            if self.pending_confirmations >= ROUTE_SWITCH_CONFIRMATIONS {
+            if self.pending_confirmations >= self.policy.switch_confirmations {
                 self.selected = best;
                 self.clear_pending_selection();
             }
         } else {
             self.clear_pending_selection();
         }
-        self.lease_until = now.saturating_add(ROUTE_LEASE);
+        self.lease_until = now.saturating_add(self.policy.lease);
         self.route()
     }
 
     pub fn snapshot_generation(&self) -> u64 {
-        self.snapshot.generation()
+        self.snapshot_generation
     }
 
     pub fn refresh(&mut self, snapshot: Arc<DataplaneSnapshotV2>) -> Result<bool> {
-        if snapshot.generation() == self.snapshot.generation() {
+        if snapshot.generation() == self.snapshot_generation {
             return Ok(false);
         }
         self.candidates = snapshot
             .lookup_destination_candidates(self.destination)
-            .map_err(|reason| anyhow::anyhow!("V2 flow route refresh failed: {reason:?}"))?;
+            .map_err(|reason| anyhow::anyhow!("V2 flow route refresh failed: {reason:?}"))?
+            .into_iter()
+            .collect();
         ensure!(
             !self.candidates.is_empty(),
             "V2 flow route has no candidates"
@@ -168,7 +199,7 @@ impl FlowRouteLeaseV2 {
         self.selected = 0;
         self.clear_pending_selection();
         self.lease_until = Duration::ZERO;
-        self.snapshot = snapshot;
+        self.snapshot_generation = snapshot.generation();
         Ok(true)
     }
 
@@ -183,53 +214,110 @@ mod evaluation;
 
 #[derive(Debug, Clone, Copy)]
 struct RouteCapacitySampleV2 {
-    sequence: u64,
     capacity_bps: u64,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct RouteCapacityWindowV2 {
+    last_sequence: u64,
+    maxima: VecDeque<RouteCapacitySampleV2>,
+}
+
+#[derive(Debug, Default)]
+struct RouteQualityStateV2 {
+    active_epoch: u32,
+    samples: HashMap<u32, RouteCapacityWindowV2>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct RouteQualityTableV2 {
-    samples: Mutex<HashMap<(u32, u32), RouteCapacitySampleV2>>,
+    state: Mutex<RouteQualityStateV2>,
 }
 
 impl RouteQualityTableV2 {
     pub fn observe(&self, feedback: RouteDeliveryFeedbackV2) {
-        let mut samples = self
-            .samples
+        self.observe_at(feedback, Instant::now());
+    }
+
+    fn observe_at(&self, feedback: RouteDeliveryFeedbackV2, now: Instant) {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if samples.len() >= MAX_ROUTE_LABELS
-            && !samples.contains_key(&(feedback.route_epoch, feedback.route_label.0))
-        {
-            samples.clear();
+        if state.active_epoch != feedback.route_epoch {
+            state.active_epoch = feedback.route_epoch;
+            state.samples.clear();
         }
+        if state.samples.len() >= MAX_ROUTE_LABELS
+            && !state.samples.contains_key(&feedback.route_label.0)
+        {
+            state.samples.clear();
+        }
+        let window = state.samples.entry(feedback.route_label.0).or_default();
+        if feedback.sequence <= window.last_sequence {
+            return;
+        }
+        window.last_sequence = feedback.sequence;
+        prune_capacity_samples(&mut window.maxima, now);
         let capacity_bps = feedback.delivery_rate_bps();
-        samples
-            .entry((feedback.route_epoch, feedback.route_label.0))
-            .and_modify(|sample| {
-                if feedback.sequence > sample.sequence {
-                    sample.sequence = feedback.sequence;
-                    sample.capacity_bps = sample.capacity_bps.max(capacity_bps);
-                }
-            })
-            .or_insert(RouteCapacitySampleV2 {
-                sequence: feedback.sequence,
-                capacity_bps,
-            });
+        while window
+            .maxima
+            .back()
+            .is_some_and(|sample| sample.capacity_bps <= capacity_bps)
+        {
+            window.maxima.pop_back();
+        }
+        window.maxima.push_back(RouteCapacitySampleV2 {
+            capacity_bps,
+            observed_at: now,
+        });
+        while window.maxima.len() > MAX_ROUTE_CAPACITY_SAMPLES {
+            window.maxima.pop_front();
+        }
     }
 
     pub fn effective_capacity_bps(&self, route: ResolvedRouteV2, first_hop_bps: u64) -> u64 {
-        let end_to_end_bps = self
-            .samples
+        self.effective_capacity_bps_at(route, first_hop_bps, Instant::now())
+    }
+
+    fn effective_capacity_bps_at(
+        &self,
+        route: ResolvedRouteV2,
+        first_hop_bps: u64,
+        now: Instant,
+    ) -> u64 {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&(route.route_epoch, route.route_label.0))
-            .map_or(0, |sample| sample.capacity_bps);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active_epoch != route.route_epoch {
+            return first_hop_bps;
+        }
+        let end_to_end_bps = state
+            .samples
+            .get_mut(&route.route_label.0)
+            .map(|window| {
+                prune_capacity_samples(&mut window.maxima, now);
+                window
+                    .maxima
+                    .front()
+                    .map_or(0, |sample| sample.capacity_bps)
+            })
+            .unwrap_or_default();
         match (first_hop_bps, end_to_end_bps) {
             (0, end_to_end) => end_to_end,
             (first_hop, 0) => first_hop,
             (first_hop, end_to_end) => first_hop.min(end_to_end),
         }
+    }
+}
+
+fn prune_capacity_samples(samples: &mut VecDeque<RouteCapacitySampleV2>, now: Instant) {
+    while samples.front().is_some_and(|sample| {
+        now.saturating_duration_since(sample.observed_at) > ROUTE_CAPACITY_WINDOW
+    }) {
+        samples.pop_front();
     }
 }
 
@@ -314,22 +402,50 @@ mod tests {
     fn destination_feedback_caps_first_hop_capacity_and_rejects_replay() {
         let table = RouteQualityTableV2::default();
         let route = route(12, 2);
-        table.observe(RouteDeliveryFeedbackV2 {
-            sequence: 4,
-            route_epoch: route.route_epoch,
-            route_label: route.route_label,
-            delivered_payload_bytes: 6_250_000,
-            interval_micros: 1_000_000,
-        });
-        assert_eq!(table.effective_capacity_bps(route, 100_000_000), 50_000_000);
+        let started = Instant::now();
+        table.observe_at(
+            RouteDeliveryFeedbackV2 {
+                sequence: 4,
+                route_epoch: route.route_epoch,
+                route_label: route.route_label,
+                delivered_payload_bytes: 6_250_000,
+                interval_micros: 1_000_000,
+            },
+            started,
+        );
+        assert_eq!(
+            table.effective_capacity_bps_at(route, 100_000_000, started),
+            50_000_000
+        );
 
-        table.observe(RouteDeliveryFeedbackV2 {
-            sequence: 3,
-            route_epoch: route.route_epoch,
-            route_label: route.route_label,
-            delivered_payload_bytes: 1,
-            interval_micros: 1_000_000,
-        });
-        assert_eq!(table.effective_capacity_bps(route, 100_000_000), 50_000_000);
+        table.observe_at(
+            RouteDeliveryFeedbackV2 {
+                sequence: 3,
+                route_epoch: route.route_epoch,
+                route_label: route.route_label,
+                delivered_payload_bytes: 1,
+                interval_micros: 1_000_000,
+            },
+            started + Duration::from_secs(1),
+        );
+        assert_eq!(
+            table.effective_capacity_bps_at(route, 100_000_000, started),
+            50_000_000
+        );
+
+        table.observe_at(
+            RouteDeliveryFeedbackV2 {
+                sequence: 5,
+                route_epoch: route.route_epoch,
+                route_label: route.route_label,
+                delivered_payload_bytes: 1_250_000,
+                interval_micros: 1_000_000,
+            },
+            started + Duration::from_secs(1),
+        );
+        assert_eq!(
+            table.effective_capacity_bps_at(route, 100_000_000, started + Duration::from_secs(31),),
+            10_000_000
+        );
     }
 }

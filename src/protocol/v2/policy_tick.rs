@@ -56,7 +56,6 @@ use super::{
         },
         canonical_spec_digest,
         egress::EGRESS_ASSIGNMENT_FLOOR_BYTES_PER_SECOND,
-        guardrails::GuardrailsV1,
         state::NATIVE_MODULE_DIGEST,
     },
     tuning::{AutoTunerV2, Bbr3PresetV2, ForcedActionV2, PathTelemetryV2, TuneDecisionV2},
@@ -477,15 +476,6 @@ impl PolicySlotV1 {
 
     pub fn is_dirty(&self) -> bool {
         self.state_dirty
-    }
-
-    /// Mark an installed state as needing persistence.
-    ///
-    /// This is used by the legacy-memory warm-start path: `set_state` keeps
-    /// its persisted-state semantics (a loaded state is clean), while a
-    /// converted legacy state must be written once in the new binary format.
-    pub fn mark_dirty(&mut self) {
-        self.state_dirty = true;
     }
 
     pub fn mark_flushed(&mut self) {
@@ -1118,8 +1108,6 @@ pub struct PolicyTickV1 {
     live: PolicySlotV1,
     utility: UtilityEstimator,
     shadow: Option<ShadowEvaluatorV2>,
-    limits: HostLimitsV1,
-    guardrails: GuardrailsV1,
     /// Node egress coordinator view for the coming tick (plan section 9);
     /// the uncoordinated placeholder until `set_egress_view` is called.
     egress_view: EgressAllocationViewV1,
@@ -1128,7 +1116,7 @@ pub struct PolicyTickV1 {
 
 impl PolicyTickV1 {
     pub fn new(
-        tuner: AutoTunerV2,
+        mut tuner: AutoTunerV2,
         live: PolicySlotV1,
         weights: UtilityWeights,
         config: PolicyTickConfigV1,
@@ -1136,15 +1124,14 @@ impl PolicyTickV1 {
         let mut limits = tuner.limits().clone();
         limits.pacing_cap_bytes_per_second = config.max_egress_bytes_per_second.unwrap_or(0);
         limits.state_cap_bytes = config.state_cap_bytes.clamp(1, POLICY_STATE_MAX_BYTES);
+        tuner.set_limits(limits.clone());
         let egress_view = uncoordinated_egress_view(&limits);
         Self {
-            guardrails: GuardrailsV1::new(limits.clone()),
             tuner,
             config,
             live,
             utility: UtilityEstimator::with_weights(weights),
             shadow: None,
-            limits,
             egress_view,
             clock: TickClock::default(),
         }
@@ -1170,19 +1157,11 @@ impl PolicyTickV1 {
         self.shadow.as_ref()
     }
 
-    pub fn shadow_mut(&mut self) -> Option<&mut ShadowEvaluatorV2> {
-        self.shadow.as_mut()
-    }
-
     pub fn set_shadow(&mut self, shadow: Option<ShadowEvaluatorV2>) {
         self.shadow = shadow.map(|mut shadow| {
             shadow.set_peer_hash(self.config.peer_hash);
             shadow
         });
-    }
-
-    pub fn take_shadow(&mut self) -> Option<ShadowEvaluatorV2> {
-        self.shadow.take()
     }
 
     pub fn logical_tick(&self) -> u64 {
@@ -1203,7 +1182,7 @@ impl PolicyTickV1 {
 
     /// Limits handed to the policy and enforced by the guardrails.
     pub fn limits(&self) -> &HostLimitsV1 {
-        &self.limits
+        self.tuner.limits()
     }
 
     /// Hot-switch the live backend; utility weights follow the new policy.
@@ -1249,12 +1228,12 @@ impl PolicyTickV1 {
         wire: &WireCostV2,
         now: Instant,
     ) -> TickOutcomeV1 {
-        let baseline = self
-            .tuner
-            .observe_at_with_force(telemetry, now, self.config.forced);
+        let baseline_effective =
+            self.tuner
+                .observe_effective_at_with_force(telemetry, now, self.config.forced);
+        let baseline = baseline_effective.to_tune_decision();
         let utility = self.utility.observe(&telemetry, &baseline, wire);
         let logical_tick = self.clock.tick(now);
-        let baseline_effective = EffectiveActionV1::from_tune_decision(&baseline);
         let mode = self.config.mode;
         let mut input = build_policy_input(
             logical_tick,
@@ -1264,14 +1243,13 @@ impl PolicyTickV1 {
             &baseline_effective,
             &utility,
             self.config.objective,
-            &self.limits,
+            self.tuner.limits(),
             // Anything but On is a shadow evaluation: the backend learns
             // from the live input but its candidate must not reach the
             // wire. This is also the only mode channel a WASM guest has.
             mode != LearnerModeV2::On,
             &self.egress_view,
         );
-        let ctx = self.tuner.guardrail_context(telemetry);
         let baseline_preset = baseline.bbr.preset;
         let (candidate, effective, clamps, trace, fault) = match self.live.decide(&mut input) {
             Ok(output) => {
@@ -1279,10 +1257,13 @@ impl PolicyTickV1 {
                 // keeps this tick's host baseline, still guardrail-checked
                 // (the egress arbitration clamp applies to it as well).
                 let (mut effective, mut clamps) = if mode == LearnerModeV2::On {
-                    self.guardrails
-                        .apply(&output.candidate, &baseline_effective, &ctx)
+                    self.tuner.constrain_candidate(
+                        telemetry,
+                        &output.candidate,
+                        &baseline_effective,
+                    )
                 } else {
-                    self.guardrails.reapply(&baseline_effective, &ctx)
+                    self.tuner.reapply_effective(telemetry, &baseline_effective)
                 };
                 clamp_pacing_to_assigned(&self.egress_view, &mut effective, &mut clamps);
                 self.live.record_clamps(&clamps);
@@ -1301,7 +1282,7 @@ impl PolicyTickV1 {
                 // through the final guardrail pass so the node egress cap
                 // applies.
                 let (mut effective, mut clamps) =
-                    self.guardrails.reapply(&baseline_effective, &ctx);
+                    self.tuner.reapply_effective(telemetry, &baseline_effective);
                 clamp_pacing_to_assigned(&self.egress_view, &mut effective, &mut clamps);
                 (
                     None,
@@ -1358,15 +1339,9 @@ pub fn builtin_core_slot(mode: LearnerModeV2) -> PolicySlotV1 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use ironet_policy_core::{LearnerMemoryV1, LearnerStateV1};
-
     use super::*;
     use crate::protocol::v2::{
-        learner::LearnerMemoryV2,
         policy::{api::PolicyDecisionKindV1, canonical_spec_digest},
-        replay::{ReplayGoldenV2, ReplayTapSampleV2, decision_golden, memory_golden},
         tuning::{AutoTuneBoundsV2, tests_fixture},
     };
 
@@ -1400,114 +1375,6 @@ mod tests {
         assert_eq!(status.state_schema, ironet_policy_core::STATE_SCHEMA_V1);
         assert_eq!(status.module_digest, digest);
         assert!(status.signer_id.is_empty());
-    }
-
-    /// The pipeline reproduces `tests/fixtures/autotune-golden-v1.json`
-    /// sample by sample: live slot = builtin core in shadow mode (what the
-    /// golden recorded as `effective`), shadow evaluator = the same policy
-    /// (what the golden recorded as `candidate`), seed 1, balanced.
-    #[test]
-    fn pipeline_reproduces_the_replay_golden_sample_by_sample() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let samples: Vec<ReplayTapSampleV2> = serde_json::from_str(
-            &std::fs::read_to_string(root.join("tests/fixtures/autotune-replay-v1.json")).unwrap(),
-        )
-        .unwrap();
-        let golden: ReplayGoldenV2 = serde_json::from_str(
-            &std::fs::read_to_string(root.join("tests/fixtures/autotune-golden-v1.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(golden.learner_mode, "shadow");
-        assert_eq!(golden.objective, "balanced");
-        let seed = golden.seed;
-        let policy = PolicySpecV1::builtin();
-
-        let mut tick = builtin_tick(LearnerModeV2::Shadow, Some(seed));
-        tick.set_shadow(Some(ShadowEvaluatorV2::new(
-            policy.clone(),
-            Objective::Balanced,
-            seed,
-        )));
-        let start = Instant::now();
-        let first_micros = samples[0].sampled_unix_micros;
-        for (sample, expected) in samples.iter().zip(&golden.samples) {
-            let now = start + Duration::from_micros(sample.sampled_unix_micros - first_micros);
-            let telemetry = sample.telemetry.into_runtime();
-            let wire: WireCostV2 = sample.wire_cost.unwrap().into();
-            let outcome = tick.run(telemetry, &wire, now);
-            let index = expected.index;
-            assert_eq!(outcome.logical_tick, expected.offset_micros / 1_000_000);
-            assert_eq!(
-                decision_golden(outcome.baseline),
-                expected.baseline,
-                "sample {index} baseline"
-            );
-            assert_eq!(
-                outcome.utility.total.to_bits(),
-                expected.utility.total_bits,
-                "sample {index} utility"
-            );
-            assert_eq!(
-                outcome.utility.components.map(f64::to_bits),
-                expected.utility.components_bits
-            );
-            assert_eq!(outcome.fault, None);
-            assert!(outcome.candidate.is_some());
-            assert_eq!(
-                decision_golden(outcome.decision),
-                expected.effective,
-                "sample {index} effective"
-            );
-            let trace = outcome.trace;
-            assert_eq!(trace.context, expected.learner.context);
-            assert_eq!(trace.baseline_preset, expected.learner.baseline_preset);
-            assert_eq!(trace.proposed_preset, expected.learner.proposed_preset);
-            assert_eq!(trace.applied_preset, expected.learner.applied_preset);
-            assert_eq!(
-                trace.predicted_advantage.to_bits(),
-                expected.learner.predicted_advantage_bits
-            );
-            assert_eq!(trace.exploring, expected.learner.exploring);
-            assert_eq!(trace.rollback, expected.learner.rollback);
-            assert_eq!(trace.rollbacks, expected.learner.rollbacks);
-            assert_eq!(trace.mode, LearnerModeV2::Shadow);
-            let shadow = outcome.shadow.expect("shadow evaluation");
-            assert_eq!(shadow.fault, None);
-            assert_eq!(
-                decision_golden(shadow.decision),
-                expected.candidate,
-                "sample {index} candidate"
-            );
-            assert_eq!(shadow.utility.total.to_bits(), expected.utility.total_bits);
-            assert_eq!(
-                shadow.trace.proposed_preset,
-                expected.learner.proposed_preset
-            );
-            assert_eq!(
-                shadow.trace.predicted_advantage.to_bits(),
-                expected.learner.predicted_advantage_bits
-            );
-            // Live state == the learner memory the golden recorded.
-            let state = LearnerStateV1::decode(tick.live().state()).unwrap();
-            let memory = LearnerMemoryV2::from(&state.export_memory());
-            assert_eq!(
-                memory_golden(&memory),
-                expected.memory,
-                "sample {index} memory"
-            );
-            let digest = blake3::hash(&serde_json::to_vec(&memory).unwrap())
-                .to_hex()
-                .to_string();
-            assert_eq!(digest, expected.memory_digest);
-            // The shadow slot carries an identical state (same seed/input).
-            assert_eq!(tick.shadow().unwrap().slot().state(), tick.live().state());
-        }
-        let live = tick.live();
-        assert_eq!(live.identity().policy_id, golden.policy_id);
-        assert_eq!(live.identity().state_schema, 1);
-        assert_eq!(live.health().state, PolicyHealthV1::Healthy);
-        assert_eq!(live.stats().calls, samples.len() as u64);
-        assert!(live.is_dirty());
     }
 
     #[test]
@@ -1921,26 +1788,6 @@ mod tests {
         };
         assert!(!tick.live_mut().replace(Box::new(next), None, "reset", &[]));
         assert!(tick.live().state().is_empty());
-    }
-
-    #[test]
-    fn legacy_memory_warm_start_round_trips_through_the_state_blob() {
-        let mut tick = builtin_tick(LearnerModeV2::Shadow, Some(1));
-        let start = Instant::now();
-        tick.run(telemetry(), &WireCostV2::default(), start);
-        let state = LearnerStateV1::decode(tick.live().state()).unwrap();
-        let legacy = LearnerMemoryV2::from(&state.export_memory());
-        assert_eq!(legacy.contexts.len(), 1);
-        let warmed = LearnerStateV1::from_memory(&LearnerMemoryV1::from(&legacy), 1, 0)
-            .encode()
-            .unwrap();
-        let mut fresh = builtin_tick(LearnerModeV2::Shadow, Some(1));
-        fresh.live_mut().set_state(warmed);
-        assert!(!fresh.live().is_dirty());
-        let outcome = fresh.run(telemetry(), &WireCostV2::default(), start);
-        assert_eq!(outcome.fault, None);
-        let restored = LearnerStateV1::decode(fresh.live().state()).unwrap();
-        assert_eq!(restored.context_count(), 1);
     }
 
     #[test]

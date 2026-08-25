@@ -1701,6 +1701,35 @@ def verify_interval_window_rate():
     if measured is None or abs(measured - (3_200.0 / 3.0)) > 1e-6:
         raise SystemExit(f"receiver interval overlap accounting self-test failed: {measured}")
 verify_interval_window_rate()
+def receiver_interval_endpoint(intervals):
+    """Aggregate a receiver's complete iperf interval stream.
+
+    A static endpoint summary includes its final partial interval. Segment
+    analysis deliberately clips intervals to the requested wall-clock window,
+    so it is the wrong comparator for that endpoint summary when receiver
+    drain extends past the requested duration.
+    """
+    if not intervals:
+        return None
+    start = min(interval["start_seconds"] for interval in intervals)
+    end = max(interval["end_seconds"] for interval in intervals)
+    seconds = end - start
+    if seconds <= 0:
+        return None
+    return {
+        "bits_per_second": sum(interval["bytes"] for interval in intervals) * 8.0 / seconds,
+        "bytes": sum(interval["bytes"] for interval in intervals),
+        "seconds": seconds,
+    }
+def verify_receiver_interval_endpoint():
+    synthetic = [
+        {"start_seconds": 0.0, "end_seconds": 1.0, "bytes": 100},
+        {"start_seconds": 1.0, "end_seconds": 1.25, "bytes": 50},
+    ]
+    endpoint = receiver_interval_endpoint(synthetic)
+    if endpoint != {"bits_per_second": 960.0, "bytes": 150, "seconds": 1.25}:
+        raise SystemExit(f"receiver interval endpoint self-test failed: {endpoint!r}")
+verify_receiver_interval_endpoint()
 def applied_boundaries(steps):
     return [0.0] + [step["applied_offset_ms"] / 1_000.0 for step in steps] + [float(duration_seconds)]
 def verify_applied_boundaries():
@@ -2227,28 +2256,44 @@ segment_results = segments(
 )
 static_endpoint_consistency = None
 if not steps and comparison.get("comparable") and segment_results:
-    static_segment = segment_results[0]
+    overlay_interval_endpoint = receiver_interval_endpoint(intervals)
+    underlay_interval_endpoint = receiver_interval_endpoint(baseline_intervals)
     endpoint_ratio = overlay / underlay if underlay else None
-    segment_ratio = static_segment["overlay_to_underlay_ratio"]
+    interval_ratio = (
+        overlay_interval_endpoint["bits_per_second"] / underlay_interval_endpoint["bits_per_second"]
+        if overlay_interval_endpoint is not None
+        and underlay_interval_endpoint is not None
+        and underlay_interval_endpoint["bits_per_second"] else None
+    )
     def relative_error(measured, expected):
         return abs(measured / expected - 1.0) if measured is not None and expected else None
     relative_errors = {
         "overlay": relative_error(
-            static_segment["overlay_mean_bits_per_second"], overlay
+            overlay_interval_endpoint["bits_per_second"] if overlay_interval_endpoint else None,
+            overlay,
         ),
         "underlay": relative_error(
-            static_segment["underlay_mean_bits_per_second"], underlay
+            underlay_interval_endpoint["bits_per_second"] if underlay_interval_endpoint else None,
+            underlay,
         ),
-        "ratio": relative_error(segment_ratio, endpoint_ratio),
+        "ratio": relative_error(interval_ratio, endpoint_ratio),
     }
-    # iperf's receiver endpoint includes its final partial interval, whose end
-    # can extend slightly beyond the requested wall-clock window on a very
-    # lossy low-rate path. Bound each endpoint independently; the ratio error
-    # can legitimately contain both endpoint errors in opposite directions.
+    # Both sides aggregate the full receiver interval stream corresponding to
+    # `end.sum_received`. Keep a small tolerance for independently rounded
+    # iperf interval/end summaries, rather than treating receiver drain beyond
+    # the requested duration as a throughput inconsistency.
     endpoint_tolerance = 0.03
     ratio_tolerance = 2 * endpoint_tolerance / (1 - endpoint_tolerance)
     static_endpoint_consistency = {
-        "receiver_interval_window_seconds": duration_seconds,
+        "requested_window_seconds": duration_seconds,
+        "receiver_interval_window_seconds": {
+            "overlay": overlay_interval_endpoint["seconds"] if overlay_interval_endpoint else None,
+            "underlay": underlay_interval_endpoint["seconds"] if underlay_interval_endpoint else None,
+        },
+        "receiver_interval_bytes": {
+            "overlay": overlay_interval_endpoint["bytes"] if overlay_interval_endpoint else None,
+            "underlay": underlay_interval_endpoint["bytes"] if underlay_interval_endpoint else None,
+        },
         "relative_tolerance": endpoint_tolerance,
         "ratio_relative_tolerance": ratio_tolerance,
         "relative_errors": relative_errors,

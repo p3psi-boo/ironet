@@ -143,6 +143,11 @@ pub(super) struct RuntimeMetrics {
     pub(super) gso_fallback_splits: AtomicU64,
     pub(super) protocol_datagram_errors: AtomicU64,
     pub(super) route_gate_drops: AtomicU64,
+    /// Bytes admitted to the Bulk scheduler class. Unlike
+    /// `bulk_service_bytes`, this advances before QUIC can transmit the
+    /// queued work and therefore remains useful when a stale congestion
+    /// model is preventing that first send.
+    pub(super) bulk_admission_bytes: AtomicU64,
     pub(super) bulk_service_bytes: AtomicU64,
     pub(super) latency_service_bytes: AtomicU64,
     pub(super) bulk_service_quantums: AtomicU64,
@@ -781,6 +786,11 @@ impl RuntimeMetrics {
             .fetch_add(observation.gso.preserved_bytes, Ordering::Relaxed);
         self.gso_fallback_splits
             .fetch_add(observation.gso.fallback_splits, Ordering::Relaxed);
+    }
+
+    pub(super) fn observe_bulk_admission(&self, bytes: u64) {
+        self.bulk_admission_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(super) fn observe_send(&self, progress: SendProgress) {

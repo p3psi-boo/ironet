@@ -784,10 +784,10 @@ impl TelemetryFilterV1 {
 
     fn smooth(&mut self, sample: PathTelemetryV2) {
         self.rtt_micros = ewma(self.rtt_micros, micros(sample.rtt), 3, 8);
-        self.min_rtt_micros = match self.min_rtt_micros {
-            0 => micros(sample.min_rtt),
-            current => current.min(micros(sample.min_rtt)),
-        };
+        // The controller already exposes a bounded min-RTT filter. Retaining
+        // another lifetime minimum here would make a changed path baseline
+        // impossible to age out without an endpoint-identity change.
+        self.min_rtt_micros = micros(sample.min_rtt);
         self.queue_delay_micros = ewma(self.queue_delay_micros, micros(sample.queue_delay), 3, 8);
         // QUIC keepalives and PMTU probes make an idle interval's loss ratio
         // statistically meaningless: losing one of only a handful of packets
@@ -1335,6 +1335,19 @@ impl AutoTunerV2 {
         now: Instant,
         forced: Option<ForcedActionV2>,
     ) -> TuneDecisionV2 {
+        self.observe_effective_at_with_force(sample, now, forced)
+            .to_tune_decision()
+    }
+
+    /// Run the native pipeline while keeping the ABI effective action as the
+    /// canonical internal representation. Boundary callers can project it to
+    /// `TuneDecisionV2` once, after policy and host constraints are complete.
+    pub fn observe_effective_at_with_force(
+        &mut self,
+        sample: PathTelemetryV2,
+        now: Instant,
+        forced: Option<ForcedActionV2>,
+    ) -> EffectiveActionV1 {
         if sample.path_epoch != self.epoch {
             self.epoch = sample.path_epoch;
             self.smoothed.reset();
@@ -1397,7 +1410,7 @@ impl AutoTunerV2 {
         clamps.entries.extend(report.entries);
         self.last_clamps = clamps;
         self.current = effective;
-        self.current.to_tune_decision()
+        self.current.clone()
     }
 
     pub fn current(&self) -> TuneDecisionV2 {
@@ -1418,6 +1431,21 @@ impl AutoTunerV2 {
     /// Host limits this tuner enforces.
     pub fn limits(&self) -> &HostLimitsV1 {
         self.guardrails.limits()
+    }
+
+    /// Install the one host limit set shared by the native baseline and all
+    /// external policy candidates.
+    pub fn set_limits(&mut self, limits: HostLimitsV1) {
+        self.guardrails = GuardrailsV1::new(limits);
+    }
+
+    pub fn reapply_effective(
+        &self,
+        sample: PathTelemetryV2,
+        effective: &EffectiveActionV1,
+    ) -> (EffectiveActionV1, ClampReportV1) {
+        let ctx = self.guardrail_context(sample);
+        self.guardrails.reapply(effective, &ctx)
     }
 
     /// Drop all learned state when the runtime cannot obtain a trustworthy

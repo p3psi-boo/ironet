@@ -5,7 +5,8 @@
 //! defined here. No scheduling or FEC policy is reinterpreted at this boundary.
 
 use std::{
-    collections::VecDeque,
+    cmp::Reverse,
+    collections::{BinaryHeap, VecDeque},
     hash::{Hash, Hasher},
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -65,6 +66,159 @@ const TX_APPLICATION_ADMISSION_HIGH_WATER_BYTES: usize = 512 * 1024;
 pub(super) const TX_ADMISSION_BATCH_BYTES: usize = 128 * 1024;
 pub(super) const MAX_CLASSIFIERS: usize = 65_536;
 pub(super) const CLASSIFIER_IDLE: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct BoundedFlowEntryV2<V> {
+    value: V,
+    generation: u64,
+    touched_at: Duration,
+}
+
+/// Hard-bounded flow state with lazy LRU expiry. Heap entries are versioned,
+/// so touching a flow never requires a linear queue removal.
+#[derive(Debug)]
+pub(super) struct BoundedFlowTableV2<V> {
+    entries: HashMap<FlowKey, BoundedFlowEntryV2<V>>,
+    oldest: BinaryHeap<Reverse<(Duration, u64, FlowKey)>>,
+    capacity: usize,
+    idle: Duration,
+    generation: u64,
+}
+
+impl<V> BoundedFlowTableV2<V> {
+    pub(super) fn new(capacity: usize, idle: Duration) -> Self {
+        assert!(capacity != 0, "flow table capacity must be non-zero");
+        Self {
+            entries: HashMap::default(),
+            oldest: BinaryHeap::new(),
+            capacity,
+            idle,
+            generation: 0,
+        }
+    }
+
+    pub(super) fn contains_key(&self, key: &FlowKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub(super) fn get_mut(&mut self, key: &FlowKey, now: Duration) -> Option<&mut V> {
+        if !self.entries.contains_key(key) {
+            return None;
+        }
+        self.touch(*key, now);
+        self.entries.get_mut(key).map(|entry| &mut entry.value)
+    }
+
+    pub(super) fn get_or_insert_with(
+        &mut self,
+        key: FlowKey,
+        now: Duration,
+        create: impl FnOnce() -> V,
+    ) -> &mut V {
+        if !self.entries.contains_key(&key) {
+            self.expire_idle(now);
+            while self.entries.len() >= self.capacity {
+                self.evict_oldest();
+            }
+            self.entries.insert(
+                key,
+                BoundedFlowEntryV2 {
+                    value: create(),
+                    generation: 0,
+                    touched_at: now,
+                },
+            );
+        }
+        self.touch(key, now);
+        &mut self.entries.get_mut(&key).expect("flow was inserted").value
+    }
+
+    pub(super) fn insert(&mut self, key: FlowKey, now: Duration, value: V) -> Option<V> {
+        if !self.entries.contains_key(&key) {
+            self.expire_idle(now);
+            while self.entries.len() >= self.capacity {
+                self.evict_oldest();
+            }
+        }
+        let previous = self
+            .entries
+            .insert(
+                key,
+                BoundedFlowEntryV2 {
+                    value,
+                    generation: 0,
+                    touched_at: now,
+                },
+            )
+            .map(|entry| entry.value);
+        self.touch(key, now);
+        previous
+    }
+
+    pub(super) fn remove(&mut self, key: &FlowKey) -> Option<V> {
+        self.entries.remove(key).map(|entry| entry.value)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn touch(&mut self, key: FlowKey, now: Duration) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        let generation = self.generation;
+        let entry = self.entries.get_mut(&key).expect("touched flow exists");
+        entry.generation = generation;
+        entry.touched_at = now;
+        self.oldest.push(Reverse((now, generation, key)));
+        if self.oldest.len() > self.capacity.saturating_mul(4).max(64) {
+            self.rebuild_heap();
+        }
+    }
+
+    fn expire_idle(&mut self, now: Duration) {
+        while let Some(Reverse((touched_at, generation, key))) = self.oldest.peek().copied() {
+            if now.saturating_sub(touched_at) < self.idle {
+                break;
+            }
+            self.oldest.pop();
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                self.entries.remove(&key);
+            }
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some(Reverse((_, generation, key))) = self.oldest.pop() {
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                self.entries.remove(&key);
+                return;
+            }
+        }
+        // The heap may only be empty when every queued generation was stale.
+        // Rebuild once so a hard-cap insertion can always evict an entry.
+        if !self.entries.is_empty() {
+            self.rebuild_heap();
+            self.evict_oldest();
+        }
+    }
+
+    fn rebuild_heap(&mut self) {
+        self.oldest.clear();
+        for (&key, entry) in &self.entries {
+            self.oldest
+                .push(Reverse((entry.touched_at, entry.generation, key)));
+        }
+    }
+}
 
 /// Bounds the number of scheduler sends that may overtake a ready strict
 /// priority admission. One send is enough to make progress for a preceding
@@ -268,7 +422,6 @@ impl CoverShaperV2 {
 #[derive(Debug)]
 struct FlowState {
     classifier: FlowClassifier,
-    last_seen: Duration,
 }
 
 #[derive(Debug)]
@@ -604,7 +757,7 @@ pub(super) async fn tx_loop(
 
     let mut tx = V2Tx::new(connection, negotiated, SchedulerLimits::default())?;
     let started = Instant::now();
-    let mut classifiers = HashMap::<FlowKey, FlowState>::default();
+    let mut classifiers = BoundedFlowTableV2::<FlowState>::new(MAX_CLASSIFIERS, CLASSIFIER_IDLE);
     let mut receive_batch = 8_usize;
     let mut applied_tuning = None::<TuneDecisionV2>;
     let mut cover_shaper = CoverShaperV2::default();
@@ -774,11 +927,6 @@ pub(super) async fn tx_loop(
                     }
                 }
                 deferred_input.extend(batch);
-                if classifiers.len() > MAX_CLASSIFIERS {
-                    let now = started.elapsed();
-                    classifiers
-                        .retain(|_, state| now.saturating_sub(state.last_seen) < CLASSIFIER_IDLE);
-                }
             }
             Event::Sent(result) => {
                 priority_send.completed_send();
@@ -919,7 +1067,7 @@ pub(super) fn effective_tx_tuning(decision: TuneDecisionV2) -> EffectiveTuneV2 {
 
 fn enqueue_tun_batch(
     tx: &mut V2Tx,
-    classifiers: &mut HashMap<FlowKey, FlowState>,
+    classifiers: &mut BoundedFlowTableV2<FlowState>,
     now: Duration,
     route_label: u32,
     records: Vec<TunIngressRecordV2>,
@@ -947,11 +1095,9 @@ fn enqueue_tun_batch(
             warn!("dropped V2 IP input with exhausted hop limit");
             continue;
         }
-        let state = classifiers.entry(key).or_insert_with(|| FlowState {
+        let state = classifiers.get_or_insert_with(key, now, || FlowState {
             classifier: FlowClassifier::new(ClassifierConfig::default(), now),
-            last_seen: now,
         });
-        state.last_seen = now;
         let class = state
             .classifier
             .observe(now, packet_len, 0, info.latency_protected);
@@ -976,6 +1122,15 @@ fn enqueue_tun_batch(
             .push((metadata, data));
     }
     for ((flow_id, class, overlay_hop_limit), records) in grouped {
+        // Count the classified application boundary before handing records to
+        // the scheduler.  The autotuner uses this as a one-shot startup
+        // signal when a stale BBR model has not yet been able to service a
+        // Bulk packet; `bulk_service_bytes` remains the authoritative
+        // post-send accounting counter.
+        let classified_payload_bytes = records
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>();
         let records = records
             .into_iter()
             .enumerate()
@@ -1009,6 +1164,9 @@ fn enqueue_tun_batch(
             !admitted.is_empty(),
             "V2 scheduler rejected a TUN PacketTrain"
         );
+        if class == TrafficClass::Bulk {
+            metrics.observe_bulk_admission(classified_payload_bytes);
+        }
     }
     metrics.observe_tun_ingress_batch(ingress);
     Ok(())
@@ -1502,6 +1660,34 @@ mod tests {
             length: 90,
             latency_protected: false,
         }
+    }
+
+    fn flow(source_port: u16) -> FlowKey {
+        let mut info = test_packet_info();
+        info.source_port = Some(source_port);
+        FlowKey::from(info)
+    }
+
+    #[test]
+    fn bounded_flow_table_expires_idle_entries_and_never_crosses_its_cap() {
+        let mut table = BoundedFlowTableV2::new(2, Duration::from_secs(60));
+        table.insert(flow(1), Duration::ZERO, 1_u8);
+        table.insert(flow(2), Duration::from_secs(1), 2_u8);
+        assert_eq!(table.len(), 2);
+
+        assert_eq!(
+            table.get_mut(&flow(1), Duration::from_secs(2)),
+            Some(&mut 1)
+        );
+        table.insert(flow(3), Duration::from_secs(3), 3_u8);
+        assert_eq!(table.len(), 2);
+        assert!(!table.contains_key(&flow(2)));
+        assert!(table.contains_key(&flow(1)));
+        assert!(table.contains_key(&flow(3)));
+
+        table.insert(flow(4), Duration::from_secs(63), 4_u8);
+        assert_eq!(table.len(), 1);
+        assert!(table.contains_key(&flow(4)));
     }
 
     #[test]

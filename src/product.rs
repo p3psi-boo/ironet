@@ -436,7 +436,7 @@ pub fn create_invite(
         authority.public() == state.authority,
         "network authority key does not match state"
     );
-    let node_key = identity::load(&config.identity_file)?;
+    let node_key = identity::load_or_create(&config.identity_file)?;
     config.validate_local_id(node_key.public())?;
     let now = now_unix()?;
     let lifetime = expires_in_secs.unwrap_or(DEFAULT_INVITE_LIFETIME_SECS);
@@ -778,7 +778,7 @@ fn validate_invite_cover(cover: &CoverConfig) -> Result<()> {
 pub async fn show_network(config_path: &Path, state_dir: &Path) -> Result<NetworkSummary> {
     let state = load_state(state_dir)?;
     let config = Config::load(config_path).await?;
-    let key = identity::load(&config.identity_file)?;
+    let key = identity::load_or_create(&config.identity_file)?;
     Ok(NetworkSummary {
         network: state.network_name,
         network_id: state.network_uid,
@@ -800,7 +800,7 @@ pub async fn show_network(config_path: &Path, state_dir: &Path) -> Result<Networ
 pub async fn list_nodes(config_path: &Path, state_dir: &Path) -> Result<Vec<NodeSummary>> {
     let state = load_state(state_dir)?;
     let config = Config::load(config_path).await?;
-    let key = identity::load(&config.identity_file)?;
+    let key = identity::load_or_create(&config.identity_file)?;
     let mut nodes = vec![NodeSummary {
         name: state.node_name.clone(),
         endpoint_id: key.public().to_string(),
@@ -909,7 +909,7 @@ pub async fn remove_node_endpoint(
 ) -> Result<(String, bool)> {
     let mut state = load_state(state_dir)?;
     let config = Config::load(config_path).await?;
-    let local = identity::load(&config.identity_file)?.public();
+    let local = identity::load_or_create(&config.identity_file)?.public();
     ensure!(
         endpoint != local,
         "use `ironet network leave --yes` to remove this machine"
@@ -1157,7 +1157,7 @@ async fn update_config(
     let mut config = Config::load(config_path).await?;
     mutate(&mut config)?;
     config.validate()?;
-    let key = identity::load(&config.identity_file)?;
+    let key = identity::load_or_create(&config.identity_file)?;
     config.validate_local_id(key.public())?;
     let previous = fs::read(config_path)
         .with_context(|| format!("failed reading {}", config_path.display()))?;

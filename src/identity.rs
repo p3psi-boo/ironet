@@ -7,7 +7,11 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::SecretKey;
+use tracing::info;
 
+/// Load a durable node identity, creating and persisting one on first use.
+///
+/// Creation uses `create_new`, so an existing identity is never replaced.
 pub fn load_or_create(path: &Path) -> Result<SecretKey> {
     if path.exists() {
         return load(path);
@@ -24,6 +28,12 @@ pub fn load_or_create(path: &Path) -> Result<SecretKey> {
     {
         Ok(mut file) => {
             write_key(&mut file, &key)?;
+            sync_parent(path)?;
+            info!(
+                identity_file = %path.display(),
+                endpoint_id = %key.public(),
+                "created persistent node identity"
+            );
             Ok(key)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => load(path),
@@ -109,6 +119,14 @@ fn write_key(file: &mut std::fs::File, key: &SecretKey) -> Result<()> {
     writeln!(file, "{}", hex::encode(key.to_bytes()))?;
     file.sync_all()?;
     Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .with_context(|| format!("failed opening identity directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("failed persisting identity directory {}", parent.display()))
 }
 
 #[cfg(test)]

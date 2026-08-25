@@ -15,7 +15,7 @@ use crate::{
 
 pub async fn validate(path: &Path) -> Result<(Config, iroh::EndpointId)> {
     let config = Config::load(path).await?;
-    let key = identity::load(&config.identity_file)?;
+    let key = identity::load_or_create(&config.identity_file)?;
     let endpoint_id = key.public();
     config.validate_local_id(endpoint_id)?;
     Ok((config, endpoint_id))
@@ -26,7 +26,7 @@ pub async fn install(source: &Path, destination: &Path) -> Result<()> {
         bail!("source and destination configuration paths must differ");
     }
     let config = Config::load_unsealed(source).await?;
-    let key = identity::load(&config.identity_file)?;
+    let key = identity::load_or_create(&config.identity_file)?;
     let endpoint_id = key.public();
     config.validate_local_id(endpoint_id)?;
     let candidate = read_file(source)?;
@@ -50,7 +50,7 @@ pub async fn install(source: &Path, destination: &Path) -> Result<()> {
 
 pub async fn seal(path: &Path) -> Result<()> {
     let config = Config::load_unsealed(path).await?;
-    let key = identity::load(&config.identity_file)?;
+    let key = identity::load_or_create(&config.identity_file)?;
     config.validate_local_id(key.public())?;
     let contents = read_file(path)?;
     let digest = format!("{}\n", blake3::hash(&contents).to_hex());
@@ -160,6 +160,34 @@ mod tests {
         assert_eq!(after.permissions().mode() & 0o777, 0o640);
         assert_eq!(after.uid(), before.uid());
         assert_eq!(after.gid(), before.gid());
+    }
+
+    #[tokio::test]
+    async fn sealing_a_new_configuration_creates_and_persists_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let identity_path = dir.path().join("state/identity.key");
+        atomic_write(
+            &config_path,
+            format!(
+                "network_id = \"bootstrap\"\nidentity_file = \"{}\"\n",
+                identity_path.display()
+            )
+            .as_bytes(),
+            0o600,
+        )
+        .unwrap();
+
+        seal(&config_path).await.unwrap();
+        let created = identity::load(&identity_path).unwrap();
+        let (_, endpoint_id) = validate(&config_path).await.unwrap();
+
+        assert_eq!(endpoint_id, created.public());
+        assert_eq!(
+            identity::load(&identity_path).unwrap().public(),
+            created.public()
+        );
+        assert!(config_digest_path(&config_path).exists());
     }
 
     #[tokio::test]

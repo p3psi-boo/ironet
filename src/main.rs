@@ -1349,7 +1349,7 @@ fn ensure_sysctl(path: &str, expected: &str) -> Result<()> {
 
 async fn inspect(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path).await?;
-    let secret_key = identity::load_or_create(&config.identity_file)?;
+    let secret_key = identity::load(&config.identity_file)?;
     let local_id = secret_key.public();
     config.validate_local_id(local_id)?;
 

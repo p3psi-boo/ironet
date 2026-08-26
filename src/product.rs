@@ -436,7 +436,7 @@ pub fn create_invite(
         authority.public() == state.authority,
         "network authority key does not match state"
     );
-    let node_key = identity::load_or_create(&config.identity_file)?;
+    let node_key = identity::load(&config.identity_file)?;
     config.validate_local_id(node_key.public())?;
     let now = now_unix()?;
     let lifetime = expires_in_secs.unwrap_or(DEFAULT_INVITE_LIFETIME_SECS);
@@ -778,7 +778,7 @@ fn validate_invite_cover(cover: &CoverConfig) -> Result<()> {
 pub async fn show_network(config_path: &Path, state_dir: &Path) -> Result<NetworkSummary> {
     let state = load_state(state_dir)?;
     let config = Config::load(config_path).await?;
-    let key = identity::load_or_create(&config.identity_file)?;
+    let key = identity::load(&config.identity_file)?;
     Ok(NetworkSummary {
         network: state.network_name,
         network_id: state.network_uid,
@@ -800,7 +800,7 @@ pub async fn show_network(config_path: &Path, state_dir: &Path) -> Result<Networ
 pub async fn list_nodes(config_path: &Path, state_dir: &Path) -> Result<Vec<NodeSummary>> {
     let state = load_state(state_dir)?;
     let config = Config::load(config_path).await?;
-    let key = identity::load_or_create(&config.identity_file)?;
+    let key = identity::load(&config.identity_file)?;
     let mut nodes = vec![NodeSummary {
         name: state.node_name.clone(),
         endpoint_id: key.public().to_string(),
@@ -909,7 +909,7 @@ pub async fn remove_node_endpoint(
 ) -> Result<(String, bool)> {
     let mut state = load_state(state_dir)?;
     let config = Config::load(config_path).await?;
-    let local = identity::load_or_create(&config.identity_file)?.public();
+    let local = identity::load(&config.identity_file)?.public();
     ensure!(
         endpoint != local,
         "use `ironet network leave --yes` to remove this machine"
@@ -1157,7 +1157,7 @@ async fn update_config(
     let mut config = Config::load(config_path).await?;
     mutate(&mut config)?;
     config.validate()?;
-    let key = identity::load_or_create(&config.identity_file)?;
+    let key = identity::load(&config.identity_file)?;
     config.validate_local_id(key.public())?;
     let previous = fs::read(config_path)
         .with_context(|| format!("failed reading {}", config_path.display()))?;
@@ -1728,6 +1728,31 @@ removed_nodes = []
             .await
             .unwrap();
         assert_eq!(repeated.endpoint_id, second.endpoint_id);
+    }
+
+    #[tokio::test]
+    async fn existing_network_queries_do_not_regenerate_a_lost_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        create_network(
+            &config_path,
+            dir.path(),
+            "production",
+            CreateNetworkOptions {
+                node_name: Some("edge-a".into()),
+                address_pool: Some("198.21.0.0/16".parse().unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let identity_path = dir.path().join("identity.key");
+        fs::remove_file(&identity_path).unwrap();
+
+        let error = show_network(&config_path, dir.path()).await.unwrap_err();
+
+        assert!(error.to_string().contains("failed to inspect"));
+        assert!(!identity_path.exists());
     }
 
     #[tokio::test]

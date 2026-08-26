@@ -318,7 +318,7 @@ async fn run_with_shutdown_future(
     state: Option<&watch::Sender<Option<Arc<V2RuntimeState>>>>,
 ) -> Result<()> {
     config.validate()?;
-    let secret_key = identity::load_or_create(&config.identity_file)?;
+    let secret_key = identity::load(&config.identity_file)?;
     let local_id = secret_key.public();
     let runtime_state = Arc::new(V2RuntimeState::new(&config, local_id));
     let derp_transport = build_v2_derp_transport(&config)?;

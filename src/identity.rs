@@ -6,39 +6,132 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use iroh::SecretKey;
+use iroh::{EndpointId, SecretKey};
 use tracing::info;
 
-/// Load a durable node identity, creating and persisting one on first use.
-///
-/// Creation uses `create_new`, so an existing identity is never replaced.
-pub fn load_or_create(path: &Path) -> Result<SecretKey> {
-    if path.exists() {
-        return load(path);
-    }
+/// A side-effect-free decision to use the configured identity or provision a
+/// new one as part of an explicit deployment transaction.
+pub struct IdentityPlan {
+    key: SecretKey,
+    needs_creation: bool,
+}
 
-    create_private_parent(path)?;
+/// The result of committing an [`IdentityPlan`]. A caller that subsequently
+/// fails its larger transaction can remove only the identity it created.
+pub struct PersistedIdentity {
+    key: SecretKey,
+    created: bool,
+    created_parents: Vec<std::path::PathBuf>,
+}
 
-    let key = SecretKey::generate();
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(mut file) => {
-            write_key(&mut file, &key)?;
-            sync_parent(path)?;
-            info!(
-                identity_file = %path.display(),
-                endpoint_id = %key.public(),
-                "created persistent node identity"
-            );
-            Ok(key)
+impl IdentityPlan {
+    /// Inspect a first-install path without mutating the filesystem. Missing
+    /// identities are planned for creation, but only [`Self::persist`] writes.
+    pub fn prepare_bootstrap(path: &Path) -> Result<Self> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(Self {
+                key: load(path)?,
+                needs_creation: false,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                key: SecretKey::generate(),
+                needs_creation: true,
+            }),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+            }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => load(path),
-        Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
     }
+
+    /// Bind an existing deployment to its already-provisioned identity.
+    pub fn require(path: &Path) -> Result<Self> {
+        Ok(Self {
+            key: load(path)?,
+            needs_creation: false,
+        })
+    }
+
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.key.public()
+    }
+
+    /// Persist the plan. Creation uses `create_new`, so an existing identity
+    /// is never replaced. A concurrent creator wins and is loaded instead.
+    pub fn persist(&self, path: &Path) -> Result<PersistedIdentity> {
+        if !self.needs_creation {
+            return Ok(PersistedIdentity {
+                key: self.key.clone(),
+                created: false,
+                created_parents: Vec::new(),
+            });
+        }
+
+        let created_parents = create_private_parent(path)?;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = write_key(&mut file, &self.key).and_then(|()| sync_parent(path))
+                {
+                    let _ = remove_created_identity(path, &self.key, &created_parents);
+                    return Err(error);
+                }
+                info!(
+                    identity_file = %path.display(),
+                    endpoint_id = %self.key.public(),
+                    "created persistent node identity"
+                );
+                Ok(PersistedIdentity {
+                    key: self.key.clone(),
+                    created: true,
+                    created_parents,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(PersistedIdentity {
+                    key: load(path)?,
+                    created: false,
+                    created_parents,
+                })
+            }
+            Err(error) => {
+                remove_empty_directories(&created_parents);
+                Err(error).with_context(|| format!("failed to create {}", path.display()))
+            }
+        }
+    }
+}
+
+impl PersistedIdentity {
+    pub fn key(&self) -> &SecretKey {
+        &self.key
+    }
+
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.key.public()
+    }
+
+    /// Undo a newly created identity after its containing transaction fails.
+    /// Existing identities are never removed.
+    pub fn rollback_created(&self, path: &Path) -> Result<()> {
+        if !self.created {
+            return Ok(());
+        }
+        remove_created_identity(path, &self.key, &self.created_parents)
+    }
+}
+
+/// Provision an identity for an explicit bootstrap operation. Runtime and
+/// inspection paths must use [`load`] so a lost node key is surfaced instead
+/// of silently changing the node's authenticated identity.
+pub fn load_or_create(path: &Path) -> Result<SecretKey> {
+    Ok(IdentityPlan::prepare_bootstrap(path)?
+        .persist(path)?
+        .key()
+        .clone())
 }
 
 pub fn load(path: &Path) -> Result<SecretKey> {
@@ -100,7 +193,8 @@ fn create_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_private_parent(path: &Path) -> Result<()> {
+fn create_private_parent(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let created_parents = missing_parent_directories(path)?;
     if let Some(parent) = path.parent() {
         // Apply the private mode only to directories created by this call.
         // Rechmodding an existing parent is unsafe: an identity placed below
@@ -112,7 +206,7 @@ fn create_private_parent(path: &Path) -> Result<()> {
             .create(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    Ok(())
+    Ok(created_parents)
 }
 
 fn write_key(file: &mut std::fs::File, key: &SecretKey) -> Result<()> {
@@ -127,6 +221,61 @@ fn sync_parent(path: &Path) -> Result<()> {
         .with_context(|| format!("failed opening identity directory {}", parent.display()))?
         .sync_all()
         .with_context(|| format!("failed persisting identity directory {}", parent.display()))
+}
+
+fn missing_parent_directories(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let Some(mut parent) = path.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(parent) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(parent.to_path_buf());
+                let Some(next) = parent.parent() else {
+                    break;
+                };
+                parent = next;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", parent.display()));
+            }
+        }
+    }
+    missing.reverse();
+    Ok(missing)
+}
+
+fn remove_created_identity(
+    path: &Path,
+    key: &SecretKey,
+    created_parents: &[std::path::PathBuf],
+) -> Result<()> {
+    let expected = format!("{}\n", hex::encode(key.to_bytes()));
+    let actual = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading created identity {}", path.display()))?;
+    ensure!(
+        actual == expected,
+        "refusing to remove identity {} because it changed after creation",
+        path.display()
+    );
+    std::fs::remove_file(path)
+        .with_context(|| format!("failed removing created identity {}", path.display()))?;
+    sync_parent(path)?;
+    remove_empty_directories(created_parents);
+    Ok(())
+}
+
+fn remove_empty_directories(paths: &[std::path::PathBuf]) {
+    for path in paths.iter().rev() {
+        match std::fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +293,35 @@ mod tests {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn identity_plan_is_side_effect_free_until_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/identity.key");
+
+        let plan = IdentityPlan::prepare_bootstrap(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+
+        let identity = plan.persist(&path).unwrap();
+        assert_eq!(identity.endpoint_id(), load(&path).unwrap().public());
+    }
+
+    #[test]
+    fn rolled_back_plan_removes_only_its_new_identity_and_empty_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/identity.key");
+        let parent = path.parent().unwrap().to_path_buf();
+
+        let identity = IdentityPlan::prepare_bootstrap(&path)
+            .unwrap()
+            .persist(&path)
+            .unwrap();
+        identity.rollback_created(&path).unwrap();
+
+        assert!(!path.exists());
+        assert!(!parent.exists());
     }
 
     #[test]

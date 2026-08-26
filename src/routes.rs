@@ -347,7 +347,7 @@ pub fn registry_path(identity_file: &Path) -> PathBuf {
 
 pub async fn validate_for_config(config_path: &Path, registry: &RouteRegistry) -> Result<()> {
     let config = Config::load_with_route_origins(config_path, registry.routes.clone()).await?;
-    let secret_key = identity::load_or_create(&config.identity_file)?;
+    let secret_key = identity::load(&config.identity_file)?;
     config.validate_local_id(secret_key.public())
 }
 

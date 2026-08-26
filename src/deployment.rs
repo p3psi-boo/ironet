@@ -15,7 +15,7 @@ use crate::{
 
 pub async fn validate(path: &Path) -> Result<(Config, iroh::EndpointId)> {
     let config = Config::load(path).await?;
-    let key = identity::load_or_create(&config.identity_file)?;
+    let key = identity::load(&config.identity_file)?;
     let endpoint_id = key.public();
     config.validate_local_id(endpoint_id)?;
     Ok((config, endpoint_id))
@@ -26,22 +26,52 @@ pub async fn install(source: &Path, destination: &Path) -> Result<()> {
         bail!("source and destination configuration paths must differ");
     }
     let config = Config::load_unsealed(source).await?;
-    let key = identity::load_or_create(&config.identity_file)?;
-    let endpoint_id = key.public();
-    config.validate_local_id(endpoint_id)?;
     let candidate = read_file(source)?;
     let previous = previous_path(destination);
-    if destination.exists() {
-        let current = read_file(destination)?;
-        atomic_write(&previous, &current, 0o600)?;
-        seal(&previous).await?;
+    let destination_digest = config_digest_path(destination);
+    let previous_digest = config_digest_path(&previous);
+    let destination_snapshot = FileSnapshot::capture(destination)?;
+    let destination_digest_snapshot = FileSnapshot::capture(&destination_digest)?;
+    let previous_snapshot = FileSnapshot::capture(&previous)?;
+    let previous_digest_snapshot = FileSnapshot::capture(&previous_digest)?;
+    let identity_plan = if destination_snapshot.contents().is_some() {
+        identity::IdentityPlan::require(&config.identity_file)?
+    } else {
+        identity::IdentityPlan::prepare_bootstrap(&config.identity_file)?
+    };
+    config.validate_local_id(identity_plan.endpoint_id())?;
+
+    let persisted_identity = identity_plan.persist(&config.identity_file)?;
+    if let Err(error) = config.validate_local_id(persisted_identity.endpoint_id()) {
+        return rollback_identity_after_failure(error, &persisted_identity, &config.identity_file);
     }
-    atomic_write(destination, &candidate, 0o600)?;
-    seal(destination).await?;
+
+    let result = (|| -> Result<()> {
+        if let Some(current) = destination_snapshot.contents() {
+            atomic_write(&previous, current, 0o600)?;
+            write_digest(&previous, current)?;
+        }
+        atomic_write(destination, &candidate, 0o600)?;
+        write_digest(destination, &candidate)
+    })();
+    if let Err(error) = result {
+        return rollback_install_after_failure(
+            error,
+            [
+                &destination_snapshot,
+                &destination_digest_snapshot,
+                &previous_snapshot,
+                &previous_digest_snapshot,
+            ],
+            &persisted_identity,
+            &config.identity_file,
+        );
+    }
+
     info!(
         source = %source.display(),
         destination = %destination.display(),
-        endpoint_id = %endpoint_id,
+        endpoint_id = %persisted_identity.endpoint_id(),
         network_id = %config.network_id,
         "configuration installed atomically"
     );
@@ -50,11 +80,20 @@ pub async fn install(source: &Path, destination: &Path) -> Result<()> {
 
 pub async fn seal(path: &Path) -> Result<()> {
     let config = Config::load_unsealed(path).await?;
-    let key = identity::load_or_create(&config.identity_file)?;
-    config.validate_local_id(key.public())?;
+    let identity_plan = if config_digest_exists(path)? {
+        identity::IdentityPlan::require(&config.identity_file)?
+    } else {
+        identity::IdentityPlan::prepare_bootstrap(&config.identity_file)?
+    };
+    config.validate_local_id(identity_plan.endpoint_id())?;
     let contents = read_file(path)?;
-    let digest = format!("{}\n", blake3::hash(&contents).to_hex());
-    atomic_write(&config_digest_path(path), digest.as_bytes(), 0o600)?;
+    let persisted_identity = identity_plan.persist(&config.identity_file)?;
+    if let Err(error) = config.validate_local_id(persisted_identity.endpoint_id()) {
+        return rollback_identity_after_failure(error, &persisted_identity, &config.identity_file);
+    }
+    if let Err(error) = write_digest(path, &contents) {
+        return rollback_identity_after_failure(error, &persisted_identity, &config.identity_file);
+    }
     info!(config = %path.display(), "configuration integrity digest written");
     Ok(())
 }
@@ -136,6 +175,114 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed reading {}", path.display()))
 }
 
+fn config_digest_exists(config_path: &Path) -> Result<bool> {
+    let digest_path = config_digest_path(config_path);
+    match std::fs::symlink_metadata(&digest_path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed inspecting {}", digest_path.display()))
+        }
+    }
+}
+
+fn write_digest(config_path: &Path, contents: &[u8]) -> Result<()> {
+    let digest = format!("{}\n", blake3::hash(contents).to_hex());
+    atomic_write(&config_digest_path(config_path), digest.as_bytes(), 0o600)
+}
+
+struct FileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl FileSnapshot {
+    fn capture(path: &Path) -> Result<Self> {
+        let contents = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    bail!("refusing to replace non-regular file {}", path.display());
+                }
+                Some(read_file(path)?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed inspecting {}", path.display()));
+            }
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            contents,
+        })
+    }
+
+    fn contents(&self) -> Option<&[u8]> {
+        self.contents.as_deref()
+    }
+
+    fn restore(&self) -> Result<()> {
+        match &self.contents {
+            Some(contents) => atomic_write(&self.path, contents, 0o600),
+            None => remove_file_if_exists(&self.path),
+        }
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            File::open(parent)
+                .with_context(|| format!("failed opening {}", parent.display()))?
+                .sync_all()
+                .with_context(|| format!("failed persisting {}", parent.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed removing {}", path.display())),
+    }
+}
+
+fn rollback_identity_after_failure<T>(
+    error: anyhow::Error,
+    identity: &identity::PersistedIdentity,
+    identity_path: &Path,
+) -> Result<T> {
+    match identity.rollback_created(identity_path) {
+        Ok(()) => Err(error),
+        Err(rollback) => Err(error.context(format!(
+            "identity provisioning rollback also failed: {rollback:#}"
+        ))),
+    }
+}
+
+fn rollback_install_after_failure<T>(
+    error: anyhow::Error,
+    snapshots: [&FileSnapshot; 4],
+    identity: &identity::PersistedIdentity,
+    identity_path: &Path,
+) -> Result<T> {
+    let restore_errors = snapshots
+        .into_iter()
+        .rev()
+        .filter_map(|snapshot| snapshot.restore().err().map(|error| format!("{error:#}")))
+        .collect::<Vec<_>>();
+    let identity_error = identity.rollback_created(identity_path).err();
+    match (restore_errors.is_empty(), identity_error) {
+        (true, None) => Err(error),
+        (false, None) => Err(error.context(format!(
+            "configuration install rollback also failed: {}",
+            restore_errors.join("; ")
+        ))),
+        (true, Some(identity)) => Err(error.context(format!(
+            "identity provisioning rollback also failed: {identity:#}"
+        ))),
+        (false, Some(identity)) => Err(error.context(format!(
+            "configuration rollback failed: {}; identity rollback failed: {identity:#}",
+            restore_errors.join("; ")
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +335,73 @@ mod tests {
             created.public()
         );
         assert!(config_digest_path(&config_path).exists());
+    }
+
+    #[tokio::test]
+    async fn sealing_an_existing_configuration_requires_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let identity_path = dir.path().join("state/identity.key");
+        atomic_write(
+            &config_path,
+            format!(
+                "network_id = \"bootstrap\"\nidentity_file = \"{}\"\n",
+                identity_path.display()
+            )
+            .as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        seal(&config_path).await.unwrap();
+        std::fs::remove_file(&identity_path).unwrap();
+
+        let error = seal(&config_path).await.unwrap_err();
+
+        assert!(error.to_string().contains("failed to inspect"));
+        assert!(!identity_path.exists());
+    }
+
+    #[tokio::test]
+    async fn validation_does_not_create_a_missing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let identity_path = dir.path().join("state/identity.key");
+        let contents = format!(
+            "network_id = \"bootstrap\"\nidentity_file = \"{}\"\n",
+            identity_path.display()
+        );
+        atomic_write(&config_path, contents.as_bytes(), 0o600).unwrap();
+        write_digest(&config_path, contents.as_bytes()).unwrap();
+
+        let error = validate(&config_path).await.unwrap_err();
+
+        assert!(error.to_string().contains("failed to inspect"));
+        assert!(!identity_path.exists());
+        assert!(!identity_path.parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn failed_install_removes_a_newly_provisioned_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("candidate.toml");
+        let identity_path = dir.path().join("state/identity.key");
+        atomic_write(
+            &source,
+            format!(
+                "network_id = \"bootstrap\"\nidentity_file = \"{}\"\n",
+                identity_path.display()
+            )
+            .as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let destination = Path::new("/proc/ironet-install-identity-rollback/config.toml");
+
+        let error = install(&source, destination).await.unwrap_err();
+
+        assert!(error.to_string().contains("failed creating"));
+        assert!(!identity_path.exists());
+        assert!(!identity_path.parent().unwrap().exists());
     }
 
     #[tokio::test]

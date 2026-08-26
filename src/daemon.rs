@@ -36,7 +36,7 @@ const RESTART_SETTLE_DELAY: Duration = Duration::from_secs(3);
 impl Generation {
     async fn load(config_path: &Path) -> Result<Self> {
         let config = Config::load(config_path).await?;
-        let secret_key = identity::load_or_create(&config.identity_file)?;
+        let secret_key = identity::load(&config.identity_file)?;
         config.validate_local_id(secret_key.public())?;
         let runtime_config = V2RuntimeConfig::from_product_config(&config)
             .context("configuration is not valid for the V2-only dataplane")?;
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_load_creates_a_missing_configured_identity() {
+    async fn generation_load_rejects_a_missing_configured_identity() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let identity_path = dir.path().join("state/identity.key");
@@ -410,12 +410,12 @@ mod tests {
         crate::deployment::seal(&config_path).await.unwrap();
         std::fs::remove_file(&identity_path).unwrap();
 
-        let generation = Generation::load(&config_path).await.unwrap();
+        let error = match Generation::load(&config_path).await {
+            Ok(_) => panic!("missing identity unexpectedly started a generation"),
+            Err(error) => error,
+        };
 
-        assert!(identity_path.exists());
-        assert_eq!(
-            generation.secret_key.public(),
-            identity::load(&identity_path).unwrap().public()
-        );
+        assert!(error.to_string().contains("failed to inspect"));
+        assert!(!identity_path.exists());
     }
 }

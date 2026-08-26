@@ -67,7 +67,7 @@ nat_enabled = true
 # maximum_module_bytes = 8388608   # 8 MiB component file
 # maximum_memory_bytes = 8388608   # 8 MiB guest linear memory
 # maximum_state_bytes = 65536      # 64 KiB per-peer state, at most 1 MiB
-# deadline_millis = 10             # single decide() wall deadline, 1..=1000
+# deadline_millis = 100            # single decide() wall deadline, 1..=1000
 # state_flush_interval_secs = 60   # periodic state flush; also on switch/exit
 
 # Trusted signers; several entries allow key rotation. Revoke by deleting the

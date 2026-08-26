@@ -428,7 +428,7 @@ const fn default_wasm_maximum_state_bytes() -> u64 {
     64 * 1024
 }
 const fn default_wasm_deadline_millis() -> u64 {
-    10
+    100
 }
 const fn default_wasm_state_flush_interval_secs() -> u64 {
     60
@@ -1675,7 +1675,7 @@ identity_file = "/tmp/ironet-v2.key"
         assert_eq!(wasm.maximum_module_bytes, 8_388_608);
         assert_eq!(wasm.maximum_memory_bytes, 8_388_608);
         assert_eq!(wasm.maximum_state_bytes, 65_536);
-        assert_eq!(wasm.deadline_millis, 10);
+        assert_eq!(wasm.deadline_millis, 100);
         assert_eq!(wasm.state_flush_interval_secs, 60);
         assert!(wasm.signers.is_empty());
         assert!(wasm.digest_pins.is_empty());
@@ -1703,7 +1703,7 @@ require_signature = true
 maximum_module_bytes = 8388608
 maximum_memory_bytes = 8388608
 maximum_state_bytes = 65536
-deadline_millis = 10
+deadline_millis = 100
 state_flush_interval_secs = 60
 
 [[autotune.wasm.signers]]

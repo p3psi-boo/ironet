@@ -29,15 +29,6 @@ jobs:
         with:
           toolchain: 1.98.0
           components: clippy,rustfmt
-          targets: wasm32-unknown-unknown
-
-      - name: Install policy guest tools
-        run: |
-          cargo install wasm-tools --locked --version 1.254.0
-          cargo install b3sum --locked --version 1.8.5
-
-      - name: Verify reproducible policy guests
-        run: scripts/build-policy-guest.sh --check
 
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2

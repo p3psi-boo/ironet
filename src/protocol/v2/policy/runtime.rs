@@ -609,4 +609,16 @@ mod tests {
         // its pinned digest instead.
         assert!(AutotuneWasmConfig::default().require_signature);
     }
+
+    #[test]
+    fn builtin_self_check_keeps_the_configured_runtime_deadline() {
+        let config = AutotuneWasmConfig {
+            deadline_millis: 1,
+            ..AutotuneWasmConfig::default()
+        };
+        let backend = PolicyLoader::new(PolicyEngine::new())
+            .load_builtin(&config)
+            .unwrap();
+        assert_eq!(backend.epoch_deadline_ticks(), config.deadline_millis);
+    }
 }

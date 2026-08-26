@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Startup validation must prove the component can execute, but it must not
+/// inherit the production tick deadline: cold Wasmtime component calls can
+/// exceed a short policy budget on a contended CI host. The normal `decide`
+/// path restores and enforces the configured deadline immediately afterward.
+const SELF_CHECK_DEADLINE_TICKS: u64 = 1_000;
+
 /// Wasmtime-backed implementation of [`PolicyBackend`].
 pub struct WasmPolicyBackend {
     identity: PolicyIdentityV1,
@@ -76,24 +82,30 @@ impl WasmPolicyBackend {
     }
 
     pub(super) fn self_check(&mut self) -> Result<()> {
-        let empty = PolicyInputV1::default();
-        self.decide(&empty)
-            .map_err(|fault| anyhow!("empty policy self-check failed: {fault}"))?;
-        // The state blob must be a *valid* encoding (empty = cold start):
-        // guests that keep typed state — the builtin among them — report
-        // corrupt state as a fault by design (plan section 12.2), so feeding
-        // garbage here would reject every stateful policy at load time.
-        // Corrupt-state handling is exercised by the fault-path tests instead.
-        let fixture = PolicyInputV1 {
-            logical_tick: 1,
-            deterministic_seed: 0x0123_4567_89ab_cdef,
-            peer_hash: [0xa5; 32],
-            path_epoch: 7,
-            ..PolicyInputV1::default()
-        };
-        self.decide(&fixture)
-            .map_err(|fault| anyhow!("fixed policy self-check failed: {fault}"))?;
-        Ok(())
+        let configured_deadline = self.epoch_deadline_ticks;
+        self.epoch_deadline_ticks = configured_deadline.max(SELF_CHECK_DEADLINE_TICKS);
+        let result = (|| {
+            let empty = PolicyInputV1::default();
+            self.decide(&empty)
+                .map_err(|fault| anyhow!("empty policy self-check failed: {fault}"))?;
+            // The state blob must be a *valid* encoding (empty = cold start):
+            // guests that keep typed state — the builtin among them — report
+            // corrupt state as a fault by design (plan section 12.2), so feeding
+            // garbage here would reject every stateful policy at load time.
+            // Corrupt-state handling is exercised by the fault-path tests instead.
+            let fixture = PolicyInputV1 {
+                logical_tick: 1,
+                deterministic_seed: 0x0123_4567_89ab_cdef,
+                peer_hash: [0xa5; 32],
+                path_epoch: 7,
+                ..PolicyInputV1::default()
+            };
+            self.decide(&fixture)
+                .map_err(|fault| anyhow!("fixed policy self-check failed: {fault}"))?;
+            Ok(())
+        })();
+        self.epoch_deadline_ticks = configured_deadline;
+        result
     }
 
     pub fn manifest(&self) -> &PolicyManifestV1 {

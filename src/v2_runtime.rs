@@ -27,28 +27,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result};
 use ipnet::IpNet;
 use iroh::{EndpointId, endpoint::Connection};
 use rustc_hash::FxHashMap as HashMap;
-use tokio::{
-    sync::{Semaphore, broadcast, mpsc, oneshot, watch},
-    task::JoinSet,
-};
+use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{info, warn};
 
-use autotune::tuner_loop;
-pub(crate) use connection::validate_cover_sni;
-use connection::{build_v2_derp_transport, establish_connection, session_policy};
-use dataplane::{
-    ControlContextV2, PresenceContextV2, PrioritizedTunInput, RxRouteContext, TUN_INPUT_SLOTS,
-    TUN_PRIORITY_INPUT_SLOTS, TxControl, control_loop, presence_loop, prioritized_tun_reader,
-    route_loop, rx_loop, tx_loop, unix_secs,
-};
+pub(crate) use crate::config::validate_cover_sni;
+use connection::build_v2_derp_transport;
 pub(crate) use host_network::cleanup_v2_nat_all;
-use host_network::{configure_tunnel, local_overlay_addresses, reconcile_v2_nat};
 pub use host_network::{derived_overlay_address, derived_overlay_ipv4_address};
-use link::{selected_direct_addresses, selected_path_cost, ticket_partition_label};
 use mesh::run_mesh;
 use telemetry::RuntimeMetrics;
 
@@ -56,15 +45,8 @@ use crate::{
     config::{AutotuneConfig, PathMigrationConfig},
     derp::{DerpPublicKey, DerpServer},
     identity,
-    protocol::v2::{
-        policy::runtime::{PolicyEngine, PolicyLoader},
-        presence::{PresenceBodyV2, PresenceLinkV2, SignedPresenceV2},
-        routing::{AdjacencyIdV2, DataplaneSnapshotV2, LabelActionV2, LabelRouteV2, RouteLabelV2},
-        session::negotiate_connection_v2,
-        tuning::TuneDecisionV2,
-    },
+    protocol::v2::policy::runtime::{PolicyEngine, PolicyLoader},
     trace::OverlayTraceOamEvent,
-    tunnel::OverlayTunnel,
 };
 
 const ALPN: &[u8] = b"h3";
@@ -100,15 +82,6 @@ pub struct V2RuntimeConfig {
     /// underlay path may use. This is enforced by the live path selector, not
     /// only when configured locators are parsed.
     pub excluded_underlay_prefixes: Vec<IpNet>,
-    /// A peer with addresses is dialed. A peer without addresses is an
-    /// allowlisted listener. `None` accepts the first authenticated peer.
-    pub peer_id: Option<EndpointId>,
-    /// Standalone lab mode may accept one authenticated but otherwise
-    /// unconfigured peer. Product configurations always set this to false so
-    /// an empty or fully revoked membership set remains fail-closed.
-    pub accept_first_peer: bool,
-    pub peer_addresses: Vec<SocketAddr>,
-    pub peer_derp_public_key: Option<DerpPublicKey>,
     /// Static authenticated adjacencies for the V2 mesh runtime. Repeating an
     /// EndpointId merges its locators. Dial ownership is derived from the two
     /// EndpointIds so only one side initiates each direct QUIC adjacency.
@@ -136,7 +109,6 @@ pub struct V2RuntimeConfig {
     pub allow_default_routes: bool,
     pub subnet_nat: bool,
     pub transit_enabled: bool,
-    pub route_label: u32,
     pub autotune: AutotuneConfig,
     pub path_migration: PathMigrationConfig,
     pub max_egress_bytes_per_second: Option<u64>,
@@ -173,12 +145,7 @@ impl V2RuntimeState {
     pub(crate) fn new(config: &V2RuntimeConfig, endpoint_id: EndpointId) -> Self {
         let (trace_events, _) = broadcast::channel(256);
         let mut peers = HashMap::default();
-        for peer in config
-            .mesh_peers
-            .iter()
-            .map(|peer| peer.endpoint_id)
-            .chain(config.peer_id)
-        {
+        for peer in config.mesh_peers.iter().map(|peer| peer.endpoint_id) {
             peers.insert(
                 peer,
                 Self::peer_status(&config.tun_name, config.tun_mtu, peer),
@@ -340,247 +307,23 @@ async fn run_with_shutdown_future(
         state.send_replace(Some(runtime_state.clone()));
     }
 
-    if !config.mesh_peers.is_empty() {
-        return run_mesh(
-            config,
-            endpoint,
-            derp_transport,
-            secret_key,
-            local_id,
-            shutdown,
-            runtime_state,
-        )
-        .await;
-    }
-
-    if config.peer_id.is_none() && !config.accept_first_peer {
+    if config.mesh_peers.is_empty() {
         info!("V2 product endpoint has no admitted peers; waiting fail-closed");
         shutdown.as_mut().await?;
         endpoint.close().await;
         return Ok(());
     }
 
-    let connection = tokio::select! {
-        // A passive endpoint can wait here indefinitely. Keep shutdown live
-        // before the dataplane JoinSet exists instead of merely registering
-        // the signal and deferring its observation until a peer arrives.
-        biased;
-        signal = shutdown.as_mut() => {
-            signal?;
-            info!("received V2 shutdown signal during connection establishment");
-            endpoint.close().await;
-            return Ok(());
-        }
-        result = establish_connection(&endpoint, &config, derp_transport.as_deref()) => result?,
-    };
-    let remote_id = connection.remote_id();
-    if let Some(expected) = config.peer_id {
-        ensure!(remote_id == expected, "incoming V2 peer is not allowlisted");
-    }
-    let policy = session_policy(&config, local_id, remote_id);
-    let negotiated = tokio::select! {
-        biased;
-        signal = shutdown.as_mut() => {
-            signal?;
-            info!("received V2 shutdown signal during session negotiation");
-            connection.close(0_u8.into(), b"V2 startup shutdown");
-            endpoint.close().await;
-            return Ok(());
-        }
-        result = negotiate_connection_v2(&connection, &policy) => result?,
-    };
-    info!(
-        peer = %remote_id,
-        session_epoch = negotiated.session_epoch,
-        cover_profile = negotiated.cover_profile_id,
-        "V2 authenticated session active"
-    );
-    runtime_state.mark_connected(&connection);
-    let (local_overlay_v4, local_overlay) = local_overlay_addresses(&config, local_id);
-    let presence_issued = unix_secs(SystemTime::now())?;
-    let local_presence = SignedPresenceV2::sign(
-        PresenceBodyV2 {
-            owner: local_id,
-            sequence: 1,
-            issued_unix_secs: presence_issued,
-            expires_unix_secs: presence_issued.saturating_add(180),
-            direct_addresses: selected_direct_addresses(&connection, config.bind.port()),
-            node_addresses: vec![
-                IpNet::from(std::net::IpAddr::V4(local_overlay_v4)),
-                IpNet::from(std::net::IpAddr::V6(local_overlay)),
-            ],
-            prefixes: config.advertised_routes.clone(),
-            links: vec![PresenceLinkV2 {
-                peer: remote_id,
-                cost: selected_path_cost(&connection),
-                healthy: true,
-                maximum_datagram_size: negotiated.limits.max_datagram_size,
-            }],
-            transit_enabled: config.transit_enabled,
-        },
-        &secret_key,
-        &config.network_id,
-    )?;
-
-    let remote_overlay = derived_overlay_address(&config.network_id, remote_id);
-    let remote_overlay_v4 = derived_overlay_ipv4_address(&config.network_id, remote_id);
-    let tunnel = OverlayTunnel::create(config.tun_name.clone(), config.tun_mtu)?;
-    let (route_policy, _kernel_route_guard) = configure_tunnel(
-        &config,
-        local_overlay_v4,
-        remote_overlay_v4,
-        local_overlay,
-        remote_overlay,
-    )?;
-    runtime_state.publish_routes(config.routes.iter().copied());
-    reconcile_v2_nat(
-        &config.tun_name,
-        &config.advertised_routes,
-        config.subnet_nat,
-    )?;
-    info!(
-        interface = %config.tun_name,
-        local_overlay_v4 = %local_overlay_v4,
-        remote_overlay_v4 = %remote_overlay_v4,
-        local_overlay = %local_overlay,
-        remote_overlay = %remote_overlay,
-        queues = tunnel.queue_count(),
-        "V2 TUN configured"
-    );
-
-    let metrics = Arc::new(RuntimeMetrics::default());
-    runtime_state.attach_metrics(remote_id, metrics.clone());
-    // The one-adjacency runtime still has one adjacency, but it consumes the same
-    // immutable label snapshot and local-delivery gate as the multi-peer
-    // runtime. This prevents the one-peer path from becoming a second wire
-    // semantics while transit is brought up incrementally.
-    let ingress_adjacency = AdjacencyIdV2::new(1)?;
-    let dataplane_snapshot = Arc::new(DataplaneSnapshotV2::compile(
-        1,
-        *local_id.as_bytes(),
-        Vec::new(),
-        vec![LabelRouteV2 {
-            route_label: RouteLabelV2::new(config.route_label)?,
-            route_epoch: negotiated.session_epoch,
-            action: LabelActionV2::Local {
-                expected_ingress: ingress_adjacency,
-            },
-        }],
-        Vec::new(),
-        false,
-    )?);
-    let (tun_sender, tun_receiver) = mpsc::channel(TUN_INPUT_SLOTS);
-    let (tun_priority_sender, tun_priority_receiver) = mpsc::channel(TUN_PRIORITY_INPUT_SLOTS);
-    // Absorb one bounded multi-queue GSO merge burst before dispatch; the TX
-    // scheduler retains its independent 512-KiB per-adjacency high-water.
-    let tun_regular_budget = Arc::new(Semaphore::new(TUN_REGULAR_INPUT_BYTES));
-    let (tune_sender, tune_receiver) = watch::channel(None::<TuneDecisionV2>);
-    let (control_sender, control_receiver) = mpsc::channel(256);
-    let (repair_sender, repair_receiver) = mpsc::channel(256);
-    let (route_sender, route_receiver) = mpsc::channel(8);
-    let (presence_sender, presence_receiver) = mpsc::channel(64);
-    let mut tasks = JoinSet::new();
-    tasks.spawn(cpu_sampler_loop(runtime_state.clone()));
-    for device in &tunnel.devices {
-        tasks.spawn(prioritized_tun_reader(
-            device.clone(),
-            tun_sender.clone(),
-            tun_priority_sender.clone(),
-            tun_regular_budget.clone(),
-            metrics.clone(),
-            tunnel.mtu,
-        ));
-    }
-    drop(tun_sender);
-    drop(tun_priority_sender);
-    tasks.spawn(tx_loop(
-        connection.clone(),
-        negotiated,
-        PrioritizedTunInput {
-            regular: tun_receiver,
-            priority: tun_priority_receiver,
-        },
-        tune_receiver,
-        control_receiver,
-        metrics.clone(),
-        config.route_label,
-    ));
-    tasks.spawn(rx_loop(
-        connection.clone(),
-        negotiated,
-        tunnel.writer(),
-        metrics.clone(),
-        control_sender.clone(),
-        repair_receiver,
-        RxRouteContext {
-            snapshot: dataplane_snapshot,
-            incoming: ingress_adjacency,
-        },
-    ));
-    tasks.spawn(control_loop(
-        connection.clone(),
-        negotiated,
-        ControlContextV2 {
-            tx: control_sender.clone(),
-            repaired: repair_sender,
-            routes: route_sender.clone(),
-            presences: presence_sender,
-            allow_default_routes: config.allow_default_routes,
-            metrics: metrics.clone(),
-        },
-    ));
-    tasks.spawn(presence_loop(
-        local_presence.clone(),
-        presence_receiver,
-        PresenceContextV2 {
-            network_id: config.network_id.clone(),
-            local_id,
-            secret_key: secret_key.clone(),
-            routes: route_sender.clone(),
-            control: control_sender.clone(),
-            allow_default_routes: config.allow_default_routes,
-            runtime_state: runtime_state.clone(),
-        },
-    ));
-    tasks.spawn(route_loop(
-        route_policy,
-        config.routes.clone(),
-        route_receiver,
-        runtime_state.clone(),
-    ));
-    tasks.spawn(tuner_loop(
-        connection.clone(),
-        metrics,
-        tune_sender,
-        runtime_state.clone(),
-        ticket_partition_label(
-            &config.network_id,
-            config.cover_profile_id,
-            QUIC_WIRE_VERSION,
-        ),
-    ));
-    control_sender
-        .send(TxControl::Send(local_presence.encode()?))
-        .await
-        .context("V2 TX task stopped before Presence advertisement")?;
-
-    let outcome = tokio::select! {
-        signal = shutdown.as_mut() => {
-            signal?;
-            info!("received V2 shutdown signal");
-            Ok(())
-        },
-        result = tasks.join_next() => match result {
-            Some(Ok(result)) => result.context("V2 dataplane task stopped"),
-            Some(Err(error)) => Err(error).context("V2 dataplane task panicked"),
-            None => bail!("V2 dataplane has no active tasks"),
-        },
-    };
-    connection.close(0_u8.into(), b"V2 shutdown");
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    endpoint.close().await;
-    outcome
+    run_mesh(
+        config,
+        endpoint,
+        derp_transport,
+        secret_key,
+        local_id,
+        shutdown,
+        runtime_state,
+    )
+    .await
 }
 
 #[derive(Debug)]

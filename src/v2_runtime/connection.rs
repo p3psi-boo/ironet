@@ -1,4 +1,4 @@
-//! V2 endpoint construction, peer connection establishment, and cover-name selection.
+//! V2 endpoint construction, mesh adjacency establishment, and cover-name selection.
 
 use std::{collections::HashSet as StdHashSet, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -21,6 +21,7 @@ use super::{
     path_selection::UnderlayPathSelector,
 };
 use crate::{
+    config::validate_cover_sni,
     derp::{
         DerpTransport, identity::load_or_create as load_or_create_derp_identity,
         tls_config as derp_tls_config,
@@ -87,7 +88,6 @@ impl V2RuntimeConfig {
                 "V2 accepts at most one node address per family"
             );
         }
-        ensure!(self.route_label != 0, "V2 route label zero is reserved");
         RouteAdvertisementV2 {
             generation: 1,
             prefixes: self.advertised_routes.clone(),
@@ -96,22 +96,6 @@ impl V2RuntimeConfig {
         ensure!(
             self.allow_default_routes || self.routes.iter().all(|route| route.prefix_len() != 0),
             "V2 default route was not explicitly enabled"
-        );
-        ensure!(
-            (self.peer_addresses.is_empty() && self.peer_derp_public_key.is_none())
-                || self.peer_id.is_some(),
-            "V2 peer locators require a peer ID"
-        );
-        ensure!(
-            !self.accept_first_peer || (self.peer_id.is_none() && self.mesh_peers.is_empty()),
-            "V2 accept-first mode cannot be combined with configured peers"
-        );
-        ensure!(
-            self.mesh_peers.is_empty()
-                || (self.peer_id.is_none()
-                    && self.peer_addresses.is_empty()
-                    && self.peer_derp_public_key.is_none()),
-            "V2 one-peer and mesh-peer modes are mutually exclusive"
         );
         let mut peers = self
             .mesh_peers
@@ -139,11 +123,10 @@ impl V2RuntimeConfig {
             );
         }
         let derp_enabled = !self.derp_servers.is_empty();
-        let has_derp_peer = self.peer_derp_public_key.is_some()
-            || self
-                .mesh_peers
-                .iter()
-                .any(|peer| peer.derp_public_key.is_some());
+        let has_derp_peer = self
+            .mesh_peers
+            .iter()
+            .any(|peer| peer.derp_public_key.is_some());
         ensure!(
             derp_enabled == self.derp_identity_file.is_some(),
             "V2 DERP servers and identity file must be configured together"
@@ -162,13 +145,9 @@ impl V2RuntimeConfig {
         regions.dedup();
         ensure!(regions.len() == region_count, "duplicate V2 DERP region");
         let mut derp_peers = self
-            .peer_derp_public_key
-            .into_iter()
-            .chain(
-                self.mesh_peers
-                    .iter()
-                    .filter_map(|peer| peer.derp_public_key),
-            )
+            .mesh_peers
+            .iter()
+            .filter_map(|peer| peer.derp_public_key)
             .collect::<Vec<_>>();
         derp_peers.sort_unstable();
         let derp_peer_count = derp_peers.len();
@@ -178,11 +157,6 @@ impl V2RuntimeConfig {
             "duplicate V2 DERP peer public key"
         );
         Ok(())
-    }
-
-    fn dialing(&self) -> bool {
-        self.peer_id.is_some()
-            && (!self.peer_addresses.is_empty() || self.peer_derp_public_key.is_some())
     }
 
     /// Translate the product configuration into the single V2 dataplane
@@ -257,10 +231,6 @@ impl V2RuntimeConfig {
             identity_file: config.identity_file.clone(),
             bind,
             excluded_underlay_prefixes: config.excluded_underlay_prefixes.clone(),
-            peer_id: None,
-            accept_first_peer: false,
-            peer_addresses: Vec::new(),
-            peer_derp_public_key: None,
             mesh_peers,
             derp_servers,
             derp_identity_file: config
@@ -281,7 +251,6 @@ impl V2RuntimeConfig {
             allow_default_routes: config.routing.allow_default_routes,
             subnet_nat: config.routing.nat_enabled,
             transit_enabled: config.routing.transit_enabled,
-            route_label: 1,
             autotune: config.autotune.clone(),
             path_migration: config.path_migration.clone(),
             max_egress_bytes_per_second: config.routing.max_egress_bps().map(|bits| bits / 8),
@@ -393,14 +362,9 @@ pub(super) fn build_v2_derp_transport(
     let identity = load_or_create_derp_identity(identity_file)?;
     let public_key = identity.public_key();
     let allowed_peers = config
-        .peer_derp_public_key
-        .into_iter()
-        .chain(
-            config
-                .mesh_peers
-                .iter()
-                .filter_map(|peer| peer.derp_public_key),
-        )
+        .mesh_peers
+        .iter()
+        .filter_map(|peer| peer.derp_public_key)
         .collect::<StdHashSet<_>>();
     info!(
         %public_key,
@@ -632,30 +596,6 @@ impl V2PeerConfig {
     }
 }
 
-pub(crate) fn validate_cover_sni(name: &str) -> Result<()> {
-    ensure!(
-        !name.is_empty() && name.len() <= 253 && name.is_ascii(),
-        "V2 cover SNI is invalid"
-    );
-    ensure!(
-        !name.starts_with('.') && !name.ends_with('.'),
-        "V2 cover SNI is not canonical"
-    );
-    ensure!(
-        name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        }),
-        "V2 cover SNI contains an invalid DNS label"
-    );
-    Ok(())
-}
-
 fn select_cover_sni<'a>(
     pool: &'a [String],
     network_id: &str,
@@ -802,70 +742,6 @@ async fn dial_mesh_peer(
     }
 }
 
-pub(super) async fn establish_connection(
-    endpoint: &Endpoint,
-    config: &V2RuntimeConfig,
-    derp_transport: Option<&DerpTransport>,
-) -> Result<Connection> {
-    if config.dialing() {
-        let peer_id = config.peer_id.expect("dialing requires peer ID");
-        let mut target = config
-            .peer_addresses
-            .iter()
-            .copied()
-            .fold(EndpointAddr::new(peer_id), EndpointAddr::with_ip_addr);
-        if let (Some(transport), Some(public_key)) = (derp_transport, config.peer_derp_public_key) {
-            target = target.with_addrs(
-                transport
-                    .remote_addresses(public_key)
-                    .into_iter()
-                    .map(TransportAddr::Custom),
-            );
-        }
-        let options = ConnectOptions::new()
-            .with_visible_server_name(
-                select_cover_sni_for_peer(
-                    &config.cover_sni_pool,
-                    &config.network_id,
-                    endpoint.id(),
-                    peer_id,
-                    config.cover_profile_id,
-                    &config.peer_addresses,
-                )
-                .await?,
-            )
-            .with_tls_session_partition(TlsSessionPartition::new(
-                config.network_id.clone(),
-                config.cover_profile_id,
-                QUIC_WIRE_VERSION,
-            ));
-        return endpoint
-            .connect_with_opts(target, ALPN, options)
-            .await
-            .context("starting V2 QUIC connection")?
-            .await
-            .context("establishing V2 QUIC connection");
-    }
-    loop {
-        let incoming = endpoint
-            .accept()
-            .await
-            .context("V2 QUIC endpoint closed while accepting")?;
-        let connection = incoming
-            .accept()
-            .context("accepting V2 QUIC handshake")?
-            .await
-            .context("establishing incoming V2 QUIC connection")?;
-        if config
-            .peer_id
-            .is_none_or(|expected| expected == connection.remote_id())
-        {
-            return Ok(connection);
-        }
-        connection.close(1_u8.into(), b"unexpected V2 peer");
-    }
-}
-
 pub(super) fn session_policy(
     config: &V2RuntimeConfig,
     local_id: EndpointId,
@@ -935,9 +811,7 @@ mod tests {
                 .all(|prefix| path_exclusions.contains(prefix))
         );
         assert_eq!(runtime.cover_sni_pool, ["media.example"]);
-        assert!(runtime.peer_id.is_none());
-        assert!(!runtime.accept_first_peer);
-        assert!(runtime.peer_addresses.is_empty());
+        assert!(runtime.mesh_peers.is_empty());
         assert_eq!(runtime.autotune.mode, AutotuneMode::On);
         assert_eq!(runtime.path_migration, config.path_migration);
         assert_eq!(runtime.max_egress_bytes_per_second, Some(10_000_000));

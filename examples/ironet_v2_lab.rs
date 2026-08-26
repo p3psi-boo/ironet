@@ -20,13 +20,13 @@ struct Args {
     identity_file: PathBuf,
     #[arg(long, default_value = "[::]:443")]
     bind: SocketAddr,
-    /// Dial this EndpointId when --peer-address is present; otherwise only
-    /// accept this authenticated EndpointId.
+    /// Compatibility alias for one mesh peer. New scripts should use
+    /// --mesh-peer and --mesh-peer-derp directly.
     #[arg(long)]
     peer: Option<EndpointId>,
     #[arg(long = "peer-address")]
     peer_addresses: Vec<SocketAddr>,
-    /// Tailscale DERP public key for the one-peer mode.
+    /// Compatibility alias for the DERP locator of --peer.
     #[arg(long = "peer-derp-key")]
     peer_derp_public_key: Option<DerpPublicKey>,
     /// Add an authenticated direct mesh adjacency as ENDPOINT_ID@SOCKET_ADDR.
@@ -71,8 +71,6 @@ struct Args {
     /// topology compilation.
     #[arg(long)]
     transit: bool,
-    #[arg(long, default_value_t = 1)]
-    route_label: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +127,39 @@ impl FromStr for MeshPeerDerpArg {
     }
 }
 
+fn merge_mesh_peer(
+    peers: &mut Vec<V2PeerConfig>,
+    endpoint_id: EndpointId,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    derp_public_key: Option<DerpPublicKey>,
+) -> Result<()> {
+    let peer = match peers
+        .iter_mut()
+        .find(|existing| existing.endpoint_id == endpoint_id)
+    {
+        Some(existing) => existing,
+        None => {
+            peers.push(V2PeerConfig {
+                endpoint_id,
+                addresses: Vec::new(),
+                derp_public_key: None,
+            });
+            peers.last_mut().expect("peer was just appended")
+        }
+    };
+    peer.addresses.extend(addresses);
+    peer.addresses.sort_unstable();
+    peer.addresses.dedup();
+    if let Some(key) = derp_public_key {
+        ensure!(
+            peer.derp_public_key.is_none_or(|current| current == key),
+            "conflicting DERP keys for mesh peer {endpoint_id}"
+        );
+        peer.derp_public_key = Some(key);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -138,39 +169,28 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let mut mesh_peers = Vec::<V2PeerConfig>::new();
     for peer in args.mesh_peers {
-        match mesh_peers
-            .iter_mut()
-            .find(|existing| existing.endpoint_id == peer.endpoint_id)
-        {
-            Some(existing) => existing.addresses.push(peer.address),
-            None => mesh_peers.push(V2PeerConfig {
-                endpoint_id: peer.endpoint_id,
-                addresses: vec![peer.address],
-                derp_public_key: None,
-            }),
-        }
+        merge_mesh_peer(&mut mesh_peers, peer.endpoint_id, [peer.address], None)?;
     }
     for peer in args.mesh_peer_derp {
-        match mesh_peers
-            .iter_mut()
-            .find(|existing| existing.endpoint_id == peer.endpoint_id)
-        {
-            Some(existing) => {
-                ensure!(
-                    existing
-                        .derp_public_key
-                        .is_none_or(|current| current == peer.public_key),
-                    "conflicting DERP keys for mesh peer {}",
-                    peer.endpoint_id
-                );
-                existing.derp_public_key = Some(peer.public_key);
-            }
-            None => mesh_peers.push(V2PeerConfig {
-                endpoint_id: peer.endpoint_id,
-                addresses: Vec::new(),
-                derp_public_key: Some(peer.public_key),
-            }),
-        }
+        merge_mesh_peer(
+            &mut mesh_peers,
+            peer.endpoint_id,
+            std::iter::empty(),
+            Some(peer.public_key),
+        )?;
+    }
+    if let Some(peer) = args.peer {
+        merge_mesh_peer(
+            &mut mesh_peers,
+            peer,
+            args.peer_addresses,
+            args.peer_derp_public_key,
+        )?;
+    } else {
+        ensure!(
+            args.peer_addresses.is_empty() && args.peer_derp_public_key.is_none(),
+            "--peer-address and --peer-derp-key require --peer"
+        );
     }
     let derp_servers = args
         .derp_servers
@@ -181,10 +201,6 @@ async fn main() -> Result<()> {
         identity_file: args.identity_file,
         bind: args.bind,
         excluded_underlay_prefixes: Vec::new(),
-        peer_id: args.peer,
-        accept_first_peer: args.peer.is_none() && mesh_peers.is_empty(),
-        peer_addresses: args.peer_addresses,
-        peer_derp_public_key: args.peer_derp_public_key,
         mesh_peers,
         derp_servers,
         derp_identity_file: args.derp_identity_file,
@@ -202,7 +218,6 @@ async fn main() -> Result<()> {
         allow_default_routes: args.allow_default_routes,
         subnet_nat: args.subnet_nat,
         transit_enabled: args.transit,
-        route_label: args.route_label,
         autotune: Default::default(),
         path_migration: Default::default(),
         max_egress_bytes_per_second: None,

@@ -45,14 +45,9 @@ pub(super) struct KernelRoutePolicyV2 {
 impl KernelRoutePolicyV2 {
     fn from_config(config: &V2RuntimeConfig, local_v4: Ipv4Addr, local_v6: Ipv6Addr) -> Self {
         let mut underlay_addresses = config
-            .peer_addresses
+            .mesh_peers
             .iter()
-            .chain(
-                config
-                    .mesh_peers
-                    .iter()
-                    .flat_map(|peer| peer.addresses.iter()),
-            )
+            .flat_map(|peer| peer.addresses.iter())
             .map(|address| address.ip())
             .filter(|address| !address.is_unspecified())
             .collect::<Vec<_>>();
@@ -238,46 +233,6 @@ pub(super) fn local_overlay_addresses(
         })
         .unwrap_or_else(|| derived_overlay_address(&config.network_id, endpoint_id));
     (ipv4, ipv6)
-}
-
-pub(super) fn configure_tunnel(
-    config: &V2RuntimeConfig,
-    local_v4: Ipv4Addr,
-    remote_v4: Ipv4Addr,
-    local_v6: Ipv6Addr,
-    remote_v6: Ipv6Addr,
-) -> Result<(Arc<KernelRoutePolicyV2>, KernelRouteGuardV2)> {
-    let policy = KernelRoutePolicyV2::from_config(config, local_v4, local_v6);
-    policy.cleanup()?;
-    let guard = KernelRouteGuardV2(policy.clone());
-    run_ip(["link", "set", "dev", &config.tun_name, "up"])?;
-    configure_tun_egress_aqm(&config.tun_name)?;
-    let local_v4_prefix = format!("{local_v4}/32");
-    run_ip([
-        "-4",
-        "address",
-        "replace",
-        &local_v4_prefix,
-        "dev",
-        &config.tun_name,
-    ])?;
-    policy.install_policy()?;
-    policy.replace_route(IpNet::from(IpAddr::V4(remote_v4)))?;
-    let local_prefix = format!("{local_v6}/128");
-    run_ip([
-        "-6",
-        "address",
-        "replace",
-        &local_prefix,
-        "dev",
-        &config.tun_name,
-    ])?;
-    policy.replace_route(IpNet::from(IpAddr::V6(remote_v6)))?;
-    for route in &config.routes {
-        policy.replace_route(*route)?;
-    }
-    let policy = Arc::new(policy);
-    Ok((policy, guard))
 }
 
 pub(super) fn configure_mesh_tunnel(

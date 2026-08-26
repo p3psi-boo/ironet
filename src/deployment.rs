@@ -3,6 +3,7 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, chown},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, bail};
@@ -30,11 +31,13 @@ pub async fn install(source: &Path, destination: &Path) -> Result<()> {
     let previous = previous_path(destination);
     let destination_digest = config_digest_path(destination);
     let previous_digest = config_digest_path(&previous);
-    let destination_snapshot = FileSnapshot::capture(destination)?;
-    let destination_digest_snapshot = FileSnapshot::capture(&destination_digest)?;
-    let previous_snapshot = FileSnapshot::capture(&previous)?;
-    let previous_digest_snapshot = FileSnapshot::capture(&previous_digest)?;
-    let identity_plan = if destination_snapshot.contents().is_some() {
+    let transaction = FileTransaction::capture([
+        destination,
+        destination_digest.as_path(),
+        previous.as_path(),
+        previous_digest.as_path(),
+    ])?;
+    let identity_plan = if transaction.contents(destination).is_some() {
         identity::IdentityPlan::require(&config.identity_file)?
     } else {
         identity::IdentityPlan::prepare_bootstrap(&config.identity_file)?
@@ -47,22 +50,15 @@ pub async fn install(source: &Path, destination: &Path) -> Result<()> {
     }
 
     let result = (|| -> Result<()> {
-        if let Some(current) = destination_snapshot.contents() {
-            atomic_write(&previous, current, 0o600)?;
-            write_digest(&previous, current)?;
+        if let Some(current) = transaction.contents(destination) {
+            write_sealed_config(&previous, current)?;
         }
-        atomic_write(destination, &candidate, 0o600)?;
-        write_digest(destination, &candidate)
+        write_sealed_config(destination, &candidate)
     })();
     if let Err(error) = result {
         return rollback_install_after_failure(
             error,
-            [
-                &destination_snapshot,
-                &destination_digest_snapshot,
-                &previous_snapshot,
-                &previous_digest_snapshot,
-            ],
+            transaction,
             &persisted_identity,
             &config.identity_file,
         );
@@ -73,7 +69,7 @@ pub async fn install(source: &Path, destination: &Path) -> Result<()> {
         destination = %destination.display(),
         endpoint_id = %persisted_identity.endpoint_id(),
         network_id = %config.network_id,
-        "configuration installed atomically"
+        "configuration installed with recoverable transaction"
     );
     Ok(())
 }
@@ -103,15 +99,25 @@ pub async fn rollback(destination: &Path) -> Result<()> {
     let (config, endpoint_id) = validate(&previous).await?;
     let previous_data = read_file(&previous)?;
     let current_data = read_file(destination)?;
-    atomic_write(destination, &previous_data, 0o600)?;
-    seal(destination).await?;
-    atomic_write(&previous, &current_data, 0o600)?;
-    seal(&previous).await?;
+    let destination_digest = config_digest_path(destination);
+    let previous_digest = config_digest_path(&previous);
+    let transaction = FileTransaction::capture([
+        destination,
+        destination_digest.as_path(),
+        previous.as_path(),
+        previous_digest.as_path(),
+    ])?;
+    if let Err(error) = (|| -> Result<()> {
+        write_sealed_config(destination, &previous_data)?;
+        write_sealed_config(&previous, &current_data)
+    })() {
+        return transaction.rollback(error, "configuration rollback");
+    }
     info!(
         destination = %destination.display(),
         endpoint_id = %endpoint_id,
         network_id = %config.network_id,
-        "configuration rolled back atomically"
+        "configuration rollback completed"
     );
     Ok(())
 }
@@ -141,7 +147,6 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         }
     };
     let temporary = temporary_path(path);
-    let _ = std::fs::remove_file(&temporary);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -161,8 +166,11 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
+static NEXT_TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
 fn temporary_path(path: &Path) -> PathBuf {
-    path_with_suffix(path, &format!(".new-{}", std::process::id()))
+    let id = NEXT_TEMPORARY_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    path_with_suffix(path, &format!(".new-{}-{id}", std::process::id()))
 }
 
 fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -189,6 +197,65 @@ fn config_digest_exists(config_path: &Path) -> Result<bool> {
 fn write_digest(config_path: &Path, contents: &[u8]) -> Result<()> {
     let digest = format!("{}\n", blake3::hash(contents).to_hex());
     atomic_write(&config_digest_path(config_path), digest.as_bytes(), 0o600)
+}
+
+/// Replace a configuration and its integrity sidecar as one recoverable
+/// transaction step. Callers that change more than this pair should wrap all
+/// affected paths in [`FileTransaction`] so any failed follow-up write is
+/// restored together.
+pub fn write_sealed_config(config_path: &Path, contents: &[u8]) -> Result<()> {
+    atomic_write(config_path, contents, 0o600)?;
+    write_digest(config_path, contents)
+}
+
+/// Captures a set of regular files before a multi-file update.
+///
+/// POSIX rename makes each replacement durable and atomic, but it cannot make
+/// a group of unrelated paths atomic. This type supplies the canonical
+/// recoverable transaction for that group: capture every target before the
+/// first write, then call [`FileTransaction::rollback`] on the first error.
+pub struct FileTransaction {
+    snapshots: Vec<FileSnapshot>,
+}
+
+impl FileTransaction {
+    pub fn capture<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Self> {
+        let mut snapshots = Vec::new();
+        for path in paths {
+            if snapshots
+                .iter()
+                .any(|snapshot: &FileSnapshot| snapshot.path == path)
+            {
+                continue;
+            }
+            snapshots.push(FileSnapshot::capture(path)?);
+        }
+        Ok(Self { snapshots })
+    }
+
+    pub fn contents(&self, path: &Path) -> Option<&[u8]> {
+        self.snapshots
+            .iter()
+            .find(|snapshot| snapshot.path == path)
+            .and_then(FileSnapshot::contents)
+    }
+
+    pub fn rollback<T>(self, error: anyhow::Error, operation: &str) -> Result<T> {
+        let restore_errors = self
+            .snapshots
+            .iter()
+            .rev()
+            .filter_map(|snapshot| snapshot.restore().err().map(|error| format!("{error:#}")))
+            .collect::<Vec<_>>();
+        if restore_errors.is_empty() {
+            Err(error.context(format!("{operation} was rolled back")))
+        } else {
+            Err(error.context(format!(
+                "{operation} failed and its rollback also failed: {}",
+                restore_errors.join("; ")
+            )))
+        }
+    }
 }
 
 struct FileSnapshot {
@@ -257,12 +324,13 @@ fn rollback_identity_after_failure<T>(
 
 fn rollback_install_after_failure<T>(
     error: anyhow::Error,
-    snapshots: [&FileSnapshot; 4],
+    transaction: FileTransaction,
     identity: &identity::PersistedIdentity,
     identity_path: &Path,
 ) -> Result<T> {
-    let restore_errors = snapshots
-        .into_iter()
+    let restore_errors = transaction
+        .snapshots
+        .iter()
         .rev()
         .filter_map(|snapshot| snapshot.restore().err().map(|error| format!("{error:#}")))
         .collect::<Vec<_>>();
@@ -307,6 +375,26 @@ mod tests {
         assert_eq!(after.permissions().mode() & 0o777, 0o640);
         assert_eq!(after.uid(), before.uid());
         assert_eq!(after.gid(), before.gid());
+    }
+
+    #[test]
+    fn transaction_restores_replaced_and_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.toml");
+        let created = dir.path().join("created.toml");
+        atomic_write(&existing, b"before", 0o600).unwrap();
+
+        let transaction =
+            FileTransaction::capture([existing.as_path(), created.as_path()]).unwrap();
+        atomic_write(&existing, b"after", 0o600).unwrap();
+        atomic_write(&created, b"new", 0o600).unwrap();
+
+        let error = transaction
+            .rollback::<()>(anyhow::anyhow!("injected failure"), "test transaction")
+            .unwrap_err();
+        assert!(error.to_string().contains("rolled back"));
+        assert_eq!(std::fs::read(existing).unwrap(), b"before");
+        assert!(!created.exists());
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
-//! Shared TUN ingress and the single-peer V2 dataplane loops.
+//! Shared V2 TUN ingress, receive, and route-management primitives.
 //!
-//! The mesh runtime keeps its own adjacency loops in the parent module and
-//! consumes the explicit `pub(super)` ingress, timing, and output primitives
-//! defined here. No scheduling or FEC policy is reinterpreted at this boundary.
+//! The mesh runtime owns every adjacency loop and consumes the explicit
+//! `pub(super)` primitives defined here. No scheduling or FEC policy is
+//! reinterpreted at this boundary.
 
 use std::{
     cmp::Reverse,
@@ -12,13 +12,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use ipnet::IpNet;
-use iroh::{EndpointId, SecretKey, endpoint::Connection};
 use rustc_hash::{FxHashMap as HashMap, FxHasher};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use tracing::{debug, info, warn};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tracing::{info, warn};
 use tun_rs::{
     IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_HDR_GSO_TCPV6,
     VIRTIO_NET_HDR_GSO_UDP_L4, VIRTIO_NET_HDR_LEN, VirtioNetHdr, gso_split,
@@ -27,25 +26,17 @@ use tun_rs::{
 use super::{
     V2RuntimeState,
     host_network::KernelRoutePolicyV2,
-    telemetry::{RuntimeMetrics, TunIngressBatchV2, increment_sampled_counter},
+    telemetry::{RuntimeMetrics, increment_sampled_counter},
 };
 use crate::{
     buffer::PacketSlotPool,
-    packet::{FlowKey, PacketInfo, icmpv4_echo_probe, inspect_ip_packet, ip_hop_limit_validated},
+    packet::{FlowKey, PacketInfo, icmpv4_echo_probe, inspect_ip_packet},
     protocol::v2::{
-        cell::TrafficClass,
-        classifier::{ClassifierConfig, FlowClassifier},
-        cover::CoverPaddingV2,
-        dataplane::{
-            MAX_REPAIR_REQUESTS_PER_TICK, V2ControlRx, V2Rx, V2Tx, completed_record_to_tun,
-        },
-        feedback::FecFeedbackV2,
-        gso::{GsoObservationV2, encode_train_record_observed},
-        presence::{PresenceDirectoryV2, PresenceUpdateV2, SignedPresenceV2},
+        dataplane::{V2Rx, V2Tx, completed_record_to_tun},
+        gso::GsoObservationV2,
         reassembly::ReassemblyOutput,
-        repair::{RepairControlV2, RepairRequestV2, RepairResponseV2},
-        routing::{AdjacencyIdV2, DataplaneSnapshotV2, RouteAdvertisementV2, TransitDispositionV2},
-        scheduler::SchedulerLimits,
+        repair::RepairRequestV2,
+        routing::RouteAdvertisementV2,
         tuning::{AutoTuneBoundsV2, CoverTrafficProfileV2, RepairWaitPolicyV2, TuneDecisionV2},
     },
 };
@@ -107,30 +98,6 @@ impl<V> BoundedFlowTableV2<V> {
         }
         self.touch(*key, now);
         self.entries.get_mut(key).map(|entry| &mut entry.value)
-    }
-
-    pub(super) fn get_or_insert_with(
-        &mut self,
-        key: FlowKey,
-        now: Duration,
-        create: impl FnOnce() -> V,
-    ) -> &mut V {
-        if !self.entries.contains_key(&key) {
-            self.expire_idle(now);
-            while self.entries.len() >= self.capacity {
-                self.evict_oldest();
-            }
-            self.entries.insert(
-                key,
-                BoundedFlowEntryV2 {
-                    value: create(),
-                    generation: 0,
-                    touched_at: now,
-                },
-            );
-        }
-        self.touch(key, now);
-        &mut self.entries.get_mut(&key).expect("flow was inserted").value
     }
 
     pub(super) fn insert(&mut self, key: FlowKey, now: Duration, value: V) -> Option<V> {
@@ -264,8 +231,8 @@ impl PrioritySendArbiterV2 {
 }
 
 /// The first ready ingress future wins because the TX loops deliberately use
-/// `tokio::select! { biased; }`. Keep this order as a data-only helper so the
-/// single-peer and mesh loops retain the same ready-race contract.
+/// `tokio::select! { biased; }`. Keep this order as a data-only helper so all
+/// mesh adjacency loops retain the same ready-race contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IngressReadyOrderV2 {
     PriorityThenSend,
@@ -420,30 +387,9 @@ impl CoverShaperV2 {
 }
 
 #[derive(Debug)]
-struct FlowState {
-    classifier: FlowClassifier,
-}
-
-#[derive(Debug)]
 pub(super) enum TxControl {
     Send(Bytes),
     Respond(RepairRequestV2),
-}
-
-#[derive(Debug)]
-pub(super) struct ControlContextV2 {
-    pub(super) tx: mpsc::Sender<TxControl>,
-    pub(super) repaired: mpsc::Sender<RepairResponseV2>,
-    pub(super) routes: mpsc::Sender<RouteAdvertisementV2>,
-    pub(super) presences: mpsc::Sender<SignedPresenceV2>,
-    pub(super) allow_default_routes: bool,
-    pub(super) metrics: Arc<RuntimeMetrics>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct RxRouteContext {
-    pub(super) snapshot: Arc<DataplaneSnapshotV2>,
-    pub(super) incoming: AdjacencyIdV2,
 }
 
 /// Read hard latency traffic into a reserved ingress lane. The mesh runtime
@@ -733,244 +679,6 @@ fn record_tun_admission_drop(metrics: &RuntimeMetrics, bytes: usize) {
     }
 }
 
-pub(super) struct PrioritizedTunInput {
-    pub(super) regular: mpsc::Receiver<TunIngressRecordV2>,
-    pub(super) priority: mpsc::Receiver<TunIngressRecordV2>,
-}
-
-pub(super) async fn tx_loop(
-    connection: Connection,
-    negotiated: crate::protocol::v2::session::NegotiatedSessionV2,
-    mut input: PrioritizedTunInput,
-    mut tuning: watch::Receiver<Option<TuneDecisionV2>>,
-    mut control: mpsc::Receiver<TxControl>,
-    metrics: Arc<RuntimeMetrics>,
-    route_label: u32,
-) -> Result<()> {
-    enum Event {
-        Input(Option<TunIngressRecordV2>),
-        PriorityInput(Option<TunIngressRecordV2>),
-        Control(Option<TxControl>),
-        Tuned,
-        Sent(Result<Option<crate::protocol::v2::dataplane::SendProgress>>),
-    }
-
-    let mut tx = V2Tx::new(connection, negotiated, SchedulerLimits::default())?;
-    let started = Instant::now();
-    let mut classifiers = BoundedFlowTableV2::<FlowState>::new(MAX_CLASSIFIERS, CLASSIFIER_IDLE);
-    let mut receive_batch = 8_usize;
-    let mut applied_tuning = None::<TuneDecisionV2>;
-    let mut cover_shaper = CoverShaperV2::default();
-    let mut deferred_input = VecDeque::<TunIngressRecordV2>::new();
-    let mut priority_send = PrioritySendArbiterV2::default();
-    loop {
-        // Preserve a bounded receive burst as one aggregation opportunity.
-        // The scheduler still owns hard memory admission, while the local
-        // byte ceiling prevents a 64-entry GSO burst from overshooting its
-        // high-water mark. One-record admission made every PacketTrain too
-        // short for a real FEC stripe and defeated train packing entirely.
-        let depth = tx.depth();
-        let high_water = tx_admission_high_water(&tx);
-        if !admission_saturated(depth, high_water) && !deferred_input.is_empty() {
-            let available =
-                high_water.saturating_sub(depth.bulk_bytes.saturating_add(depth.latency_bytes));
-            let batch = drain_tun_ingress_batch(
-                &mut deferred_input,
-                receive_batch,
-                available.min(TX_ADMISSION_BATCH_BYTES),
-            );
-            enqueue_tun_batch(
-                &mut tx,
-                &mut classifiers,
-                started.elapsed(),
-                route_label,
-                batch,
-                false,
-                &metrics,
-            )?;
-        }
-        let depth = tx.depth();
-        let event = if tx.has_pending() && admission_saturated(depth, high_water) {
-            if ingress_ready_order(true, priority_send.next())
-                == IngressReadyOrderV2::PriorityThenSend
-            {
-                tokio::select! {
-                    biased;
-                    changed = tuning.changed() => {
-                        changed.context("V2 tuner stopped")?;
-                        Event::Tuned
-                    }
-                    record = input.priority.recv() => Event::PriorityInput(record),
-                    sent = tx.send_next() => Event::Sent(sent),
-                    command = control.recv() => Event::Control(command),
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    changed = tuning.changed() => {
-                        changed.context("V2 tuner stopped")?;
-                        Event::Tuned
-                    }
-                    sent = tx.send_next() => Event::Sent(sent),
-                    record = input.priority.recv() => Event::PriorityInput(record),
-                    command = control.recv() => Event::Control(command),
-                }
-            }
-        } else if tx.has_pending() || !deferred_input.is_empty() {
-            if ingress_ready_order(false, priority_send.next())
-                == IngressReadyOrderV2::PriorityThenSendThenRegular
-            {
-                tokio::select! {
-                    biased;
-                    changed = tuning.changed() => {
-                        changed.context("V2 tuner stopped")?;
-                        Event::Tuned
-                    }
-                    record = input.priority.recv() => Event::PriorityInput(record),
-                    sent = tx.send_next() => Event::Sent(sent),
-                    record = input.regular.recv() => Event::Input(record),
-                    command = control.recv() => Event::Control(command),
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    changed = tuning.changed() => {
-                        changed.context("V2 tuner stopped")?;
-                        Event::Tuned
-                    }
-                    sent = tx.send_next() => Event::Sent(sent),
-                    record = input.priority.recv() => Event::PriorityInput(record),
-                    record = input.regular.recv() => Event::Input(record),
-                    command = control.recv() => Event::Control(command),
-                }
-            }
-        } else {
-            tokio::select! {
-                biased;
-                record = input.priority.recv() => Event::PriorityInput(record),
-                changed = tuning.changed() => {
-                    changed.context("V2 tuner stopped")?;
-                    Event::Tuned
-                }
-                record = input.regular.recv() => Event::Input(record),
-                command = control.recv() => Event::Control(command),
-            }
-        };
-        match event {
-            Event::Tuned => {
-                if let Some(decision) = *tuning.borrow_and_update() {
-                    receive_batch = decision.receive_batch;
-                    if applied_tuning.is_none_or(|current| {
-                        effective_tx_tuning(current) != effective_tx_tuning(decision)
-                    }) {
-                        tx.apply_tuning(decision)?;
-                        cover_shaper.update(decision);
-                        info!(
-                            reason = ?decision.reason,
-                            train_bytes = decision.train_target_bytes,
-                            quantum_cells = decision.bulk_quantum_cells,
-                            fec = ?decision.fec,
-                            send_buffer_bytes = decision.send_buffer_bytes,
-                            datagram_admission_bytes = tx.datagram_send_buffer_limit(),
-                            receive_buffer_bytes = decision.receive_buffer_bytes,
-                            receive_batch,
-                            cover_profile = ?decision.cover_profile,
-                            cover_overhead_per_mille = decision.cover_overhead_per_mille,
-                            cover_padding_bytes_per_second = decision.cover_padding_bytes_per_second,
-                            "applied automatic V2 tuning decision"
-                        );
-                        applied_tuning = Some(decision);
-                    }
-                }
-            }
-            Event::Input(None) => bail!("all V2 TUN readers stopped"),
-            Event::PriorityInput(None) => bail!("all V2 priority TUN readers stopped"),
-            Event::PriorityInput(Some(first)) => {
-                priority_send.admitted_priority();
-                let mut batch = Vec::with_capacity(receive_batch);
-                batch.push(first);
-                while batch.len() < receive_batch {
-                    match input.priority.try_recv() {
-                        Ok(record) => batch.push(record),
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => break,
-                    }
-                }
-                enqueue_tun_batch(
-                    &mut tx,
-                    &mut classifiers,
-                    started.elapsed(),
-                    route_label,
-                    batch,
-                    true,
-                    &metrics,
-                )?;
-            }
-            Event::Control(None) => bail!("V2 control receiver stopped"),
-            Event::Control(Some(TxControl::Send(record))) => {
-                metrics.observe_control_tx(&record);
-                ensure!(tx.enqueue_control(record)?, "V2 control queue is full");
-            }
-            Event::Control(Some(TxControl::Respond(request))) => {
-                let response = tx.repair_response(&request).encode()?;
-                metrics.observe_control_tx(&response);
-                ensure!(tx.enqueue_control(response)?, "V2 control queue is full");
-            }
-            Event::Input(Some(first)) => {
-                let mut batch = Vec::with_capacity(receive_batch);
-                batch.push(first);
-                while batch.len() < receive_batch {
-                    match input.regular.try_recv() {
-                        Ok(record) => batch.push(record),
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => break,
-                    }
-                }
-                deferred_input.extend(batch);
-            }
-            Event::Sent(result) => {
-                priority_send.completed_send();
-                if let Some(progress) = result? {
-                    metrics.observe_send(progress);
-                    let sent_real = progress.class.is_some();
-                    if sent_real {
-                        metrics
-                            .real_tx_bytes
-                            .fetch_add(progress.bytes as u64, Ordering::Relaxed);
-                    }
-                    metrics
-                        .cover_tx_bytes
-                        .fetch_add(progress.cover_padding_bytes as u64, Ordering::Relaxed);
-                    metrics
-                        .pmtu_drop_bytes
-                        .fetch_add(progress.dropped_bytes as u64, Ordering::Relaxed);
-                    let previous_pmtu_drops = metrics
-                        .pmtu_drop_datagrams
-                        .fetch_add(progress.dropped_datagrams as u64, Ordering::Relaxed);
-                    if progress.dropped_datagrams != 0 && previous_pmtu_drops == 0 {
-                        warn!(
-                            datagrams = progress.dropped_datagrams,
-                            bytes = progress.dropped_bytes,
-                            "retiring stale V2 Cells after live PMTU shrink; further drops are counted without per-quantum logs"
-                        );
-                    }
-                    if sent_real && !tx.has_pending() && deferred_input.is_empty() {
-                        let _ = cover_shaper.enqueue_after_real(&mut tx)?;
-                    }
-                }
-            }
-        }
-        let depth = tx.depth();
-        metrics.train_queue_bytes.store(
-            (depth.bulk_bytes + depth.latency_bytes) as u64,
-            Ordering::Relaxed,
-        );
-        metrics
-            .latency_queue_bytes
-            .store(depth.latency_bytes as u64, Ordering::Relaxed);
-    }
-}
-
 pub(super) fn tx_admission_high_water(tx: &V2Tx) -> usize {
     tx.datagram_send_buffer_limit().clamp(
         TX_ADMISSION_BATCH_BYTES,
@@ -1065,297 +773,6 @@ pub(super) fn effective_tx_tuning(decision: TuneDecisionV2) -> EffectiveTuneV2 {
     }
 }
 
-fn enqueue_tun_batch(
-    tx: &mut V2Tx,
-    classifiers: &mut BoundedFlowTableV2<FlowState>,
-    now: Duration,
-    route_label: u32,
-    records: Vec<TunIngressRecordV2>,
-    hard_latency: bool,
-    metrics: &RuntimeMetrics,
-) -> Result<()> {
-    // A Cell has one fixed routing shim. Grouping by ingress IP hop limit
-    // makes its overlay budget the exact TTL/Hop-Limit of every contained
-    // record instead of weakening it to a train-wide default.
-    let mut grouped = HashMap::<(u64, TrafficClass, u8), Vec<(Bytes, Bytes)>>::default();
-    let mut ingress = TunIngressBatchV2::default();
-    for record in records {
-        let TunIngressRecordV2 {
-            bytes: raw,
-            info,
-            gso: reader_gso,
-            _permit: _,
-        } = record;
-        let packet = &raw[VIRTIO_NET_HDR_LEN..];
-        let packet_len = packet.len();
-        let key = FlowKey::from(info);
-        let flow_id = flow_id(key);
-        let overlay_hop_limit = ip_hop_limit_validated(packet);
-        if overlay_hop_limit == 0 {
-            warn!("dropped V2 IP input with exhausted hop limit");
-            continue;
-        }
-        let state = classifiers.get_or_insert_with(key, now, || FlowState {
-            classifier: FlowClassifier::new(ClassifierConfig::default(), now),
-        });
-        let class = state
-            .classifier
-            .observe(now, packet_len, 0, info.latency_protected);
-        let (metadata, data, mut gso) = match encode_train_record_observed(raw) {
-            Ok(record) => record,
-            Err(error) => {
-                warn!(%error, "dropped invalid V2 GSO metadata");
-                continue;
-            }
-        };
-        gso.input_bytes = gso.input_bytes.saturating_add(reader_gso.input_bytes);
-        gso.preserved_bytes = gso
-            .preserved_bytes
-            .saturating_add(reader_gso.preserved_bytes);
-        gso.fallback_splits = gso
-            .fallback_splits
-            .saturating_add(reader_gso.fallback_splits);
-        ingress.observe(packet_len, gso);
-        grouped
-            .entry((flow_id, class, overlay_hop_limit))
-            .or_default()
-            .push((metadata, data));
-    }
-    for ((flow_id, class, overlay_hop_limit), records) in grouped {
-        // Count the classified application boundary before handing records to
-        // the scheduler.  The autotuner uses this as a one-shot startup
-        // signal when a stale BBR model has not yet been able to service a
-        // Bulk packet; `bulk_service_bytes` remains the authoritative
-        // post-send accounting counter.
-        let classified_payload_bytes = records
-            .iter()
-            .map(|(_, data)| data.len() as u64)
-            .sum::<u64>();
-        let records = records
-            .into_iter()
-            .enumerate()
-            .map(|(index, (metadata, data))| {
-                Ok(crate::protocol::v2::train::TrainRecord {
-                    record_id: u16::try_from(index + 1)
-                        .context("V2 TUN batch has too many records")?,
-                    metadata,
-                    data,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if hard_latency {
-            tracing::trace!(
-                target: "ironet::latency_probe",
-                stage = "scheduler-admit",
-                flow_id,
-                records = records.len(),
-                "V2 strict latency batch"
-            );
-        }
-        let admitted = tx.enqueue_records_auto_with_hop_limit_and_priority(
-            flow_id,
-            class,
-            route_label,
-            overlay_hop_limit,
-            records,
-            hard_latency,
-        )?;
-        ensure!(
-            !admitted.is_empty(),
-            "V2 scheduler rejected a TUN PacketTrain"
-        );
-        if class == TrafficClass::Bulk {
-            metrics.observe_bulk_admission(classified_payload_bytes);
-        }
-    }
-    metrics.observe_tun_ingress_batch(ingress);
-    Ok(())
-}
-
-pub(super) async fn rx_loop(
-    connection: Connection,
-    negotiated: crate::protocol::v2::session::NegotiatedSessionV2,
-    mut writer: crate::tunnel::OverlayTunnelWriter,
-    metrics: Arc<RuntimeMetrics>,
-    control: mpsc::Sender<TxControl>,
-    mut repaired: mpsc::Receiver<RepairResponseV2>,
-    route: RxRouteContext,
-) -> Result<()> {
-    let mut rx = V2Rx::new(connection, negotiated, minimum_receive_buffer_bytes())?;
-    // This only drains DATAGRAMs already buffered by QUIC, so using the
-    // negotiated maximum never waits or adds latency. RX FEC state follows
-    // the peer's wire data and must not subscribe to the local TX tuner.
-    let receive_batch = AutoTuneBoundsV2::default().maximum_receive_batch;
-    let mut repair_tick = tokio::time::interval(Duration::from_millis(10));
-    repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut feedback_tick = tokio::time::interval(Duration::from_secs(1));
-    feedback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut feedback_sequence = 0_u64;
-    loop {
-        enum Event {
-            Cells(Result<Vec<Bytes>>),
-            Repair(Option<RepairResponseV2>),
-            Tick,
-            Feedback,
-        }
-        let event = tokio::select! {
-            datagrams = rx.receive_datagram_batch(receive_batch) => Event::Cells(datagrams),
-            response = repaired.recv() => Event::Repair(response),
-            _ = repair_tick.tick() => Event::Tick,
-            _ = feedback_tick.tick() => Event::Feedback,
-        };
-        let output = match event {
-            Event::Cells(datagrams) => {
-                let evicted = apply_receive_buffer_target(&mut rx, &metrics)?;
-                if evicted != 0 {
-                    warn!(
-                        evicted,
-                        receive_buffer_bytes = rx.maximum_buffered_bytes(),
-                        "evicted stale V2 RX state while shrinking automatic budget"
-                    );
-                }
-                let mut combined = ReassemblyOutput::default();
-                for bytes in datagrams? {
-                    if CoverPaddingV2::is_record(&bytes) {
-                        let length = bytes.len();
-                        if let Err(error) = rx.accept_datagram(bytes) {
-                            let (errors, report) = metrics.record_protocol_datagram_error();
-                            if report {
-                                warn!(
-                                    errors,
-                                    stage = "cover",
-                                    %error,
-                                    "dropped malformed V2 DATAGRAM; further errors are exponentially sampled"
-                                );
-                            }
-                            continue;
-                        }
-                        metrics
-                            .cover_rx_bytes
-                            .fetch_add(length as u64, Ordering::Relaxed);
-                        continue;
-                    }
-                    let disposition = match route.snapshot.dispatch_cell(route.incoming, bytes) {
-                        Ok(disposition) => disposition,
-                        Err(error) => {
-                            let (errors, report) = metrics.record_protocol_datagram_error();
-                            if report {
-                                warn!(
-                                    errors,
-                                    stage = "cell-route",
-                                    %error,
-                                    "dropped malformed V2 DATAGRAM; further errors are exponentially sampled"
-                                );
-                            }
-                            continue;
-                        }
-                    };
-                    match disposition {
-                        TransitDispositionV2::Local { header, cell } => {
-                            let output = match rx.accept_routed_datagram(cell, header) {
-                                Ok(output) => output,
-                                Err(error) => {
-                                    let (errors, report) = metrics.record_protocol_datagram_error();
-                                    if report {
-                                        warn!(
-                                            errors,
-                                            stage = "cell-payload",
-                                            %error,
-                                            "dropped malformed V2 DATAGRAM; further errors are exponentially sampled"
-                                        );
-                                    }
-                                    continue;
-                                }
-                            };
-                            metrics.observe_receive(&output);
-                            combined.merge(output);
-                        }
-                        TransitDispositionV2::Drop(reason) => {
-                            let (drops, report) = metrics.record_route_gate_drop();
-                            if report {
-                                warn!(
-                                    ?reason,
-                                    drops,
-                                    "dropped V2 Cell at route-label gate; further drops are exponentially sampled"
-                                );
-                            }
-                        }
-                        TransitDispositionV2::Forward { .. } => {
-                            bail!("single-peer V2 runtime received a transit Cell")
-                        }
-                        TransitDispositionV2::TtlExpired(_) => {
-                            bail!("single-peer V2 runtime produced transit TTL OAM")
-                        }
-                    }
-                }
-                Some(combined)
-            }
-            Event::Repair(Some(response)) => {
-                let evicted = apply_receive_buffer_target(&mut rx, &metrics)?;
-                if evicted != 0 {
-                    warn!(
-                        evicted,
-                        receive_buffer_bytes = rx.maximum_buffered_bytes(),
-                        "evicted stale V2 RX state while shrinking automatic budget"
-                    );
-                }
-                let request_id = response.request_id;
-                let route_epoch = response.key.session_epoch;
-                match rx.accept_repair_response_at(response, Instant::now())? {
-                    Some((output, observation)) => {
-                        metrics.observe_repair_response(observation);
-                        metrics.observe_receive(&output);
-                        Some(output)
-                    }
-                    None => {
-                        let (stale, report) =
-                            increment_sampled_counter(&metrics.repair_stale_responses);
-                        if report {
-                            warn!(
-                                request_id,
-                                route_epoch,
-                                stale,
-                                "ignored unmatched or expired V2 Repair response; further events are exponentially sampled"
-                            );
-                        }
-                        None
-                    }
-                }
-            }
-            Event::Repair(None) => bail!("V2 Repair control receiver stopped"),
-            Event::Tick => {
-                let repair_batch = rx.repair_requests_bounded(
-                    Instant::now(),
-                    adaptive_repair_minimum_age(&metrics),
-                    MAX_REPAIR_REQUESTS_PER_TICK,
-                );
-                metrics.observe_repair_suppression(&repair_batch);
-                for request in repair_batch.requests {
-                    metrics.observe_repair_request(&request);
-                    control
-                        .send(TxControl::Send(request.encode()?))
-                        .await
-                        .context("V2 TX control task stopped")?;
-                }
-                None
-            }
-            Event::Feedback => {
-                feedback_sequence = feedback_sequence.wrapping_add(1).max(1);
-                control
-                    .send(TxControl::Send(
-                        metrics.fec_feedback(feedback_sequence).encode()?,
-                    ))
-                    .await
-                    .context("V2 TX control task stopped before FEC feedback")?;
-                None
-            }
-        };
-        if let Some(output) = output {
-            write_reassembled(&mut writer, &metrics, output).await?;
-        }
-    }
-}
-
 pub(super) async fn write_reassembled(
     writer: &mut crate::tunnel::OverlayTunnelWriter,
     metrics: &RuntimeMetrics,
@@ -1412,171 +829,6 @@ pub(super) async fn write_reassembled(
         .fetch_add(count as u64, Ordering::Relaxed);
     metrics.tun_rx_bytes.fetch_add(bytes, Ordering::Relaxed);
     Ok(())
-}
-
-pub(super) async fn control_loop(
-    connection: Connection,
-    negotiated: crate::protocol::v2::session::NegotiatedSessionV2,
-    context: ControlContextV2,
-) -> Result<()> {
-    let mut receiver = V2ControlRx::new(connection, negotiated);
-    loop {
-        let record = receiver.receive().await?;
-        context.metrics.observe_control_rx(&record);
-        if SignedPresenceV2::is_record(&record) {
-            context
-                .presences
-                .send(SignedPresenceV2::decode(record)?)
-                .await
-                .context("V2 Presence manager stopped")?;
-            continue;
-        }
-        if RouteAdvertisementV2::is_record(&record) {
-            context
-                .routes
-                .send(RouteAdvertisementV2::decode(
-                    record,
-                    context.allow_default_routes,
-                )?)
-                .await
-                .context("V2 route manager stopped")?;
-            continue;
-        }
-        if FecFeedbackV2::is_record(&record) {
-            context
-                .metrics
-                .apply_remote_feedback(FecFeedbackV2::decode(record)?);
-            continue;
-        }
-        match RepairControlV2::decode(record)? {
-            RepairControlV2::Request(request) => context
-                .tx
-                .send(TxControl::Respond(request))
-                .await
-                .context("V2 TX control task stopped")?,
-            RepairControlV2::Response(response) => context
-                .repaired
-                .send(response)
-                .await
-                .context("V2 RX task stopped")?,
-        }
-    }
-}
-
-pub(super) struct PresenceContextV2 {
-    pub(super) network_id: String,
-    pub(super) local_id: EndpointId,
-    pub(super) secret_key: SecretKey,
-    pub(super) routes: mpsc::Sender<RouteAdvertisementV2>,
-    pub(super) control: mpsc::Sender<TxControl>,
-    pub(super) allow_default_routes: bool,
-    pub(super) runtime_state: Arc<V2RuntimeState>,
-}
-
-pub(super) async fn presence_loop(
-    mut local_presence: SignedPresenceV2,
-    mut updates: mpsc::Receiver<SignedPresenceV2>,
-    context: PresenceContextV2,
-) -> Result<()> {
-    let PresenceContextV2 {
-        network_id,
-        local_id,
-        secret_key,
-        routes,
-        control,
-        allow_default_routes,
-        runtime_state,
-    } = context;
-    let mut directory = PresenceDirectoryV2::new(network_id.clone())?;
-    directory.insert(local_presence.clone(), SystemTime::now())?;
-    runtime_state.publish_presence_directory(&directory, 2);
-    let mut generation = 1_u64;
-    let mut refresh = tokio::time::interval(Duration::from_secs(60));
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    refresh.tick().await;
-    loop {
-        let update = tokio::select! {
-            update = updates.recv() => {
-                update.context("V2 Presence update channel stopped")?
-            }
-            _ = refresh.tick() => {
-                let now = unix_secs(SystemTime::now())?;
-                local_presence.body.sequence = local_presence
-                    .body
-                    .sequence
-                    .checked_add(1)
-                    .context("V2 local Presence sequence overflow")?;
-                local_presence.body.issued_unix_secs = now;
-                local_presence.body.expires_unix_secs = now.saturating_add(180);
-                local_presence = SignedPresenceV2::sign(
-                    local_presence.body.clone(),
-                    &secret_key,
-                    &network_id,
-                )?;
-                control
-                    .send(TxControl::Send(local_presence.encode()?))
-                    .await
-                    .context("V2 TX task stopped before Presence renewal")?;
-                local_presence.clone()
-            }
-        };
-        let owner = update.body.owner;
-        let result = directory.insert(update, SystemTime::now())?;
-        if matches!(
-            result,
-            PresenceUpdateV2::Duplicate | PresenceUpdateV2::Stale
-        ) {
-            continue;
-        }
-        if result == PresenceUpdateV2::Renewed {
-            runtime_state.publish_presence_directory(&directory, 2);
-            debug!(%owner, "accepted V2 Presence lease renewal without route epoch churn");
-            continue;
-        }
-        generation = generation.wrapping_add(1).max(2);
-        let route_epoch = u32::try_from(generation).unwrap_or_else(|_| (generation as u32).max(1));
-        let topology = directory.compile_topology(
-            generation,
-            route_epoch,
-            allow_default_routes,
-            SystemTime::now(),
-        )?;
-        let local = topology
-            .snapshot(crate::protocol::v2::routing::NodeIdV2(*local_id.as_bytes()))
-            .context("compiled V2 Presence topology omitted the local node")?;
-        let mut learned_prefixes = directory
-            .records()
-            .filter(|presence| presence.body.owner != local_id)
-            .flat_map(|presence| {
-                presence
-                    .body
-                    .node_addresses
-                    .iter()
-                    .chain(&presence.body.prefixes)
-                    .copied()
-            })
-            .collect::<Vec<_>>();
-        learned_prefixes
-            .sort_by_key(|prefix| (prefix.addr().is_ipv6(), prefix.addr(), prefix.prefix_len()));
-        learned_prefixes.dedup();
-        routes
-            .send(RouteAdvertisementV2 {
-                generation,
-                prefixes: learned_prefixes,
-            })
-            .await
-            .context("V2 route manager stopped")?;
-        runtime_state.publish_presence_directory(&directory, 2);
-        info!(
-            %owner,
-            ?result,
-            generation,
-            nodes = directory.len(),
-            routes = local.route_count(),
-            labels = local.label_count(),
-            "compiled authenticated V2 Presence topology"
-        );
-    }
 }
 
 pub(super) async fn route_loop(
@@ -1649,6 +901,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::*;
+    use crate::v2_runtime::telemetry::TunIngressBatchV2;
 
     fn test_packet_info() -> PacketInfo {
         PacketInfo {

@@ -879,7 +879,7 @@ impl Config {
         );
         let mut cover_names = HashSet::new();
         for name in &self.cover.sni_pool {
-            crate::v2_runtime::validate_cover_sni(name)?;
+            validate_cover_sni(name)?;
             ensure!(cover_names.insert(name), "duplicate cover SNI {name}");
         }
         self.validate_bind_addresses()?;
@@ -1295,6 +1295,34 @@ pub fn validate_interface_name(name: &str) -> Result<()> {
         name.bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
         "invalid Linux interface name: {name}"
+    );
+    Ok(())
+}
+
+/// Validates the network-level cover-name contract shared by persisted product
+/// configuration and the V2 runtime. Keeping this at the configuration
+/// boundary prevents configuration validation from depending on runtime
+/// internals and gives every entry point identical DNS-name semantics.
+pub(crate) fn validate_cover_sni(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.len() <= 253 && name.is_ascii(),
+        "V2 cover SNI is invalid"
+    );
+    ensure!(
+        !name.starts_with('.') && !name.ends_with('.'),
+        "V2 cover SNI is not canonical"
+    );
+    ensure!(
+        name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }),
+        "V2 cover SNI contains an invalid DNS label"
     );
     Ok(())
 }

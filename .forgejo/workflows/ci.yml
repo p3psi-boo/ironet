@@ -55,6 +55,11 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Verify vendored noq-proto patch
+        run: |
+          cargo test --manifest-path crates/noq-proto-v2/Cargo.toml --locked
+          cargo check --manifest-path crates/noq-proto-v2/Cargo.toml --features qlog --locked
+
       - name: Run Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 

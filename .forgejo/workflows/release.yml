@@ -31,9 +31,41 @@ jobs:
             --component clippy,rustfmt \
             --target x86_64-unknown-linux-musl
 
+      - name: Resolve release package version
+        run: |
+          tag="${FORGEJO_REF_NAME#v}"
+          if [[ "$FORGEJO_REF_NAME" != "v$tag" || ! "$tag" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{4}$ ]]; then
+            echo "release tag must be vYYYY.MM.ddNN" >&2
+            exit 1
+          fi
+
+          day="${tag:0:10}"
+          sequence="${tag:10:2}"
+          day_iso="${day//./-}"
+          commit_day=$(git show -s --format=%cs HEAD)
+          if [[ "$commit_day" != "$day_iso" ]]; then
+            echo "tag day $day does not match commit day $commit_day" >&2
+            exit 1
+          fi
+
+          next_day=$(date -u -d "$day_iso +1 day" +%F)
+          commits=$(git rev-list --count \
+            --since="$day_iso 00:00:00 UTC" \
+            --before="$next_day 00:00:00 UTC" \
+            HEAD)
+          if (( commits > 99 )); then
+            echo "UTC commit count exceeds the two-digit tag sequence" >&2
+            exit 1
+          fi
+          expected=$(printf '%02d' "$commits")
+          if [[ "$sequence" != "$expected" ]]; then
+            echo "tag sequence $sequence does not match UTC commit count $expected" >&2
+            exit 1
+          fi
+          printf '%s\n' "$tag" >.release-version
+
       - name: Verify, test, and lint
         run: |
-          test "$FORGEJO_REF_NAME" = "v$(sed -n '/^\[package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
           cargo fmt --check
           python3 scripts/check-doc-links.py
           cargo test --locked
@@ -41,7 +73,7 @@ jobs:
 
       - name: Build static musl Debian package
         run: |
-          scripts/build-deb.sh
+          VERSION="$(<.release-version)" scripts/build-deb.sh
           sha256sum dist/*.deb >dist/SHA256SUMS
 
       - name: Verify package and binary

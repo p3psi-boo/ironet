@@ -54,6 +54,7 @@ pub(super) fn base_config(
         dns: DnsConfig::default(),
         autotune: Default::default(),
         path_migration: Default::default(),
+        password_enrollment: None,
     }
 }
 

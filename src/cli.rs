@@ -77,15 +77,22 @@ pub(crate) enum Command {
     /// assigns an overlay address, and starts the service unless `--no-start` is set.
     /// With no invite argument on an interactive terminal, the command prompts for it.
     #[command(
-        after_help = "Examples:\n  ironet join 'ironet://join/v2/...'\n  ironet join --invite-file invite.txt\n  cat invite.txt | ironet join --invite-file - --output json"
+        after_help = "Examples:\n  ironet join 'ironet://join/v2/...'\n  ironet join --invite-file invite.txt\n  ironet join --peer 203.0.113.10:4000 --password-file /run/secrets/ironet-password\n  cat invite.txt | ironet join --invite-file - --output json"
     )]
     Join {
         /// Invite URL; omit it to use `--invite-file` or the interactive prompt.
-        #[arg(value_name = "INVITE")]
+        #[arg(value_name = "INVITE", conflicts_with = "peer")]
         invite: Option<String>,
         /// Read the invite URL from a file; use `-` to read standard input.
-        #[arg(long, conflicts_with = "invite", value_name = "PATH")]
+        #[arg(long, conflicts_with_all = ["invite", "peer"], value_name = "PATH")]
         invite_file: Option<PathBuf>,
+        /// Authority address for direct password enrollment. Uses the same
+        /// numeric port as the UDP data plane over TCP.
+        #[arg(long, value_name = "IP:PORT", requires = "password_file")]
+        peer: Option<SocketAddr>,
+        /// Read the direct-enrollment password from this secret file.
+        #[arg(long, value_name = "PATH", requires = "peer")]
+        password_file: Option<PathBuf>,
         /// Set this node's name; the default is the machine hostname.
         #[arg(long, value_name = "NAME")]
         node_name: Option<String>,
@@ -417,7 +424,7 @@ pub(crate) enum NetworkCommand {
     /// configuration digest. The IPv4/IPv6 address pools and node name use defaults when omitted.
     /// Starts the system service unless `--no-start` is set.
     #[command(
-        after_help = "Examples:\n  ironet network create office\n  ironet network create office --node-name gateway-a --listen 203.0.113.10:4000\n  ironet network create lab --address-pool 10.42.0.0/16 --ipv6-address-pool fd42:6972:6f68::/64 --no-start --output json"
+        after_help = "Examples:\n  ironet network create office\n  ironet network create office --node-name gateway-a --listen 203.0.113.10:4000\n  ironet network create nix-lab --password-file /run/secrets/ironet-password\n  ironet network create lab --address-pool 10.42.0.0/16 --ipv6-address-pool fd42:6972:6f68::/64 --no-start --output json"
     )]
     Create {
         /// Name used to identify the network in local status and invites.
@@ -447,6 +454,10 @@ pub(crate) enum NetworkCommand {
         /// Reuse an identity retained by `network leave --keep-identity`.
         #[arg(long)]
         reuse_identity: bool,
+        /// Read a password from a root-readable secret file and enable direct
+        /// password enrollment on this node's TCP/UDP listen port.
+        #[arg(long, value_name = "PATH")]
+        password_file: Option<PathBuf>,
         /// Write the configuration and state without starting the service.
         #[arg(long)]
         no_start: bool,

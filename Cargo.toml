@@ -48,7 +48,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0"
 socket2 = "0.6.1"
 smallvec = "1.15.1"
-tokio = { version = "1.53.1", features = ["fs", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-util = "0.7.19"
 toml = "1.1.4"

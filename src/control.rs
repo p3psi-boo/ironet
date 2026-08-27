@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncWrite, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch},
     time,
@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::{
     config::Config,
     extensions::{self, ExtensionState},
+    json_line,
     status::{PeerStatus, RuntimeStatus},
     trace::{self, PingResult, PingSample, TraceHop, TraceResult},
 };
@@ -335,7 +336,7 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
     let line = time::timeout(
         REQUEST_READ_TIMEOUT,
-        read_bounded_line(&mut reader, MAX_REQUEST_BYTES),
+        json_line::read_bounded_line(&mut reader, MAX_REQUEST_BYTES),
     )
     .await
     .context("timed out reading control request")??;
@@ -945,51 +946,7 @@ async fn send_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &ServerMessage,
 ) -> Result<()> {
-    let mut encoded = serde_json::to_vec(message).context("failed encoding control response")?;
-    ensure!(
-        encoded.len() <= MAX_RESPONSE_BYTES,
-        "control response exceeds {MAX_RESPONSE_BYTES} bytes"
-    );
-    encoded.push(b'\n');
-    writer
-        .write_all(&encoded)
-        .await
-        .context("failed writing control response")
-}
-
-async fn read_bounded_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    maximum: usize,
-) -> Result<Vec<u8>> {
-    let mut line = Vec::new();
-    loop {
-        let (take, finished) = {
-            let available = reader
-                .fill_buf()
-                .await
-                .context("failed reading control message")?;
-            if available.is_empty() {
-                return Ok(line);
-            }
-            let take = available
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(available.len(), |index| index + 1);
-            ensure!(
-                line.len() + take <= maximum,
-                "control message exceeds {maximum} bytes"
-            );
-            line.extend_from_slice(&available[..take]);
-            (take, available[take - 1] == b'\n')
-        };
-        reader.consume(take);
-        if finished {
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            return Ok(line);
-        }
-    }
+    json_line::write(writer, message, MAX_RESPONSE_BYTES).await
 }
 
 fn request_parameters(method: &Method) -> Result<serde_json::Value> {
@@ -1182,7 +1139,9 @@ mod tests {
     async fn bounded_line_rejects_oversized_messages() {
         let data = vec![b'x'; 9];
         let mut reader = BufReader::new(data.as_slice());
-        let error = read_bounded_line(&mut reader, 8).await.unwrap_err();
+        let error = json_line::read_bounded_line(&mut reader, 8)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("exceeds 8 bytes"));
     }
 
@@ -1332,7 +1291,7 @@ mod tests {
             stream.write_all(request).await.unwrap();
             stream.shutdown().await.unwrap();
             let mut reader = BufReader::new(stream);
-            let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
+            let line = json_line::read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
                 .await
                 .unwrap();
             match serde_json::from_slice::<ServerMessage>(&line).unwrap() {
@@ -1368,7 +1327,7 @@ mod tests {
             .unwrap();
         stream.shutdown().await.unwrap();
         let mut reader = BufReader::new(stream);
-        let line = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
+        let line = json_line::read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
             .await
             .unwrap();
         match serde_json::from_slice::<ServerMessage>(&line).unwrap() {

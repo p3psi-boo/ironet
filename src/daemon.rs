@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::{
     config::Config,
     control::{self, DaemonCommand, ReloadAck, RpcError},
-    identity,
+    identity, password_enrollment,
     v2_runtime::{self, V2RuntimeConfig, V2RuntimeState},
 };
 
@@ -57,8 +57,9 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
     let (active_config_tx, active_config_rx) = watch::channel(initial.config.clone());
     let (runtime_state_tx, runtime_state_rx) = watch::channel::<Option<Arc<V2RuntimeState>>>(None);
     let events = Arc::new(control::EventLog::default());
+    let enrollment_config_rx = active_config_rx.clone();
     let mut supervisor = tokio::spawn(supervise(
-        config_path,
+        config_path.clone(),
         initial,
         active_config_tx,
         command_rx,
@@ -73,13 +74,20 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
         runtime_state_rx,
         events,
     ));
+    let mut enrollment_server = tokio::spawn(password_enrollment::serve(
+        config_path.clone(),
+        enrollment_config_rx,
+        command_tx.clone(),
+    ));
 
     let mut result = tokio::select! {
         result = &mut supervisor => {
             control_server.abort();
+            enrollment_server.abort();
             flatten_task("daemon supervisor", result)
         }
         result = &mut control_server => {
+            enrollment_server.abort();
             let control_error = match result {
                 Ok(Ok(())) => anyhow!("control server stopped unexpectedly"),
                 Ok(Err(error)) => error,
@@ -92,6 +100,21 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
                 Ok(Ok(())) => Err(control_error),
                 Ok(Err(error)) => Err(error.context(control_error.to_string())),
                 Err(error) => Err(anyhow!("daemon supervisor task failed: {error}; {control_error}")),
+            }
+        }
+        result = &mut enrollment_server => {
+            control_server.abort();
+            let enrollment_error = flatten_task("password enrollment listener", result);
+            let (reply, stopped) = oneshot::channel();
+            let _ = command_tx.send(DaemonCommand::Stop { reply }).await;
+            let _ = stopped.await;
+            match supervisor.await {
+                Ok(Ok(())) => enrollment_error,
+                Ok(Err(error)) => match enrollment_error {
+                    Ok(()) => Err(error),
+                    Err(enrollment_error) => Err(error.context(enrollment_error.to_string())),
+                },
+                Err(error) => Err(anyhow!("daemon supervisor task failed: {error}")),
             }
         }
     };

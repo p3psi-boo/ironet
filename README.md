@@ -66,6 +66,17 @@ sudo ironet invite create --expires 1h
 sudo ironet join 'ironet://join/v2/...'
 ```
 
+声明式部署可改用密码直连：authority 创建网络时配置 `--password-file`，
+加入端只声明 authority 的 `IP:PORT` 和同一份密码文件：
+
+```bash
+sudo ironet network create production --password-file /run/secrets/ironet-password
+sudo ironet join --peer 203.0.113.10:4000 --password-file /run/secrets/ironet-password
+```
+
+密码直连在同一数值端口使用 TCP 完成加密的临时邀请签发，数据面继续使用 UDP；
+详细流程见[快速开始](docs/快速开始.md#密码直连加入适合-nixos-等声明式部署)。
+
 需要向网络发布本地 LAN 时再启用该能力：
 
 ```bash

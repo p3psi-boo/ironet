@@ -26,15 +26,18 @@ use crate::{
 
 mod addressing;
 mod bootstrap;
+mod invites;
 mod storage;
 
 use addressing::*;
 pub use bootstrap::parse_duration;
 use bootstrap::*;
-pub use storage::{authority_key_path, default_node_name, load_state, save_state, state_path};
-use storage::{
-    load_sealed_sync, save_invite_transaction, update_config, update_config_and_state, write_bundle,
+pub use invites::{
+    confirm_password_enrollment, create_invite, create_password_enrollment_invite,
+    expire_pending_password_enrollments, list_invites, revoke_invite, revoke_password_enrollment,
 };
+pub use storage::{authority_key_path, default_node_name, load_state, save_state, state_path};
+use storage::{load_sealed_sync, update_config, update_config_and_state, write_bundle};
 
 pub const PRODUCT_STATE_VERSION: u8 = 2;
 pub const INVITE_VERSION: u8 = 2;
@@ -97,6 +100,16 @@ pub struct InviteRecord {
     #[serde(default)]
     pub token_hash: String,
     pub member_endpoint_id: EndpointId,
+    /// A direct password enrollment is provisionally admitted until the
+    /// joining machine has persisted its local configuration. Expired
+    /// provisional memberships are revoked by the authority daemon.
+    #[serde(default)]
+    pub pending_password_enrollment: bool,
+    /// Whether this pending enrollment introduced the peer entry itself. This
+    /// lets expiry remove only its own provisional peer without touching a
+    /// pre-existing manually configured member with the same endpoint ID.
+    #[serde(default)]
+    pub provisioned_peer: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +206,9 @@ pub struct CreateNetworkOptions {
     pub dns_domain: Option<String>,
     pub no_dns: bool,
     pub reuse_identity: bool,
+    /// Enables password-gated, direct `IP:PORT` enrollment. The clear-text
+    /// password is consumed during setup and is never persisted.
+    pub password: Option<Vec<u8>>,
 }
 
 pub async fn create_network(
@@ -210,6 +226,7 @@ pub async fn create_network(
         dns_domain,
         no_dns,
         reuse_identity,
+        password,
     } = options;
     ensure!(
         !(no_dns && dns_domain.is_some()),
@@ -250,6 +267,15 @@ pub async fn create_network(
             );
         }
         let existing_config = Config::load(config_path).await?;
+        if let Some(password) = password.as_deref() {
+            let enrollment = existing_config.password_enrollment.as_ref().context(
+                "network was not created with password enrollment; create a new network or use an invite",
+            )?;
+            ensure!(
+                crate::password_enrollment::password_matches(password, enrollment)?,
+                "password does not match the configured password enrollment listener"
+            );
+        }
         if no_dns {
             ensure!(
                 !existing_config.dns.enabled,
@@ -336,6 +362,9 @@ pub async fn create_network(
         Vec::new(),
     );
     config.dns = dns;
+    if let Some(password) = password.as_deref() {
+        config.password_enrollment = Some(crate::password_enrollment::create_config(password)?);
+    }
     config.validate()?;
     config.validate_local_id(node_key.public())?;
     let state = ProductState {
@@ -377,124 +406,6 @@ pub async fn create_network(
         state: product_file.display().to_string(),
         created: true,
     })
-}
-
-pub fn create_invite(
-    config_path: &Path,
-    state_dir: &Path,
-    expires_in_secs: Option<u64>,
-    direct_addresses: Vec<SocketAddr>,
-    member_endpoint_id: Option<EndpointId>,
-) -> Result<InviteSummary> {
-    let mut config = load_sealed_sync(config_path)?;
-    config.validate()?;
-    let mut state = load_state(state_dir)?;
-    let authority_file = state
-        .authority_key_file
-        .as_deref()
-        .context("this node cannot issue invites; no network authority key is installed")?;
-    let authority = identity::load(authority_file)?;
-    ensure!(
-        authority.public() == state.authority,
-        "network authority key does not match state"
-    );
-    let node_key = identity::load(&config.identity_file)?;
-    config.validate_local_id(node_key.public())?;
-    let now = now_unix()?;
-    let lifetime = expires_in_secs.unwrap_or(DEFAULT_INVITE_LIFETIME_SECS);
-    ensure!(lifetime > 0, "invite lifetime must be greater than zero");
-    let expires = now
-        .checked_add(lifetime)
-        .context("invite expiry overflow")?;
-    let id = hex::encode(&SecretKey::generate().to_bytes()[..12]);
-    let generated_member = member_endpoint_id.is_none().then(SecretKey::generate);
-    let member_endpoint_id = member_endpoint_id
-        .or_else(|| generated_member.as_ref().map(SecretKey::public))
-        .expect("member identity is generated or supplied");
-    if !config
-        .peers
-        .iter()
-        .any(|peer| peer.endpoint_id == member_endpoint_id)
-    {
-        config.peers.push(PeerConfig {
-            name: format!("invite-{}", &member_endpoint_id.to_string()[..12]),
-            endpoint_id: member_endpoint_id,
-            direct_addresses: Vec::new(),
-            derp_public_key: None,
-        });
-    }
-    config.validate()?;
-    config.validate_local_id(node_key.public())?;
-    let derp_public_key = if config.relay.derp_enabled() && config.derp_identity_file().exists() {
-        Some(crate::derp::identity::load(&config.derp_identity_file())?.public_key())
-    } else {
-        None
-    };
-    let payload = InvitePayload {
-        version: INVITE_VERSION,
-        id: id.clone(),
-        network_name: state.network_name.clone(),
-        network_uid: state.network_uid.clone(),
-        network_secret: config.network_id.clone(),
-        authority: state.authority,
-        address_pool: state.address_pool,
-        ipv6_address_pool: state.ipv6_address_pool,
-        cover: config.cover.clone(),
-        dns_domain: config.dns.domain.clone(),
-        issued_unix_secs: now,
-        expires_unix_secs: expires,
-        capabilities: vec!["join".into()],
-        member_endpoint_id,
-        member_secret: generated_member
-            .as_ref()
-            .map(|key| hex::encode(key.to_bytes())),
-        bootstrap: InviteBootstrap {
-            name: state.node_name.clone(),
-            endpoint_id: node_key.public(),
-            direct_addresses,
-            derp_public_key,
-        },
-    };
-    let bytes = serde_json::to_vec(&payload)?;
-    let signature = authority.sign(&bytes).to_bytes().to_vec();
-    let envelope = SignedInvite { payload, signature };
-    let token = format!(
-        "ironet://join/v2/{}",
-        hex::encode(serde_json::to_vec(&envelope)?)
-    );
-    state.invites.push(InviteRecord {
-        id: id.clone(),
-        created_unix_secs: now,
-        expires_unix_secs: expires,
-        revoked: false,
-        token_hash: blake3::hash(token.as_bytes()).to_hex().to_string(),
-        member_endpoint_id,
-    });
-    save_invite_transaction(config_path, state_dir, &config, &state)?;
-    Ok(InviteSummary {
-        id,
-        token,
-        expires_unix_secs: expires,
-    })
-}
-
-pub fn list_invites(state_dir: &Path) -> Result<Vec<InviteRecord>> {
-    let mut invites = load_state(state_dir)?.invites;
-    invites.sort_by_key(|invite| (invite.revoked, invite.expires_unix_secs, invite.id.clone()));
-    Ok(invites)
-}
-
-pub fn revoke_invite(state_dir: &Path, id: &str) -> Result<bool> {
-    let mut state = load_state(state_dir)?;
-    let invite = state
-        .invites
-        .iter_mut()
-        .find(|invite| invite.id == id)
-        .with_context(|| format!("unknown invite {id}"))?;
-    let changed = !invite.revoked;
-    invite.revoked = true;
-    save_state(state_dir, &state)?;
-    Ok(changed)
 }
 
 pub async fn join_network(

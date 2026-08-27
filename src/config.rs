@@ -74,6 +74,48 @@ pub struct Config {
     /// guardrails without rebuilding the binary.
     #[serde(default, skip_serializing_if = "is_default")]
     pub path_migration: PathMigrationConfig,
+    /// Optional password-gated enrollment listener. Its PBKDF2 output is a
+    /// verifier/key, never the operator's clear-text password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_enrollment: Option<PasswordEnrollmentConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordEnrollmentConfig {
+    /// Random per-network PBKDF2 salt, encoded as 16 bytes of lowercase hex.
+    pub salt: String,
+    /// PBKDF2-HMAC-SHA256 output, encoded as 32 bytes of lowercase hex.
+    /// This is used for challenge authentication and encrypting the transient
+    /// invite returned to a successful password joiner.
+    pub password_key: String,
+    /// Lifetime of the internal one-time invite issued after authentication.
+    #[serde(default = "default_password_enrollment_invite_ttl_secs")]
+    pub invite_ttl_secs: u64,
+}
+
+pub const DEFAULT_PASSWORD_ENROLLMENT_INVITE_TTL_SECS: u64 = 300;
+
+fn default_password_enrollment_invite_ttl_secs() -> u64 {
+    DEFAULT_PASSWORD_ENROLLMENT_INVITE_TTL_SECS
+}
+
+impl PasswordEnrollmentConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            hex::decode(&self.salt).is_ok_and(|value| value.len() == 16),
+            "password_enrollment.salt must contain exactly 16 bytes of hex"
+        );
+        ensure!(
+            hex::decode(&self.password_key).is_ok_and(|value| value.len() == 32),
+            "password_enrollment.password_key must contain exactly 32 bytes of hex"
+        );
+        ensure!(
+            (60..=3_600).contains(&self.invite_ttl_secs),
+            "password_enrollment.invite_ttl_secs must be between 60 and 3600"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -885,6 +927,9 @@ impl Config {
         self.validate_bind_addresses()?;
         self.validate_node_info()?;
         self.validate_dns()?;
+        if let Some(enrollment) = &self.password_enrollment {
+            enrollment.validate()?;
+        }
 
         let mut ids = HashSet::new();
         let mut names = HashSet::new();

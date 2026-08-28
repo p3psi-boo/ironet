@@ -9,14 +9,36 @@
 mod client;
 mod protocol;
 mod server;
+mod workflow;
 
-use anyhow::{Result, ensure};
+use std::path::Path;
+
+use anyhow::{Context, Result, ensure};
 use ring::hmac;
 
 use crate::config::{DEFAULT_PASSWORD_ENROLLMENT_INVITE_TTL_SECS, PasswordEnrollmentConfig};
 
 pub use client::{EnrollmentTicket, confirm, enroll};
-pub use server::serve;
+pub(crate) use server::{ListenerControl, ListenerServer};
+pub use workflow::join_network;
+
+pub fn read_password_file(path: &Path) -> Result<Vec<u8>> {
+    ensure!(
+        path != Path::new("-"),
+        "password input must be a regular secret file"
+    );
+    let mut password = std::fs::read(path)
+        .with_context(|| format!("failed reading password file {}", path.display()))?;
+    while matches!(password.last(), Some(b'\n' | b'\r')) {
+        password.pop();
+    }
+    ensure!(
+        !password.is_empty(),
+        "password file {} is empty",
+        path.display()
+    );
+    Ok(password)
+}
 
 /// Build the sealed configuration fragment stored by an authority. The
 /// clear-text password stays in the caller's secret file; the sealed config

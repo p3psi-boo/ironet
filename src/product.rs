@@ -72,11 +72,23 @@ pub struct ProductState {
     pub local_ipv6_address: Option<IpNet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_invite_id: Option<String>,
+    /// A password-issued invite committed on this member which still needs an
+    /// authority acknowledgement. Completed joins clear this field, so normal
+    /// declarative reruns remain local and idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_password_confirmation: Option<PasswordEnrollmentConfirmation>,
     pub created_unix_secs: u64,
     #[serde(default)]
     pub invites: Vec<InviteRecord>,
     #[serde(default)]
     pub removed_nodes: Vec<RemovedNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordEnrollmentConfirmation {
+    pub invite_id: String,
+    pub member_endpoint_id: EndpointId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +391,7 @@ pub async fn create_network(
         ipv6_address_pool: ipv6_pool,
         local_ipv6_address: Some(ipv6_address),
         join_invite_id: None,
+        pending_password_confirmation: None,
         created_unix_secs: now,
         invites: Vec::new(),
         removed_nodes: Vec::new(),
@@ -415,7 +428,36 @@ pub async fn join_network(
     node_name: Option<String>,
     reuse_identity: bool,
 ) -> Result<NetworkSummary> {
+    join_network_with_confirmation(
+        config_path,
+        state_dir,
+        token,
+        node_name,
+        reuse_identity,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn join_network_with_confirmation(
+    config_path: &Path,
+    state_dir: &Path,
+    token: &str,
+    node_name: Option<String>,
+    reuse_identity: bool,
+    pending_password_confirmation: Option<PasswordEnrollmentConfirmation>,
+) -> Result<NetworkSummary> {
     let payload = decode_invite(token)?;
+    if let Some(confirmation) = &pending_password_confirmation {
+        ensure!(
+            confirmation.invite_id == payload.id,
+            "password enrollment confirmation does not match its invite"
+        );
+        ensure!(
+            confirmation.member_endpoint_id == payload.member_endpoint_id,
+            "password enrollment confirmation does not match its member identity"
+        );
+    }
     if state_path(state_dir).exists() && config_path.exists() {
         let existing = load_state(state_dir)?;
         ensure!(
@@ -531,6 +573,7 @@ pub async fn join_network(
         ipv6_address_pool: payload.ipv6_address_pool,
         local_ipv6_address: Some(ipv6_address),
         join_invite_id: Some(payload.id.clone()),
+        pending_password_confirmation,
         created_unix_secs: now,
         invites: Vec::new(),
         removed_nodes: Vec::new(),
@@ -556,6 +599,27 @@ pub async fn join_network(
         state: product_file.display().to_string(),
         created: false,
     })
+}
+
+pub(crate) fn complete_password_enrollment_confirmation(
+    state_dir: &Path,
+    invite_id: &str,
+    member_endpoint_id: EndpointId,
+) -> Result<()> {
+    let mut state = load_state(state_dir)?;
+    let Some(confirmation) = state.pending_password_confirmation.as_ref() else {
+        return Ok(());
+    };
+    ensure!(
+        confirmation.invite_id == invite_id,
+        "local password enrollment confirmation belongs to a different invite"
+    );
+    ensure!(
+        confirmation.member_endpoint_id == member_endpoint_id,
+        "local password enrollment confirmation belongs to a different node identity"
+    );
+    state.pending_password_confirmation = None;
+    save_state(state_dir, &state)
 }
 
 pub fn decode_invite(token: &str) -> Result<InvitePayload> {

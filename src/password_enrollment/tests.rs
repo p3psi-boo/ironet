@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use iroh::SecretKey;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, mpsc},
 };
 
 use super::{
@@ -13,7 +13,8 @@ use super::{
         EnrollmentRequest, PASSWORD_KEY_BYTES, PASSWORD_SALT_BYTES, PROTOCOL_VERSION,
         decrypt_invite, derive_password_key, encrypt_invite, make_proof, proof_is_valid,
     },
-    server::{enrollment_bind_addresses, handle_connection, serve},
+    server::{ListenerServer, enrollment_bind_addresses, handle_connection},
+    workflow::join_network as password_join_network,
 };
 use crate::{
     config::Config,
@@ -98,13 +99,14 @@ async fn listener_reconciles_password_enrollment_config_changes() {
     .await
     .unwrap();
     let disabled = Config::load(&config_path).await.unwrap();
-    let (config_tx, config_rx) = watch::channel(disabled.clone());
     let (command_tx, _command_rx) = mpsc::channel(1);
-    let service = tokio::spawn(serve(config_path, config_rx, command_tx));
+    let (control, service) =
+        ListenerServer::bind(config_path, disabled.clone(), command_tx).unwrap();
+    let service = tokio::spawn(service.run());
 
     let mut enabled = disabled.clone();
     enabled.password_enrollment = Some(create_config(b"password").unwrap());
-    config_tx.send_replace(enabled);
+    control.reconcile(enabled).await.unwrap();
     let mut connected = false;
     for _ in 0..20 {
         if let Ok(stream) = TcpStream::connect(address).await {
@@ -116,10 +118,85 @@ async fn listener_reconciles_password_enrollment_config_changes() {
     }
     assert!(connected, "listener did not start after config activation");
 
-    config_tx.send_replace(disabled);
+    control.reconcile(disabled).await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(TcpStream::connect(address).await.is_err());
-    drop(config_tx);
+    drop(control);
+    assert!(service.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn listener_handover_supports_wildcard_to_specific_on_the_same_port() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    product::create_network(
+        &config_path,
+        directory.path(),
+        "nix-lab",
+        CreateNetworkOptions {
+            bind_address: Some(format!("0.0.0.0:{port}").parse().unwrap()),
+            password: Some(b"password".to_vec()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let initial = Config::load(&config_path).await.unwrap();
+    let (command_tx, _command_rx) = mpsc::channel(1);
+    let (control, service) =
+        ListenerServer::bind(config_path, initial.clone(), command_tx).unwrap();
+    let service = tokio::spawn(service.run());
+
+    let mut specific = initial;
+    specific.bind_addresses = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+    control.reconcile(specific).await.unwrap();
+
+    let other_loopback = std::net::TcpListener::bind(("127.0.0.2", port))
+        .expect("wildcard listener should be released after handover");
+    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_ok());
+    drop(other_loopback);
+    drop(control);
+    assert!(service.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn rejected_listener_handover_restores_the_previous_listener() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    product::create_network(
+        &config_path,
+        directory.path(),
+        "nix-lab",
+        CreateNetworkOptions {
+            bind_address: Some(address),
+            password: Some(b"password".to_vec()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let initial = Config::load(&config_path).await.unwrap();
+    let (command_tx, _command_rx) = mpsc::channel(1);
+    let (control, service) =
+        ListenerServer::bind(config_path, initial.clone(), command_tx).unwrap();
+    let service = tokio::spawn(service.run());
+
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let blocked_address = blocker.local_addr().unwrap();
+    let mut rejected = initial;
+    rejected.bind_addresses = vec![blocked_address];
+    let error = control.reconcile(rejected).await.unwrap_err();
+    assert!(error.to_string().contains("previous listeners restored"));
+    assert!(TcpStream::connect(address).await.is_ok());
+
+    drop(blocker);
+    drop(control);
     assert!(service.await.unwrap().is_ok());
 }
 
@@ -188,6 +265,175 @@ async fn direct_enrollment_is_confirmed_after_the_client_persists_its_identity()
     assert!(!state.invites[0].pending_password_enrollment);
     let config = Config::load(&config_path).await.unwrap();
     assert!(config.peers.iter().any(|peer| peer.endpoint_id == member));
+}
+
+#[tokio::test]
+async fn completed_password_join_reruns_locally_when_the_authority_is_offline() {
+    let authority = tempfile::tempdir().unwrap();
+    let authority_config = authority.path().join("config.toml");
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let password = b"correct horse battery staple".to_vec();
+    product::create_network(
+        &authority_config,
+        authority.path(),
+        "nix-lab",
+        CreateNetworkOptions {
+            bind_address: Some(address),
+            password: Some(password.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let (command_tx, mut command_rx) = mpsc::channel(2);
+    let authority_state = Config::load(&authority_config).await.unwrap();
+    let (control, server) =
+        ListenerServer::bind(authority_config.clone(), authority_state, command_tx).unwrap();
+    let reload_control = control.clone();
+    let reload_config = authority_config.clone();
+    let reload = tokio::spawn(async move {
+        let Some(DaemonCommand::Reload { reply }) = command_rx.recv().await else {
+            panic!("enrollment did not request a daemon reload");
+        };
+        reload_control
+            .reconcile(Config::load(&reload_config).await.unwrap())
+            .await
+            .unwrap();
+        reply
+            .send(Ok(ReloadAck {
+                generation: 2,
+                endpoint_id: "authority".into(),
+            }))
+            .unwrap();
+    });
+    let server = tokio::spawn(server.run());
+
+    let member = tempfile::tempdir().unwrap();
+    let member_config = member.path().join("config.toml");
+    let first = password_join_network(
+        &member_config,
+        member.path(),
+        address,
+        &password,
+        Some("nix-edge-a".into()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        product::load_state(member.path())
+            .unwrap()
+            .pending_password_confirmation
+            .is_none()
+    );
+    drop(control);
+    server.await.unwrap().unwrap();
+    reload.await.unwrap();
+
+    let second = password_join_network(
+        &member_config,
+        member.path(),
+        address,
+        &password,
+        Some("nix-edge-a".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.endpoint_id, first.endpoint_id);
+    assert_eq!(second.network_id, first.network_id);
+}
+
+#[tokio::test]
+async fn locally_committed_join_retries_only_its_pending_confirmation() {
+    let authority = tempfile::tempdir().unwrap();
+    let authority_config = authority.path().join("config.toml");
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let password = b"correct horse battery staple".to_vec();
+    product::create_network(
+        &authority_config,
+        authority.path(),
+        "nix-lab",
+        CreateNetworkOptions {
+            bind_address: Some(address),
+            password: Some(password.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let (command_tx, mut command_rx) = mpsc::channel(2);
+    let authority_state = Config::load(&authority_config).await.unwrap();
+    let (control, first_server) =
+        ListenerServer::bind(authority_config.clone(), authority_state, command_tx).unwrap();
+    let first_server = tokio::spawn(first_server.run());
+    let abort_server = first_server.abort_handle();
+    let reload_control = control.clone();
+    let reload_config = authority_config.clone();
+    let reload = tokio::spawn(async move {
+        let Some(DaemonCommand::Reload { reply }) = command_rx.recv().await else {
+            panic!("enrollment did not request a daemon reload");
+        };
+        reload_control
+            .reconcile(Config::load(&reload_config).await.unwrap())
+            .await
+            .unwrap();
+        reply
+            .send(Ok(ReloadAck {
+                generation: 2,
+                endpoint_id: "authority".into(),
+            }))
+            .unwrap();
+        abort_server.abort();
+    });
+
+    let member = tempfile::tempdir().unwrap();
+    let member_config = member.path().join("config.toml");
+    let error = password_join_network(
+        &member_config,
+        member.path(),
+        address,
+        &password,
+        Some("nix-edge-a".into()),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("confirming locally committed"));
+    let pending = product::load_state(member.path())
+        .unwrap()
+        .pending_password_confirmation
+        .expect("confirmation must remain pending after a transport failure");
+    drop(control);
+    assert!(first_server.await.unwrap_err().is_cancelled());
+    reload.await.unwrap();
+
+    let (command_tx, _command_rx) = mpsc::channel(1);
+    let authority_state = Config::load(&authority_config).await.unwrap();
+    let (control, second_server) =
+        ListenerServer::bind(authority_config, authority_state, command_tx).unwrap();
+    let second_server = tokio::spawn(second_server.run());
+    let summary = password_join_network(
+        &member_config,
+        member.path(),
+        address,
+        &password,
+        Some("nix-edge-a".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.endpoint_id, pending.member_endpoint_id.to_string());
+    assert!(
+        product::load_state(member.path())
+            .unwrap()
+            .pending_password_confirmation
+            .is_none()
+    );
+    drop(control);
+    second_server.await.unwrap().unwrap();
 }
 
 #[tokio::test]

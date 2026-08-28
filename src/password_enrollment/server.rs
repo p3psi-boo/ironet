@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,7 +11,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     time::{self, MissedTickBehavior},
 };
 use tracing::{info, warn};
@@ -32,57 +33,183 @@ const PENDING_ENROLLMENT_SWEEP: Duration = Duration::from_secs(30);
 
 type Committer = Arc<Mutex<()>>;
 
-/// Reconciles the TCP enrollment listener with the daemon's active Config.
-/// Authentication handlers may run concurrently; all membership mutations pass
-/// through one authority-local committer so config and state never race.
-pub async fn serve(
-    config_path: PathBuf,
-    mut active_config: watch::Receiver<Config>,
-    command_tx: mpsc::Sender<DaemonCommand>,
-) -> Result<()> {
-    let mut bound_addresses = listener_addresses(&active_config.borrow());
-    let mut listeners = bind_listeners(&bound_addresses)?;
-    log_listener_state(&listeners)?;
-    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    let committer = Arc::new(Mutex::new(()));
-    let mut sweep = time::interval(PENDING_ENROLLMENT_SWEEP);
-    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+struct ListenerUpdate {
+    config: Config,
+    reply: oneshot::Sender<Result<()>>,
+}
 
-    loop {
-        tokio::select! {
-            changed = active_config.changed() => {
-                if changed.is_err() {
-                    return Ok(());
-                }
-                let next_addresses = listener_addresses(&active_config.borrow());
-                if next_addresses != bound_addresses {
-                    listeners = bind_listeners(&next_addresses)?;
-                    bound_addresses = next_addresses;
-                    log_listener_state(&listeners)?;
+#[derive(Clone)]
+pub(crate) struct ListenerControl {
+    updates: mpsc::Sender<ListenerUpdate>,
+}
+
+impl ListenerControl {
+    /// Reconcile before the daemon acknowledges a generation change. The
+    /// server either installs the complete listener set or keeps the previous
+    /// set, so reload and listener state share one commit boundary.
+    pub(crate) async fn reconcile(&self, config: Config) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.updates
+            .send(ListenerUpdate { config, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("password enrollment listener stopped"))?;
+        response
+            .await
+            .context("password enrollment listener dropped reconcile response")?
+    }
+}
+
+struct ListenerSet {
+    addresses: Vec<SocketAddr>,
+    listeners: Vec<TcpListener>,
+}
+
+impl ListenerSet {
+    fn bind(config: &Config) -> Result<Self> {
+        let addresses = listener_addresses(config);
+        let listeners = bind_listeners(&addresses)?;
+        log_listener_state(&listeners)?;
+        Ok(Self {
+            addresses,
+            listeners,
+        })
+    }
+
+    fn reconcile(&mut self, config: &Config) -> Result<()> {
+        let next_addresses = listener_addresses(config);
+        if next_addresses == self.addresses {
+            return Ok(());
+        }
+
+        match bind_listeners(&next_addresses) {
+            Ok(next) => self.install(next_addresses, next),
+            Err(error) if error_kind(&error) != Some(io::ErrorKind::AddrInUse) => Err(error),
+            Err(_) => {
+                // Wildcard-to-specific transitions on the same port cannot
+                // overlap even with SO_REUSEADDR. Drop the old set only for
+                // this known handover case, and restore it if the new bind is
+                // rejected for another reason.
+                let previous_addresses = self.addresses.clone();
+                self.listeners.clear();
+                match bind_listeners(&next_addresses) {
+                    Ok(next) => self.install(next_addresses, next),
+                    Err(error) => match bind_listeners(&previous_addresses) {
+                        Ok(previous) => {
+                            self.install(previous_addresses, previous)?;
+                            Err(error).context(
+                                "binding replacement password enrollment listeners; previous listeners restored",
+                            )
+                        }
+                        Err(rollback) => Err(anyhow::anyhow!(
+                            "binding replacement password enrollment listeners failed: {error:#}; restoring previous listeners failed: {rollback:#}"
+                        )),
+                    },
                 }
             }
-            accepted = accept_next(&mut listeners), if !listeners.is_empty() => {
-                let (stream, remote) = accepted?;
-                let Ok(permit) = connections.clone().try_acquire_owned() else {
-                    warn!(%remote, "password enrollment connection limit reached");
-                    continue;
-                };
-                let config_path = config_path.clone();
-                let command_tx = command_tx.clone();
-                let committer = committer.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = handle_connection(stream, &config_path, command_tx, committer).await {
-                        warn!(%remote, %error, "password enrollment request failed")
+        }
+    }
+
+    fn install(&mut self, addresses: Vec<SocketAddr>, listeners: Vec<TcpListener>) -> Result<()> {
+        log_listener_state(&listeners)?;
+        self.addresses = addresses;
+        self.listeners = listeners;
+        Ok(())
+    }
+}
+
+fn error_kind(error: &anyhow::Error) -> Option<io::ErrorKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>().map(io::Error::kind))
+}
+
+/// Owns the TCP enrollment listeners for the daemon. Authentication handlers
+/// may run concurrently; all membership mutations pass through one
+/// authority-local committer so config and state never race.
+pub(crate) struct ListenerServer {
+    config_path: PathBuf,
+    command_tx: mpsc::Sender<DaemonCommand>,
+    active_config: Config,
+    listener_set: ListenerSet,
+    updates: mpsc::Receiver<ListenerUpdate>,
+}
+
+impl ListenerServer {
+    pub(crate) fn bind(
+        config_path: PathBuf,
+        active_config: Config,
+        command_tx: mpsc::Sender<DaemonCommand>,
+    ) -> Result<(ListenerControl, Self)> {
+        let listener_set = ListenerSet::bind(&active_config)?;
+        let (updates, update_rx) = mpsc::channel(4);
+        Ok((
+            ListenerControl { updates },
+            Self {
+                config_path,
+                command_tx,
+                active_config,
+                listener_set,
+                updates: update_rx,
+            },
+        ))
+    }
+
+    pub(crate) async fn run(mut self) -> Result<()> {
+        let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        let committer = Arc::new(Mutex::new(()));
+        let mut sweep = time::interval(PENDING_ENROLLMENT_SWEEP);
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                update = self.updates.recv() => {
+                    let Some(ListenerUpdate { config, reply }) = update else {
+                        return Ok(());
+                    };
+                    let result = self.listener_set.reconcile(&config);
+                    if result.is_ok() {
+                        self.active_config = config;
                     }
-                });
-            }
-            _ = sweep.tick() => {
-                let config = active_config.borrow().clone();
-                if config.password_enrollment.is_some()
-                    && let Err(error) = expire_pending(&config_path, &config, &command_tx, &committer).await
-                {
-                    warn!(%error, "failed expiring pending password enrollments");
+                    let _ = reply.send(result);
+                }
+                accepted = accept_next(&mut self.listener_set.listeners), if !self.listener_set.listeners.is_empty() => {
+                    let (stream, remote) = accepted?;
+                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                        warn!(%remote, "password enrollment connection limit reached");
+                        continue;
+                    };
+                    let config_path = self.config_path.clone();
+                    let command_tx = self.command_tx.clone();
+                    let committer = committer.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = handle_connection(stream, &config_path, command_tx, committer).await {
+                            warn!(%remote, %error, "password enrollment request failed")
+                        }
+                    });
+                }
+                _ = sweep.tick() => {
+                    if self.active_config.password_enrollment.is_some() {
+                        // Expiry can request a daemon reload and must never
+                        // block the listener-control loop: an enrollment
+                        // handler may hold the same committer while waiting
+                        // for that reload to reconcile these listeners.
+                        let config_path = self.config_path.clone();
+                        let config = self.active_config.clone();
+                        let command_tx = self.command_tx.clone();
+                        let committer = committer.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = expire_pending(
+                                &config_path,
+                                &config,
+                                &command_tx,
+                                &committer,
+                            ).await
+                            {
+                                warn!(%error, "failed expiring pending password enrollments");
+                            }
+                        });
+                    }
                 }
             }
         }

@@ -52,12 +52,16 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
     let initial = Generation::load(&config_path)
         .await
         .context("failed loading initial daemon generation")?;
-    let listener = control::bind(&socket_path).await?;
     let (command_tx, command_rx) = mpsc::channel(16);
+    let (enrollment_control, enrollment_server) = password_enrollment::ListenerServer::bind(
+        config_path.clone(),
+        initial.config.clone(),
+        command_tx.clone(),
+    )?;
+    let listener = control::bind(&socket_path).await?;
     let (active_config_tx, active_config_rx) = watch::channel(initial.config.clone());
     let (runtime_state_tx, runtime_state_rx) = watch::channel::<Option<Arc<V2RuntimeState>>>(None);
     let events = Arc::new(control::EventLog::default());
-    let enrollment_config_rx = active_config_rx.clone();
     let mut supervisor = tokio::spawn(supervise(
         config_path.clone(),
         initial,
@@ -65,6 +69,7 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
         command_rx,
         runtime_state_tx,
         events.clone(),
+        enrollment_control,
     ));
     let mut control_server = tokio::spawn(control::serve(
         listener,
@@ -74,11 +79,7 @@ pub async fn run(config_path: PathBuf, socket_path: PathBuf) -> Result<()> {
         runtime_state_rx,
         events,
     ));
-    let mut enrollment_server = tokio::spawn(password_enrollment::serve(
-        config_path.clone(),
-        enrollment_config_rx,
-        command_tx.clone(),
-    ));
+    let mut enrollment_server = tokio::spawn(enrollment_server.run());
 
     let mut result = tokio::select! {
         result = &mut supervisor => {
@@ -141,6 +142,7 @@ async fn supervise(
     mut commands: mpsc::Receiver<DaemonCommand>,
     runtime_state: watch::Sender<Option<Arc<V2RuntimeState>>>,
     events: Arc<control::EventLog>,
+    enrollment: password_enrollment::ListenerControl,
 ) -> Result<()> {
     let mut generation = 1_u64;
     let mut pending_reload: Option<PendingReload> = None;
@@ -182,6 +184,16 @@ async fn supervise(
         };
         if let Err(error) = startup {
             if let Some(pending) = pending_reload.take() {
+                if let Err(rollback) = enrollment.reconcile(pending.previous.config.clone()).await {
+                    let message = format!(
+                        "{error}; restoring password enrollment listeners failed: {rollback:#}"
+                    );
+                    let _ = pending.reply.send(Err(RpcError {
+                        code: "reload_failed".into(),
+                        message: message.clone(),
+                    }));
+                    return Err(anyhow!(message));
+                }
                 let _ = pending.reply.send(Err(RpcError {
                     code: "reload_failed".into(),
                     message: error.to_string(),
@@ -286,15 +298,31 @@ async fn supervise(
                                     continue 'active;
                                 }
                             };
+                            if let Err(error) = enrollment.reconcile(next.config.clone()).await {
+                                let _ = reply.send(Err(RpcError {
+                                    code: "reload_rejected".into(),
+                                    message: format!(
+                                        "password enrollment listener rejected the generation: {error:#}"
+                                    ),
+                                }));
+                                continue 'active;
+                            }
                             if let Some(shutdown) = shutdown_tx.take() {
                                 let _ = shutdown.send(());
                             }
                             if let Err(error) = flatten_task("data plane", runtime_task.await) {
+                                let rollback = enrollment.reconcile(current.config.clone()).await;
+                                let message = match rollback {
+                                    Ok(()) => error.to_string(),
+                                    Err(rollback) => format!(
+                                        "{error}; restoring password enrollment listeners failed: {rollback:#}"
+                                    ),
+                                };
                                 let _ = reply.send(Err(RpcError {
                                     code: "reload_failed".into(),
-                                    message: error.to_string(),
+                                    message: message.clone(),
                                 }));
-                                return Err(error);
+                                return Err(anyhow!(message));
                             }
                             let previous = current;
                             current = next;
@@ -351,6 +379,15 @@ async fn supervise(
                     }
                     match Generation::load(&config_path).await {
                         Ok(next_generation) => {
+                            if let Err(error) = enrollment
+                                .reconcile(next_generation.config.clone())
+                                .await
+                            {
+                                let _ = state.write(&path);
+                                return Err(error.context(
+                                    "route expiry could not reconcile password enrollment listeners",
+                                ));
+                            }
                             current = next_generation;
                             generation = generation.saturating_add(1);
                             tokio::time::sleep(RESTART_SETTLE_DELAY).await;

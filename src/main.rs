@@ -73,54 +73,24 @@ async fn main() -> Result<()> {
             no_start,
             output,
         }) => {
-            let join = resolve_join(
-                invite,
-                invite_file,
-                peer,
-                password_file,
-                reuse_identity,
-                &config,
-                &state_dir,
-            )
-            .await?;
-            let summary = match join {
-                ResolvedJoin::ExistingNetwork(confirmation) => {
-                    let summary = product::show_network(&config, &state_dir).await?;
-                    password_enrollment::confirm(
-                        confirmation.peer,
-                        &confirmation.password,
-                        confirmation.member_endpoint_id,
-                        &confirmation.invite_id,
-                    )
-                    .await?;
-                    summary
+            let summary = match (peer, password_file) {
+                (None, None) => {
+                    let invite = read_invite(invite, invite_file)?;
+                    product::join_network(&config, &state_dir, &invite, node_name, reuse_identity)
+                        .await?
                 }
-                ResolvedJoin::Invite(join) => {
-                    let summary = product::join_network(
-                        &config,
-                        &state_dir,
-                        &join.invite,
-                        node_name,
-                        join.reuse_identity,
+                (Some(peer), Some(password_file)) => {
+                    ensure!(
+                        !reuse_identity,
+                        "--reuse-identity is only supported with an invite URL"
+                    );
+                    let password = password_enrollment::read_password_file(&password_file)?;
+                    password_enrollment::join_network(
+                        &config, &state_dir, peer, &password, node_name,
                     )
-                    .await?;
-                    if let Some(PendingEnrollmentConfirmation {
-                        peer,
-                        password,
-                        member_endpoint_id,
-                        invite_id,
-                    }) = join.confirmation
-                    {
-                        password_enrollment::confirm(
-                            peer,
-                            &password,
-                            member_endpoint_id,
-                            &invite_id,
-                        )
-                        .await?;
-                    }
-                    summary
+                    .await?
                 }
+                _ => bail!("--peer and --password-file must be supplied together"),
             };
             let started = start_service(&config, &socket, &state_dir, no_start).await?;
             print_network_summary(&summary, output, Some(started))
@@ -274,7 +244,7 @@ async fn network_command(
         } => {
             let password = password_file
                 .as_deref()
-                .map(read_password_file)
+                .map(password_enrollment::read_password_file)
                 .transpose()?;
             let summary = product::create_network(
                 config,
@@ -565,96 +535,6 @@ fn read_invite(invite: Option<String>, invite_file: Option<PathBuf>) -> Result<S
             .with_context(|| format!("failed reading invite {}", path.display()))?
             .trim()
             .into())
-    }
-}
-
-fn read_password_file(path: &Path) -> Result<Vec<u8>> {
-    ensure!(
-        path != Path::new("-"),
-        "password input must be a regular secret file"
-    );
-    let mut password = std::fs::read(path)
-        .with_context(|| format!("failed reading password file {}", path.display()))?;
-    while matches!(password.last(), Some(b'\n' | b'\r')) {
-        password.pop();
-    }
-    ensure!(
-        !password.is_empty(),
-        "password file {} is empty",
-        path.display()
-    );
-    Ok(password)
-}
-
-enum ResolvedJoin {
-    ExistingNetwork(PendingEnrollmentConfirmation),
-    Invite(InviteJoin),
-}
-
-struct InviteJoin {
-    invite: String,
-    reuse_identity: bool,
-    confirmation: Option<PendingEnrollmentConfirmation>,
-}
-
-struct PendingEnrollmentConfirmation {
-    peer: SocketAddr,
-    password: Vec<u8>,
-    member_endpoint_id: iroh::EndpointId,
-    invite_id: String,
-}
-
-async fn resolve_join(
-    invite: Option<String>,
-    invite_file: Option<PathBuf>,
-    peer: Option<SocketAddr>,
-    password_file: Option<PathBuf>,
-    reuse_identity: bool,
-    config_path: &Path,
-    state_dir: &Path,
-) -> Result<ResolvedJoin> {
-    match (peer, password_file) {
-        (None, None) => Ok(ResolvedJoin::Invite(InviteJoin {
-            invite: read_invite(invite, invite_file)?,
-            reuse_identity,
-            confirmation: None,
-        })),
-        (Some(peer), Some(password_file)) => {
-            ensure!(
-                !reuse_identity,
-                "--reuse-identity is only supported with an invite URL"
-            );
-            let password = read_password_file(&password_file)?;
-            let identity_path = state_dir.join("identity.key");
-            let enrollment_identity = identity::IdentityPlan::prepare_bootstrap(&identity_path)?;
-            let member_endpoint_id = enrollment_identity.endpoint_id();
-            if config_path.exists() && product::state_path(state_dir).exists() {
-                let invite_id = product::load_state(state_dir)?
-                    .join_invite_id
-                    .context("this machine was not joined through password enrollment")?;
-                return Ok(ResolvedJoin::ExistingNetwork(
-                    PendingEnrollmentConfirmation {
-                        peer,
-                        password,
-                        member_endpoint_id,
-                        invite_id,
-                    },
-                ));
-            }
-            let ticket = password_enrollment::enroll(peer, &password, member_endpoint_id).await?;
-            enrollment_identity.persist(&identity_path)?;
-            Ok(ResolvedJoin::Invite(InviteJoin {
-                invite: ticket.invite,
-                reuse_identity: true,
-                confirmation: Some(PendingEnrollmentConfirmation {
-                    peer,
-                    password,
-                    member_endpoint_id,
-                    invite_id: ticket.invite_id,
-                }),
-            }))
-        }
-        _ => bail!("--peer and --password-file must be supplied together"),
     }
 }
 

@@ -32,7 +32,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.98.0 \
+          rustup toolchain install 1.95.0 \
             --profile minimal \
             --component clippy,rustfmt \
             --target x86_64-unknown-linux-musl \

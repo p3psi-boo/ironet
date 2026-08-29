@@ -2,7 +2,7 @@
 name = "ironet-policy-builtin"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.95"
 description = "Built-in Ironet policy guest packaged as a WebAssembly component"
 license = "MIT OR Apache-2.0"
 

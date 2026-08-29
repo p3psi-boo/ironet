@@ -2,7 +2,7 @@
 name = "ironet-policy-core"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.95"
 description = "Single-source policy core (contextual bandit learner) shared by the Ironet native backend and the builtin WASM guest"
 license = "MIT OR Apache-2.0"
 

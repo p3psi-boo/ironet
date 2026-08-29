@@ -14,7 +14,7 @@ resolver = "3"
 name = "ironet"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.95"
 description = "Demand-aware Linux overlay network using QUIC and the Ironet Protocol V2 Cell/PacketTrain dataplane"
 license = "MIT OR Apache-2.0"
 

@@ -1,4 +1,4 @@
-FROM rust:1.91-trixie AS builder
+FROM rust:1.95-trixie AS builder
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -15,7 +15,7 @@ FROM golang:1.26.5-alpine AS derper-builder
 ARG TAILSCALE_VERSION=v1.102.2
 RUN CGO_ENABLED=0 go install tailscale.com/cmd/derper@${TAILSCALE_VERSION}
 
-FROM rust:1.91-trixie AS iroh-relay-builder
+FROM rust:1.95-trixie AS iroh-relay-builder
 
 ARG IROH_RELAY_VERSION=1.0.3
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

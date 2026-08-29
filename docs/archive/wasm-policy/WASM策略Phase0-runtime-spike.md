@@ -1,6 +1,6 @@
 # WASM 策略 Phase 0：Wasmtime runtime spike 报告（历史）
 
-> **归档状态（2026-08-22）**：本报告记录 Rust 1.91 / Wasmtime 43 的一次选型测量。当前仓库已使用 Rust 1.98 / Wasmtime 48；现行运行时契约见[策略运行时架构](../../策略运行时架构.md)。
+> **归档状态（2026-08-22）**：本报告记录 Rust 1.91 / Wasmtime 43 的一次选型测量。当前仓库使用 Rust 1.95 / Wasmtime 48；现行运行时契约见[策略运行时架构](../../策略运行时架构.md)。
 > 对应[WASM 策略模块化实施计划](WASM策略模块化实施计划.md)的 Phase 0 “用 Pulley 与 Cranelift 两种 Wasmtime 配置各做一次 spike”。
 > 日期：2026-08-21。执行机：NixOS（Linux 6.18.43，16 核，23 GiB 内存），Rust 1.91.0（独立 flake devShell）。
 > 可复现源码保留在 [`tools/phase0-spike`](../../../tools/phase0-spike/README.md)。生成的二进制、`.cwasm`、构建日志和原始文本输出已从仓库移除；按第 10 节命令可重新生成到本地忽略目录。

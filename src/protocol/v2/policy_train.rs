@@ -434,7 +434,9 @@ mod tests {
             },
             action: OracleActionV2 {
                 bbr_preset: Some(Bbr3PresetV2::Policer),
-                fec: Some("8+1".to_owned()),
+                // A policer is controlled by its gross-wire pacing ceiling;
+                // adding parity only creates more bytes for it to discard.
+                fec: None,
                 train_target_bytes: 16 * 1024,
                 bulk_quantum_cells: 1,
                 cover_overhead_per_mille: 0,

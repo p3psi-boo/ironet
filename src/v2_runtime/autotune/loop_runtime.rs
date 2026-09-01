@@ -466,7 +466,10 @@ pub(crate) async fn tuner_loop(
         );
         let lost_packets =
             counter_delta(current.lost_packets, telemetry_window.previous.lost_packets);
-        let loss_ppm = ratio_per_million(lost_packets, sent_packets.saturating_add(lost_packets));
+        // `udp_tx.datagrams` already counts every attempted wire datagram,
+        // including the ones later declared lost. Adding `lost_packets` again
+        // biases the denominator and under-reports the erasure rate.
+        let loss_ppm = ratio_per_million(lost_packets, sent_packets);
         let sent_bytes =
             counter_delta(current.udp_tx.bytes, telemetry_window.previous.udp_tx.bytes);
         let received_bytes =

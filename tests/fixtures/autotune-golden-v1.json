@@ -2,7 +2,7 @@
   "schema_version": 1,
   "policy_id": "bandit-vivace@1",
   "state_schema": 1,
-  "module_digest": "5815f7e50fe161a94643b56cd4067e288cd7aa4e120c836844279bd6e410a036",
+  "module_digest": "295d02c24e787532a25e7edc17e20600927280e85afd6a661c70e747daaad8b3",
   "backend": "native",
   "objective": "balanced",
   "mode": "shadow",

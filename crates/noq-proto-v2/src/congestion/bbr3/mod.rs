@@ -138,6 +138,18 @@ const POLICER_FALLBACK_MIN_RTT_CEILING: Duration = Duration::from_millis(10);
 const POLICER_CONFIRMED_LOSS_REVOKE_WINDOWS: u8 = 10;
 const SHALLOW_LOSS_BURST_PACKETS: u64 = 16;
 
+// BBR estimates the rate that arrives while its pacer controls the rate put on
+// the wire. On a path with rate-independent erasure those differ by the arrival
+// rate, so feeding the unadjusted delivery estimate back into the pacer makes
+// the estimate decay once more every round. Compensate only one tenth at a time
+// and require the preceding step to have raised delivery before taking another
+// one. This is the causal guard that prevents a drop policer from turning loss
+// into an unbounded positive-feedback loop.
+const ERASURE_COMPENSATION_STEP: f64 = 0.9;
+const ERASURE_MIN_ARRIVAL_RATE: f64 = 0.15;
+const ERASURE_OUTCOME_DECAY: f64 = 0.75;
+const ERASURE_MIN_SAMPLE_PACKETS: u64 = 32;
+
 /// equivalent to BBR.MinRTTFilterLen: A constant specifying the length of the BBR.min_rtt min filter window, BBR.MinRTTFilterLen is 10 secs.
 const MIN_RTT_FILTER_LEN: u64 = 10;
 
@@ -499,6 +511,25 @@ pub struct Bbr3 {
     /// True after the transport reports ECN in the current model-update interval. ECN is an
     /// explicit congestion signal, so it must never use the relaxed random-loss threshold.
     explicit_congestion_in_round: bool,
+    /// ACKed/lost wire outcomes accumulated until the next packet-timed round.
+    /// They are separate from BBR's loss accounting: every loss still reaches
+    /// the inner model for bytes-in-flight bookkeeping.
+    erasure_round_acked_bytes: u64,
+    erasure_round_lost_bytes: u64,
+    erasure_acked_weight: f64,
+    erasure_lost_weight: f64,
+    /// Measured and causally-applied arrival fractions. The applied value starts
+    /// at one and approaches the measured value only when each preceding step
+    /// bought a higher delivery rate.
+    erasure_measured_arrival: f64,
+    erasure_applied_arrival: f64,
+    erasure_compensation_round: u64,
+    erasure_delivered_at_compensation: f64,
+    erasure_compensation_transitions: u64,
+    erasure_compensation_changed: bool,
+    /// ECN suppresses erasure compensation through the next completed round;
+    /// `explicit_congestion_in_round` is reset earlier by the BBR model update.
+    erasure_explicit_congestion_in_round: bool,
     /// equivalent to BBR.probe_rtt_done_stamp: timestamp when probe RTT state is finished
     probe_rtt_done_stamp: Option<Instant>,
     /// equivalent to BBR.probe_rtt_round_done: set once per round when BBR.probe_rtt_done_stamp to check if we need to switch state
@@ -746,6 +777,17 @@ impl Bbr3 {
             loss_round_delivered: 0,
             loss_in_round: false,
             explicit_congestion_in_round: false,
+            erasure_round_acked_bytes: 0,
+            erasure_round_lost_bytes: 0,
+            erasure_acked_weight: 0.0,
+            erasure_lost_weight: 0.0,
+            erasure_measured_arrival: 1.0,
+            erasure_applied_arrival: 1.0,
+            erasure_compensation_round: 0,
+            erasure_delivered_at_compensation: 0.0,
+            erasure_compensation_transitions: 0,
+            erasure_compensation_changed: false,
+            erasure_explicit_congestion_in_round: false,
             probe_rtt_done_stamp: None,
             probe_rtt_round_done: false,
             prior_cwnd: 0,
@@ -1092,6 +1134,159 @@ impl Bbr3 {
             }
             _ => {}
         }
+    }
+
+    fn erasure_compensation_allowed(&self, explicit_congestion: bool) -> bool {
+        !self.params.loss_is_congestion
+            && !explicit_congestion
+            && self.state != BbrState::ProbeRtt
+            && self.params.pacing_rate_cap_bytes_per_second == 0
+            && self.policer_learned_wire_rate_ceiling().is_none()
+            // Compensation must not run ahead of the independent delay brake.
+            // Until both RTT estimates exist that brake has no signal.
+            && !self.min_rtt.is_zero()
+            && self.min_rtt != Duration::from_secs(u64::MAX)
+            && !self.srtt.is_zero()
+    }
+
+    fn erasure_control_arrival_rate(&self) -> f64 {
+        if self.erasure_compensation_allowed(self.erasure_explicit_congestion_in_round) {
+            self.erasure_applied_arrival
+                .clamp(ERASURE_MIN_ARRIVAL_RATE, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    fn erasure_delay_brake(&self) -> f64 {
+        let arrival_rate = self.erasure_control_arrival_rate();
+        // This is a brake on *erasure compensation*, not an independent
+        // startup RTT controller.  On the first ACK the transport's SRTT may
+        // still carry its initial value while min_rtt already contains a
+        // sub-millisecond sample. Applying min_rtt / queue_delay at that point
+        // can round the exported pacing rate to zero and make the pacer return
+        // Duration::MAX. Wait until compensation has actually increased the
+        // gross wire budget before braking it.
+        if arrival_rate >= 1.0 - f64::EPSILON
+            || self.params.loss_is_congestion
+            || self.min_rtt.is_zero()
+            || self.min_rtt == Duration::from_secs(u64::MAX)
+            || self.srtt <= self.min_rtt
+        {
+            return 1.0;
+        }
+
+        // Permit at most one propagation RTT of queue. Past that point the
+        // response is continuous: min_rtt / queue_delay. Apply this after
+        // erasure compensation because the queue holds wire bytes, not only the
+        // fraction that eventually arrives.
+        let queue_delay = self.srtt.saturating_sub(self.min_rtt);
+        if queue_delay <= self.min_rtt {
+            1.0
+        } else {
+            // Withdraw the extra 1/arrival wire budget as the queue grows,
+            // but leave ordinary BBR pacing to BBR's own queue guard. RTT
+            // jitter must not turn a tiny erasure correction into a large
+            // reduction below the delivery model's baseline rate.
+            (self.min_rtt.as_secs_f64() / queue_delay.as_secs_f64())
+                .clamp(0.0, 1.0)
+                .max(arrival_rate)
+        }
+    }
+
+    fn set_erasure_applied_arrival(&mut self, arrival: f64) {
+        let arrival = arrival.clamp(ERASURE_MIN_ARRIVAL_RATE, 1.0);
+        if (arrival - self.erasure_applied_arrival).abs() <= f64::EPSILON {
+            return;
+        }
+        self.erasure_applied_arrival = arrival;
+        self.erasure_compensation_transitions =
+            self.erasure_compensation_transitions.saturating_add(1);
+        self.erasure_compensation_changed = true;
+    }
+
+    fn reset_erasure_path_model(&mut self) {
+        self.erasure_round_acked_bytes = 0;
+        self.erasure_round_lost_bytes = 0;
+        self.erasure_acked_weight = 0.0;
+        self.erasure_lost_weight = 0.0;
+        self.erasure_measured_arrival = 1.0;
+        self.erasure_applied_arrival = 1.0;
+        self.erasure_compensation_round = 0;
+        self.erasure_delivered_at_compensation = 0.0;
+        self.erasure_compensation_transitions = 0;
+        self.erasure_compensation_changed = false;
+        self.erasure_explicit_congestion_in_round = false;
+    }
+
+    /// Move the wire-rate correction towards the measured arrival rate one
+    /// packet-timed round at a time. Every increase in compensation is a small,
+    /// falsifiable probe: the next increase is refused unless delivery rose.
+    fn update_erasure_compensation(&mut self) {
+        let acked = std::mem::take(&mut self.erasure_round_acked_bytes);
+        let lost = std::mem::take(&mut self.erasure_round_lost_bytes);
+        let explicit_congestion = std::mem::take(&mut self.erasure_explicit_congestion_in_round);
+        let sample_bytes = acked.saturating_add(lost);
+        let minimum_sample_bytes = self.smss.saturating_mul(ERASURE_MIN_SAMPLE_PACKETS);
+
+        let delivered = self
+            .rs
+            .filter(|sample| sample.delivery_rate.is_finite() && sample.delivery_rate > 0.0)
+            .map_or_else(|| self.bw.max(0.0), |sample| sample.delivery_rate);
+
+        if !self.erasure_compensation_allowed(explicit_congestion) {
+            self.set_erasure_applied_arrival(1.0);
+            return;
+        }
+
+        if sample_bytes < minimum_sample_bytes {
+            self.erasure_round_acked_bytes = self.erasure_round_acked_bytes.saturating_add(acked);
+            self.erasure_round_lost_bytes = self.erasure_round_lost_bytes.saturating_add(lost);
+            return;
+        }
+
+        self.erasure_acked_weight =
+            self.erasure_acked_weight * ERASURE_OUTCOME_DECAY + acked as f64;
+        self.erasure_lost_weight = self.erasure_lost_weight * ERASURE_OUTCOME_DECAY + lost as f64;
+        let outcome_weight = self.erasure_acked_weight + self.erasure_lost_weight;
+        if !outcome_weight.is_finite() || outcome_weight <= 0.0 {
+            return;
+        }
+        self.erasure_measured_arrival =
+            (self.erasure_acked_weight / outcome_weight).clamp(ERASURE_MIN_ARRIVAL_RATE, 1.0);
+        // Share the policer model's clean-window threshold. Compensating
+        // sub-0.5% background loss adds negligible goodput, but it disables
+        // the proven low-RTT pacing bypass and can cost far more throughput
+        // than it recovers on fast LAN/Wi-Fi paths.
+        let wanted = if 1.0 - self.erasure_measured_arrival <= POLICER_CLEAN_THRESHOLD {
+            1.0
+        } else {
+            self.erasure_measured_arrival
+        };
+
+        if wanted >= self.erasure_applied_arrival {
+            // Less compensation can only reduce pressure, so take it at once.
+            self.set_erasure_applied_arrival(wanted);
+            self.erasure_delivered_at_compensation = delivered;
+            self.erasure_compensation_round = self.round_count;
+            return;
+        }
+
+        if self.round_count == self.erasure_compensation_round {
+            return;
+        }
+        if delivered <= self.erasure_delivered_at_compensation {
+            // The last step bought no delivery. Hold and re-arm at the current
+            // operating point so a later path improvement can still be followed.
+            self.erasure_delivered_at_compensation = delivered;
+            self.erasure_compensation_round = self.round_count;
+            return;
+        }
+
+        let next = (self.erasure_applied_arrival * ERASURE_COMPENSATION_STEP).max(wanted);
+        self.set_erasure_applied_arrival(next);
+        self.erasure_delivered_at_compensation = delivered;
+        self.erasure_compensation_round = self.round_count;
     }
 
     fn record_shallow_loss_declaration(&mut self, now: Instant, lost_bytes: u64) {
@@ -1497,6 +1692,10 @@ impl Bbr3 {
         self.state != BbrState::ProbeRtt
             && self.pacing_bypass_armed
             && self.policer_pacing_scale >= 1.0
+            // An erasure-compensated or delay-braked path needs the pacer: the
+            // gross wire rate, rather than cwnd alone, is the control variable.
+            && self.erasure_control_arrival_rate() >= 1.0 - f64::EPSILON
+            && self.erasure_delay_brake() >= 1.0 - f64::EPSILON
             && self
                 .pacing_bypass_below_rtt
                 .is_some_and(|threshold| self.min_rtt < threshold)
@@ -1714,7 +1913,11 @@ impl Bbr3 {
         } else {
             self.policer_pacing_scale
         };
-        let mut rate = gain * self.bw * (100.0 - self.pacing_margin_percent) / 100.0 * model_scale;
+        let arrival_rate = self.erasure_control_arrival_rate();
+        let erasure_scale = 1.0 / arrival_rate;
+        let mut rate = gain * self.bw * (100.0 - self.pacing_margin_percent) / 100.0
+            * model_scale
+            * erasure_scale;
         // A runtime cwnd floor represents host-authoritative evidence that
         // the delivery-rate model is trapped below a queued flow's usable
         // BDP.  Raising only cwnd cannot escape that trap because the pacer
@@ -1728,7 +1931,8 @@ impl Bbr3 {
             let floor_rate = self.params.cwnd_floor_bytes as f64
                 / self.cwnd_gain.max(1.0)
                 / self.min_rtt.as_secs_f64()
-                * model_scale;
+                * model_scale
+                * erasure_scale;
             rate = rate.max(floor_rate);
         }
         if self.params.pacing_rate_cap_bytes_per_second > 0 {
@@ -1746,9 +1950,19 @@ impl Bbr3 {
                 ceiling
             };
         }
-        if learned_policer_ceiling.is_some() || self.full_bw_reached || rate > self.pacing_rate {
+        let delay_brake = self.erasure_delay_brake();
+        rate *= delay_brake;
+        let erasure_control_active = arrival_rate < 1.0 - f64::EPSILON
+            || delay_brake < 1.0 - f64::EPSILON
+            || self.erasure_compensation_changed;
+        if learned_policer_ceiling.is_some()
+            || self.full_bw_reached
+            || rate > self.pacing_rate
+            || erasure_control_active
+        {
             self.pacing_rate = rate;
         }
+        self.erasure_compensation_changed = false;
     }
 
     /// equivalent to BBRRaiseInflightLongtermSlope <https://www.ietf.org/archive/id/draft-ietf-ccwg-bbr-05.html#section-5.3.3.6-8>
@@ -2028,7 +2242,13 @@ impl Bbr3 {
             | BbrState::ProbeBw(ProbeBwSubstate::Up)
             | BbrState::Startup => {}
             _ => {
-                if self.loss_in_round {
+                // Loss still retires bytes-in-flight and feeds the erasure
+                // estimator, but it must not depress BBR's bandwidth/inflight
+                // lower bounds unless policy explicitly classifies loss as
+                // congestion or the transport reported ECN.
+                if self.loss_in_round
+                    && (self.params.loss_is_congestion || self.erasure_explicit_congestion_in_round)
+                {
                     self.init_lower_bounds();
                     self.loss_lower_bounds();
                 }
@@ -2273,6 +2493,7 @@ impl Bbr3 {
         if self.round_start {
             self.advance_external_cap_drain_transition();
             self.refresh_params();
+            self.update_erasure_compensation();
         }
         self.update_ack_aggregation(now);
         self.check_full_bw_reached();
@@ -2493,6 +2714,7 @@ impl Controller for Bbr3 {
     fn on_path_activated(&mut self) {
         self.clear_shallow_loss_quantum_guard();
         self.external_cap_drain_rounds_remaining = 0;
+        self.reset_erasure_path_model();
         self.restart_capacity_discovery();
     }
 
@@ -2533,6 +2755,7 @@ impl Controller for Bbr3 {
         rtt: &RttEstimator,
     ) {
         self.policer_window_acked_bytes = self.policer_window_acked_bytes.saturating_add(bytes);
+        self.erasure_round_acked_bytes = self.erasure_round_acked_bytes.saturating_add(bytes);
         self.delivered = self.delivered.saturating_add(bytes);
         self.delivered_time = Some(now);
         if let Some(mut rate_sample) = self.rs {
@@ -2660,6 +2883,7 @@ impl Controller for Bbr3 {
             self.policer_window_lost_bytes =
                 self.policer_window_lost_bytes.saturating_add(lost_bytes);
             self.explicit_congestion_in_round = true;
+            self.erasure_explicit_congestion_in_round = true;
             self.lost += lost_bytes;
             let p_index_result = self
                 .packets
@@ -2678,6 +2902,7 @@ impl Controller for Bbr3 {
         self.record_shallow_loss_declaration(now, lost_bytes_64);
         self.policer_window_lost_bytes =
             self.policer_window_lost_bytes.saturating_add(lost_bytes_64);
+        self.erasure_round_lost_bytes = self.erasure_round_lost_bytes.saturating_add(lost_bytes_64);
         self.lost += lost_bytes_64;
         let p_index_result = self.packets.binary_search_by_key(&pn, |p| p.packet_number);
         if let Ok(p_index) = p_index_result {
@@ -2723,10 +2948,18 @@ impl Controller for Bbr3 {
     }
 
     fn window(&self) -> u64 {
-        if self.pacing_bypass_active() {
+        let base = if self.pacing_bypass_active() {
             self.cwnd.max(self.low_rtt_cwnd_floor)
         } else {
             self.cwnd
+        };
+        let compensated = (base as f64 / self.erasure_control_arrival_rate())
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
+        if self.params.cwnd_cap_bytes > 0 {
+            compensated.min(self.params.cwnd_cap_bytes)
+        } else {
+            compensated
         }
     }
 
@@ -2819,6 +3052,13 @@ impl Controller for Bbr3 {
                 delivered_in_round: self.rs.map_or(0, |sample| sample.delivered),
                 probe_rtt_entries: self.probe_rtt_entries,
                 guard_transitions: self.queue_delay_guard_transitions,
+                erasure_measured_arrival_per_mille: (self.erasure_measured_arrival * 1_000.0)
+                    .round()
+                    .clamp(0.0, 1_000.0) as u16,
+                erasure_applied_arrival_per_mille: (self.erasure_control_arrival_rate() * 1_000.0)
+                    .round()
+                    .clamp(0.0, 1_000.0) as u16,
+                erasure_compensation_transitions: self.erasure_compensation_transitions,
                 clamped_writes: self.tunables.clamped_writes.load(Ordering::Relaxed),
                 params_generation: self.params_generation,
             }),
@@ -3025,6 +3265,149 @@ mod test {
         assert!(bbr3.metrics().pacing_rate.is_some());
         assert!(bbr3.metrics().send_quantum.is_some());
         assert_eq!(bbr3.window(), 64 * 1024);
+    }
+
+    #[test]
+    fn erasure_compensation_advances_only_after_delivery_improves() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.full_bw_reached = true;
+        bbr3.min_rtt = Duration::from_millis(100);
+        bbr3.srtt = Duration::from_millis(100);
+        bbr3.bw = 1_000_000.0;
+        bbr3.cwnd = 200_000;
+
+        let mut sample = test_rate_sample(0, 200_000);
+        sample.delivery_rate = 1_000_000.0;
+        bbr3.rs = Some(sample);
+        bbr3.round_count = 1;
+        bbr3.erasure_round_acked_bytes = 58 * 1_200;
+        bbr3.erasure_round_lost_bytes = 42 * 1_200;
+        bbr3.update_erasure_compensation();
+
+        assert!((bbr3.erasure_measured_arrival - 0.58).abs() < 1e-9);
+        assert!((bbr3.erasure_applied_arrival - 0.9).abs() < 1e-9);
+        bbr3.set_pacing_rate_with_gain(1.0);
+        assert!((bbr3.pacing_rate - 1_100_000.0).abs() < 1.0);
+        assert_eq!(bbr3.window(), 222_222);
+
+        // A second request for compensation at the same delivered rate is a
+        // policer-shaped outcome, so the controller holds the preceding probe.
+        bbr3.round_count = 2;
+        bbr3.erasure_round_acked_bytes = 58 * 1_200;
+        bbr3.erasure_round_lost_bytes = 42 * 1_200;
+        bbr3.update_erasure_compensation();
+        assert!((bbr3.erasure_applied_arrival - 0.9).abs() < 1e-9);
+
+        // Once the prior wire-rate increase buys delivery, one more bounded
+        // step is earned rather than jumping directly to the measured 0.58.
+        sample.delivery_rate = 1_100_000.0;
+        bbr3.rs = Some(sample);
+        bbr3.round_count = 3;
+        bbr3.erasure_round_acked_bytes = 58 * 1_200;
+        bbr3.erasure_round_lost_bytes = 42 * 1_200;
+        bbr3.update_erasure_compensation();
+        assert!((bbr3.erasure_applied_arrival - 0.81).abs() < 1e-9);
+
+        let snapshot = bbr3.metrics().snapshot.expect("BBR3 snapshot");
+        assert_eq!(snapshot.erasure_measured_arrival_per_mille, 580);
+        assert_eq!(snapshot.erasure_applied_arrival_per_mille, 810);
+        assert_eq!(snapshot.erasure_compensation_transitions, 2);
+    }
+
+    #[test]
+    fn erasure_wire_budget_keeps_delay_and_policer_brakes_authoritative() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.full_bw_reached = true;
+        bbr3.min_rtt = Duration::from_millis(100);
+        bbr3.srtt = Duration::from_millis(250);
+        bbr3.bw = 1_000_000.0;
+
+        // A stale/high initial SRTT must not brake ordinary BBR before the
+        // erasure loop has requested any extra wire traffic.
+        bbr3.set_pacing_rate_with_gain(1.0);
+        assert!((bbr3.pacing_rate - 990_000.0).abs() < 1.0);
+
+        bbr3.erasure_applied_arrival = 0.5;
+
+        bbr3.srtt = Duration::from_millis(100);
+        bbr3.set_pacing_rate_with_gain(1.0);
+        assert!((bbr3.pacing_rate - 1_980_000.0).abs() < 1.0);
+
+        // At 2.5x min RTT, queue delay is 1.5 RTT and continuously brakes the
+        // compensated rate by 1/1.5 rather than waiting for packet loss.
+        bbr3.srtt = Duration::from_millis(250);
+        bbr3.set_pacing_rate_with_gain(1.0);
+        assert!((bbr3.pacing_rate - 1_320_000.0).abs() < 1.0);
+
+        // A deeper queue can withdraw all added erasure traffic, but the
+        // erasure loop does not second-guess BBR below its own base rate.
+        bbr3.srtt = Duration::from_millis(400);
+        bbr3.set_pacing_rate_with_gain(1.0);
+        assert!((bbr3.pacing_rate - 990_000.0).abs() < 1.0);
+
+        // A learned shallow-policer ceiling owns the gross wire budget. It also
+        // suppresses erasure window inflation, avoiding two coupled loops.
+        bbr3.srtt = bbr3.min_rtt;
+        bbr3.policer_pacing_candidate_armed = true;
+        bbr3.policer_pacing_ceiling_bytes_per_second = 700_000.0;
+        bbr3.cwnd = 200_000;
+        bbr3.set_pacing_rate_with_gain(1.0);
+        assert_eq!(bbr3.pacing_rate, 700_000.0);
+        assert_eq!(bbr3.window(), 200_000);
+        assert_eq!(
+            bbr3.metrics()
+                .snapshot
+                .expect("BBR3 snapshot")
+                .erasure_applied_arrival_per_mille,
+            1_000
+        );
+    }
+
+    #[test]
+    fn erasure_compensation_waits_for_rtt_and_resets_on_path_activation() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.round_count = 1;
+        bbr3.bw = 1_000_000.0;
+        bbr3.erasure_round_acked_bytes = 58 * 1_200;
+        bbr3.erasure_round_lost_bytes = 42 * 1_200;
+        bbr3.update_erasure_compensation();
+        assert_eq!(bbr3.erasure_applied_arrival, 1.0);
+
+        bbr3.min_rtt = Duration::from_millis(100);
+        bbr3.srtt = bbr3.min_rtt;
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.round_count = 2;
+        bbr3.erasure_round_acked_bytes = 58 * 1_200;
+        bbr3.erasure_round_lost_bytes = 42 * 1_200;
+        bbr3.update_erasure_compensation();
+        assert!(bbr3.erasure_applied_arrival < 1.0);
+
+        bbr3.on_path_activated();
+        assert_eq!(bbr3.erasure_measured_arrival, 1.0);
+        assert_eq!(bbr3.erasure_applied_arrival, 1.0);
+        assert_eq!(bbr3.erasure_compensation_transitions, 0);
+    }
+
+    #[test]
+    fn erasure_clean_window_keeps_low_rtt_fast_path_eligible() {
+        let mut config = Bbr3Config::default();
+        config.pacing_bypass_below_rtt(Some(Duration::from_millis(5)));
+        let mut bbr3 = Bbr3::new(Arc::new(config), 1_200);
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.min_rtt = Duration::from_millis(2);
+        bbr3.srtt = Duration::from_millis(8);
+        bbr3.pacing_bypass_armed = true;
+        bbr3.round_count = 1;
+        bbr3.erasure_round_acked_bytes = 995 * 1_200;
+        bbr3.erasure_round_lost_bytes = 5 * 1_200;
+
+        bbr3.update_erasure_compensation();
+
+        assert!((bbr3.erasure_measured_arrival - 0.995).abs() < 1e-9);
+        assert_eq!(bbr3.erasure_applied_arrival, 1.0);
+        assert!(bbr3.pacing_bypass_active());
     }
 
     #[test]
@@ -4369,6 +4752,26 @@ mod test {
         bbr3.tunables.generation.store(1, Ordering::Relaxed);
         bbr3.refresh_params();
         assert!(bbr3.is_inflight_too_high());
+    }
+
+    #[test]
+    fn erasure_loss_does_not_depress_bbr_lower_bounds_without_ecn() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1_200);
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Cruise);
+        bbr3.max_bw = 1_000_000.0;
+        bbr3.bw_latest = 400_000.0;
+        bbr3.inflight_latest = 40_000;
+        bbr3.cwnd = 100_000;
+        bbr3.loss_in_round = true;
+
+        bbr3.adapt_lower_bounds_from_congestion();
+        assert!(bbr3.bw_shortterm.is_infinite());
+        assert_eq!(bbr3.inflight_shortterm, u64::MAX);
+
+        bbr3.erasure_explicit_congestion_in_round = true;
+        bbr3.adapt_lower_bounds_from_congestion();
+        assert_eq!(bbr3.bw_shortterm, 700_000.0);
+        assert_eq!(bbr3.inflight_shortterm, 70_000);
     }
 
     #[test]

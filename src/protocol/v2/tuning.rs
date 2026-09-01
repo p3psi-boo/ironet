@@ -230,7 +230,9 @@ impl Bbr3ProposalV2 {
                 // Keep only a small estimate margin: controller bandwidth can include
                 // token-burst samples, while 900‰ measurably underfeeds shallow policers.
                 pacing_cap_bytes_per_second: controller_bw.saturating_mul(970) / 1_000,
-                loss_is_congestion: true,
+                // The absolute pacing cap owns this signal. Treating the same
+                // drops as BBR congestion would compound the cap.
+                loss_is_congestion: false,
             },
             Bbr3PresetV2::LongFat => Self {
                 preset,

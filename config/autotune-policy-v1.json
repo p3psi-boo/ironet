@@ -75,11 +75,11 @@
         "headroom_milli": 250,
         "cwnd_gain_milli": 2000,
         "pacing_cap_bytes_per_second": 0,
-        "loss_is_congestion": true
+        "loss_is_congestion": false
       },
       "action": {
-        "fec_data_cells": 8,
-        "fec_parity_cells": 1,
+        "fec_data_cells": 0,
+        "fec_parity_cells": 0,
         "train_target_bytes": 16384,
         "bulk_quantum_cells": 1,
         "cover_overhead_per_mille": 0

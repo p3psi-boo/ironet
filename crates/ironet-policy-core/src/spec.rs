@@ -88,7 +88,10 @@ impl BbrProposalSpecV1 {
                 cwnd_gain_milli: 2_000,
                 pacing_cap_bytes_per_second: controller_bw_bytes_per_second.saturating_mul(970)
                     / 1_000,
-                loss_is_congestion: true,
+                // A drop policer is governed by the explicit gross-wire cap;
+                // feeding the same drops into BBR's inflight response applies
+                // the signal twice and ratchets the delivery model downward.
+                loss_is_congestion: false,
             },
             Bbr3PresetV1::LongFat => Self {
                 preset,
@@ -270,8 +273,8 @@ impl PolicySpecV1 {
                 ),
                 preset(
                     "policer",
-                    proposal(Policer, 1_100, 250, 2_000, true),
-                    action(Some((8, 1)), 16_384, 1),
+                    proposal(Policer, 1_100, 250, 2_000, false),
+                    action(Some((0, 0)), 16_384, 1),
                 ),
                 preset(
                     "long-fat",
@@ -583,7 +586,15 @@ mod tests {
     fn policer_fallback_fills_pacing_cap_from_controller_bandwidth() {
         let resolved = resolve_preset_proposal(None, Bbr3PresetV1::Policer, 1_000_000);
         assert_eq!(resolved.pacing_cap_bytes_per_second, 970_000);
+        assert!(!resolved.loss_is_congestion);
         let spec = PolicySpecV1::builtin();
+        let policer = spec
+            .presets
+            .iter()
+            .find(|preset| preset.proposal.preset == Bbr3PresetV1::Policer)
+            .expect("built-in policer preset");
+        assert_eq!(policer.action.fec_data_cells, Some(0));
+        assert_eq!(policer.action.fec_parity_cells, Some(0));
         let resolved = resolve_preset_proposal(
             spec.preset(Bbr3PresetV1::Policer),
             Bbr3PresetV1::Policer,

@@ -198,6 +198,13 @@ pub struct ControllerSnapshot {
     pub probe_rtt_entries: u64,
     /// Number of queue-delay guard transitions.
     pub guard_transitions: u64,
+    /// Measured fraction of transmitted bytes that arrived, in parts per mille.
+    pub erasure_measured_arrival_per_mille: u16,
+    /// Arrival fraction currently applied to pacing and cwnd, in parts per mille.
+    /// Values below 1000 mean the gross wire budget is being compensated.
+    pub erasure_applied_arrival_per_mille: u16,
+    /// Number of causal erasure-compensation adjustments.
+    pub erasure_compensation_transitions: u64,
     /// Number of untrusted tuning values clamped by the controller.
     pub clamped_writes: u64,
     /// Last tuning generation applied by the controller.
